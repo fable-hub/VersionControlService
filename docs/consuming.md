@@ -507,7 +507,7 @@ operations `Resolve`, `Finalize` and `Cancel` fail with that code.
 A fallback read returns a neutral value. `ListObjects` returns an empty array.
 `GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no
 threshold with `MaterializeLargeObjects = true`. `Prune` and `Deduplicate` return the
-reason as their report.
+reason as their report. `CanDeduplicate` returns `false`.
 
 The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. Its
 `ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` calls fail with
@@ -1579,10 +1579,10 @@ The channel has these limits:
 | End of a subprocess | Everything that waits is delivered at once, without waiting for the batch rate, before the operation completes. |
 
 The Git provider reports the subprocesses of Refresh, Update, Synchronize, Publish, Clone and Bind, the
-large-object listing, download and free of `ObjectMaterialization`, and
-the LFS upload of a publish. It does not report the text diff workers, the byte-exact object reads, the
-cleanup of the LFS cache (prune and dedup) or the few configuration probes that run without an operation
-context.
+large-object listing, download and free of `ObjectMaterialization`,
+the LFS upload of a publish and the check of `CanDeduplicate`. It does not report the text diff workers,
+the byte-exact object reads, the cleanup of the LFS cache (`Prune` and `Deduplicate`) or the few
+configuration probes that run without an operation context.
 
 The lakeFS provider runs no subprocesses and reports its HTTP requests instead. Every request of an
 operation is one command. The `Command` header reads `lakefs <method> <target>`, with the target relative

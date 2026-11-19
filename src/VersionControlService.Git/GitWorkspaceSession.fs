@@ -6153,6 +6153,9 @@ let private createSessionWithTextDiff
         LfsMediaDirectory = None
     }
 
+    let runRepoGit arguments context =
+        runGit state.Hooks state.RepoPath arguments None context
+
     // A Save in the middle of a Free or Download could commit the file while it is missing
     // or half written, so these bodies take the mutation lock like every other workspace change.
     // The lock is not re-entrant, and nothing inside these bodies takes it again.
@@ -6291,7 +6294,7 @@ let private createSessionWithTextDiff
                 Some(
                     GitLfsExtensions.createObjectMaterialization
                         state.RepoPath
-                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
+                        runRepoGit
                         state.Credentials
                         state.ConnectionProfileId
                         (preflightIndexLock state)
@@ -6301,13 +6304,14 @@ let private createSessionWithTextDiff
                 Some(
                     GitLfsExtensions.createStoragePolicy
                         state.RepoPath
-                        (fun arguments context -> runGit state.Hooks state.RepoPath arguments None context)
+                        runRepoGit
                         (preflightIndexLock state)
                 )
             Maintenance =
                 Some(
                     GitLfsExtensions.createMaintenance
                         state.RepoPath
+                        runRepoGit
                         state.Credentials
                         state.ConnectionProfileId
                 )

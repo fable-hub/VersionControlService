@@ -770,8 +770,33 @@ let private runMaintenance
             | Error failure -> return Failed(toOperationFailure failure)
     }
 
+/// git-lfs prints these when the file system cannot clone files or when LFS extensions rule deduplication out.
+let private dedupUnavailableTokens = [| "does not support de-duplication"; "extensions are configured" |]
+
+let private canDeduplicate
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
+    (context: OperationContext)
+    =
+    async {
+        let! result = runGit (Array.append GitLfsService.storageDedupArgs [| "--test" |]) context
+
+        match result with
+        | Error failure -> return Failed failure
+        | Ok output when output.ExitCode = 0 -> return OperationResult.succeeded true
+        | Ok output ->
+            let text = (output.StdErr + "\n" + output.StdOut).Trim()
+            let lowered = text.ToLowerInvariant()
+
+            if dedupUnavailableTokens |> Array.exists lowered.Contains then
+                return OperationResult.succeeded false
+            else
+                let kind = GitService.classifyFailureKind text
+                return Failed(OperationFailure.createRedacted (categoryOfKind kind) "lfs_operation_failed" text)
+    }
+
 let createMaintenance
     (repoPath: string)
+    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
     : StorageMaintenanceService = {
@@ -788,4 +813,5 @@ let createMaintenance
             "maintenance-deduplicate"
             "Git LFS storage deduplication was canceled."
             (GitService.dedupLfsStorageWithProgressAndCancellation repoPath)
+    CanDeduplicate = canDeduplicate runGit
 }

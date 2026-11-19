@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.5.0 - 2026-11-19
+
+### Added
+
+-   `StorageMaintenanceService.CanDeduplicate` reports whether `Deduplicate` can work for the workspace. The Git provider asks `git lfs dedup --test`, and the fallback service answers `false`.
+
+### Changed
+
+-   `StorageMaintenanceService` has a new `CanDeduplicate` field, so record literals have to set it.
+
 ## 0.4.0 - 2026-11-05
 
 ### Added

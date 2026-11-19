@@ -112,6 +112,7 @@ module WorkspaceSession =
     let private noOpStorageMaintenance: StorageMaintenanceService = {
         Prune = fun _ -> async { return noOp storageMaintenanceReason storageMaintenanceReason }
         Deduplicate = fun _ -> async { return noOp storageMaintenanceReason storageMaintenanceReason }
+        CanDeduplicate = fun _ -> async { return noOp storageMaintenanceReason false }
     }
 
     let private repositoryBrowserReason = "The provider has no repository browser service."
@@ -163,7 +164,7 @@ module WorkspaceSession =
     /// the warning.
     /// ListObjects returns an empty array, and GetSettings returns no threshold with
     /// MaterializeLargeObjects = true. GetActiveSession and GetRepositoryWebUrl return None.
-    /// Prune and Deduplicate return the reason as their report.
+    /// Prune and Deduplicate return the reason as their report. CanDeduplicate returns false.
     /// Synchronization operations and the conflict session operations Resolve, Finalize and
     /// Cancel fail as Unsupported with the service_unavailable code.
     let withFallbackServices (session: WorkspaceSession) : WorkspaceSession = {

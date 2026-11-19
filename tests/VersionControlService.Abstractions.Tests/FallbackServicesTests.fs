@@ -216,8 +216,10 @@ let fallbackServicesTests =
             let maintenanceReason = "The provider has no storage maintenance service."
             let! pruneResult = maintenance.Prune context
             let! deduplicateResult = maintenance.Deduplicate context
+            let! canDeduplicateResult = maintenance.CanDeduplicate context
             Expect.equal (expectNoOp maintenanceReason pruneResult) maintenanceReason "Prune returns its reason as the report."
             Expect.equal (expectNoOp maintenanceReason deduplicateResult) maintenanceReason "Deduplicate returns its reason as the report."
+            Expect.isFalse (expectNoOp maintenanceReason canDeduplicateResult) "CanDeduplicate answers false."
 
             let browserReason = "The provider has no repository browser service."
             let! webUrlResult = repositoryBrowser.GetRepositoryWebUrl context
@@ -348,6 +350,7 @@ let fallbackServicesTests =
             let! _ = storagePolicy.SetPathPolicy path true capturing
             let! _ = maintenance.Prune capturing
             let! _ = maintenance.Deduplicate capturing
+            let! _ = maintenance.CanDeduplicate capturing
             let! _ = repositoryBrowser.GetRepositoryWebUrl capturing
             let! _ =
                 textDiff.Open

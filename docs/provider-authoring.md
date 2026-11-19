@@ -68,7 +68,7 @@ Optional services advertise real capability:
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
 | `ObjectMaterialization` | list large or lazy objects, and hydrate or dematerialize many of them in one call |
 | `StoragePolicy` | literal-path policy and host-facing settings |
-| `Maintenance` | prune and deduplicate local storage |
+| `Maintenance` | prune and deduplicate local storage, and report whether deduplication can work |
 | `RepositoryBrowser` | a credential-free repository URL |
 
 Providers leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
