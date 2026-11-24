@@ -39,7 +39,7 @@ module ProjectPaths =
     let fableConsumerTestsPath =
         Path.GetFullPath "tests/VersionControlService.FableConsumer.Tests"
 
-let gitOwner = "nfdi4plants"
+let gitOwner = "fable-hub"
 let project = "VersionControlService"
 let projectRepo = $"https://github.com/{gitOwner}/{project}"
 

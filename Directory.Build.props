@@ -2,7 +2,7 @@
     <PropertyGroup>
         <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
         <Authors>Caroline Ott</Authors>
-        <RepositoryUrl>https://github.com/nfdi4plants/VersionControlService</RepositoryUrl>
+        <RepositoryUrl>https://github.com/fable-hub/VersionControlService</RepositoryUrl>
         <RepositoryType>git</RepositoryType>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <PackageTags>fsharp;fable;version-control;provider-spi</PackageTags>
