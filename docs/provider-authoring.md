@@ -64,7 +64,7 @@ Optional services advertise real capability:
 | Service | Purpose |
 |---|---|
 | `Synchronization` | refresh, preview update, update, publish, and synchronize |
-| `TextDiff` | resumable pages for a working file against its version at HEAD |
+| `TextDiff` | resumable pages for a working file against its version in the last revision, or for a revision against its first parent |
 | `ConflictResolution` | provider-owned conflict sessions and stale-handle checks |
 | `ObjectMaterialization` | list large or lazy objects, and hydrate or dematerialize many of them in one call |
 | `StoragePolicy` | literal-path policy and host-facing settings |
@@ -72,6 +72,8 @@ Optional services advertise real capability:
 | `RepositoryBrowser` | a credential-free repository URL |
 
 Providers leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
+
+A text diff request names what it compares in `OpenDiffRequest.Comparison`. `DiffComparison.WorkingFile` compares the working file with its version in the last revision. `DiffComparison.Revision` compares the version in a revision with the version in its first parent and never reads the working tree. The Git provider accepts only a full object id as the revision.
 
 A `TextDiff` provider returns `Resumable` while it scans and binds each continuation to the
 same request fields. It journals produced pages so `ReplayPage` can return a page after its

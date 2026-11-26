@@ -99,6 +99,7 @@ let private path value =
 let private openRequest: OpenDiffRequest = {
     Path = path "large.txt"
     PreviousPath = None
+    Comparison = DiffComparison.WorkingFile
     Preparation = None
     PreviousEncoding = None
     CurrentEncoding = None

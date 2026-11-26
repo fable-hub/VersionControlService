@@ -490,8 +490,14 @@ serves a single file and a folder. A call with many paths is faster than one cal
 ## Paged text diffs
 
 `TextDiff` is an optional service on `WorkspaceSession`. Read it from `session.TextDiff`
-before opening a diff. The Git provider compares a working file with its version at HEAD
-when `PreviousPath` is `None`. `Open` pins the source identities for the returned handle.
+before opening a diff. Every `OpenDiffRequest` names what it compares in `Comparison`.
+`DiffComparison.WorkingFile` compares the working file with its version in the last revision.
+`DiffComparison.Revision id` compares the version in that revision with the version in its
+first parent. A root commit has no parent, so its previous side is absent. A revision
+comparison never reads the working tree, so later edits to the working file do not end it.
+The revision must be a full lower-case object id. A ref name or a short id fails with
+`diff_read_failed`. `PreviousPath` names the path of the previous side when the file was
+renamed. `Open` pins the source identities for the returned handle.
 
 The Git provider supplies a working service only when the host passes a worker pool. The
 functions that take no `GitSessionOptions` (`GitWorkspaceSession.createFactory`,
@@ -554,6 +560,7 @@ let openDiff (service: TextDiffService) (path: RepositoryPath) (context: Operati
     let request: OpenDiffRequest = {
         Path = path
         PreviousPath = None
+        Comparison = DiffComparison.WorkingFile
         Preparation = None
         PreviousEncoding = None
         CurrentEncoding = None
@@ -875,11 +882,13 @@ A memory session reads each committed Git blob whole into memory. A blob can be 
 `min(16 MiB, budget / 2, budget - 576 KiB)`, where 576 KiB is a page envelope plus 64 KiB.
 For a larger blob, `Open` returns `NotDiffable` with
 `DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)` before it reads any blob.
-`limitBytes` is that minimum. The host knows whether it chose memory by a setting or
-because of low space, so it words the message for the user. With a budget of 1 to 2 MiB, a
-dense diff shows about one page, and the blob limit at 1 MiB is 448 KiB. The budget must be
-positive. A budget below 576 KiB blocks every committed blob, because the limit is then below
-zero.
+`limitBytes` is that minimum. The limit holds per side. A revision comparison reads two
+committed sides, so two sides that each fit can exceed the budget together, and `Open`
+then fails with `diff_memory_budget_reached`. The host knows whether it chose memory by a
+setting or because of low space, so it words the message for the user. With a budget of 1
+to 2 MiB, a dense diff shows about one page, and the blob limit at 1 MiB is 448 KiB. The
+budget must be positive. A budget below 576 KiB blocks every committed blob, because the
+limit is then below zero.
 
 Before a request that can write, the worker checks the session. A request can add at most
 one page envelope (512 KiB) plus 32 KiB for pairs and index growth, and the check keeps

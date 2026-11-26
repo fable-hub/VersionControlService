@@ -1,6 +1,8 @@
-/// Decides which local content each side of a diff compares. The previous side comes from the pinned HEAD
-/// commit and the current side is the working file. Every lookup is local. Git runs through the injected
-/// runner, which the worker routes to the supervisor, so no transfer, LFS command or status scan happens here.
+/// Decides which local content each side of a diff compares. The working file comparison reads the previous side
+/// from the pinned HEAD commit and the current side from the working file. The revision comparison reads the
+/// current side from the revision and the previous side from its first parent, and it does not touch the working
+/// tree. Every lookup is local. Git runs through the injected runner, which the worker routes to the supervisor,
+/// so no transfer, LFS command or status scan happens here.
 module VersionControlService.Git.TextDiff.TextDiffSourceResolver
 
 open System
@@ -16,6 +18,7 @@ type ResolverInput = {
     /// Repository-relative with forward slashes.
     Path: string
     PreviousPath: string option
+    Comparison: DiffComparison
 }
 
 type GitShort = Supervisor.ShortResult
@@ -61,7 +64,10 @@ type ResolvedSide =
     | LfsObject of objectPath: string * size: int64 * objectIdentity: FileIdentity * pointerFileIdentity: FileIdentity option
 
 type ResolvedSources = {
-    CommitId: string option
+    /// The commit the previous side was read from. None when the previous side has no commit.
+    PreviousCommitId: string option
+    /// The commit the current side was read from. None when the current side is the working file.
+    CurrentCommitId: string option
     Previous: ResolvedSide
     Current: ResolvedSide
 }
@@ -204,11 +210,45 @@ let private resolveLfsObject
     | _ -> return Stop(ResolveOutcome.Blocked(DiffBlocker.LocalContentUnavailable(side, Some pointer.Oid)))
 }
 
-let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commitId: string option) : Async<Step<ResolvedSide>> = async {
+/// Pins a revision of the request to a commit and finds its first parent. The revision must be a full object id,
+/// so no ref name or revision expression reaches Git. A root commit has no parent.
+let private resolveRevision (host: IResolverHost) (revision: RevisionId) : Async<Step<string * string option>> = async {
+    let requested = RevisionId.value revision
+
+    if not (Supervisor.isObjectId requested) then
+        return Stop(ResolveOutcome.ReadError $"The revision {requested} is not a full lower-case object id.")
+    else
+        let! commitResult = awaitHost host (host.RunGit [| "rev-parse"; "--verify"; "--quiet"; requested + "^{commit}" |])
+        let commitId = (utf8 commitResult.Stdout).Trim()
+
+        if succeeded commitResult && Supervisor.isObjectId commitId then
+            let! parentResult = awaitHost host (host.RunGit [| "rev-parse"; "--verify"; "--quiet"; commitId + "^1^{commit}" |])
+            let parentId = (utf8 parentResult.Stdout).Trim()
+
+            if succeeded parentResult && Supervisor.isObjectId parentId then
+                return Continue(commitId, Some parentId)
+            elif parentResult.Error.IsNone && parentResult.Stderr.Trim().Length = 0 then
+                // --verify --quiet exits 1 without a message when the commit has no first parent.
+                return Continue(commitId, None)
+            else
+                return Stop(commandFailure "rev-parse" parentResult)
+        elif commitResult.Error.IsSome then
+            return Stop(commandFailure "rev-parse" commitResult)
+        else
+            return Stop(ResolveOutcome.ReadError $"The revision {requested} is not a commit in the local repository.")
+}
+
+/// Resolves one side from a commit tree. No commit means the side is absent.
+let private resolveCommitted
+    (host: IResolverHost)
+    (input: ResolverInput)
+    (side: DiffSide)
+    (commitId: string option)
+    (path: string)
+    : Async<Step<ResolvedSide>> = async {
     match commitId with
     | None -> return Continue ResolvedSide.Absent
     | Some commit ->
-        let path = input.PreviousPath |> Option.defaultValue input.Path
         let! listing = awaitHost host (host.RunGit [| "ls-tree"; "-z"; "--full-tree"; commit; "--"; path |])
 
         if not (succeeded listing) then
@@ -218,13 +258,13 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
             | Error message -> return Stop(ResolveOutcome.ReadError message)
             | Ok None -> return Continue ResolvedSide.Absent
             | Ok(Some entry) when entry.Mode = "040000" || entry.Mode = "120000" || entry.Mode = "160000" ->
-                return Stop(ResolveOutcome.Blocked(DiffBlocker.NotRegularFile DiffSide.Previous))
+                return Stop(ResolveOutcome.Blocked(DiffBlocker.NotRegularFile side))
             | Ok(Some entry) when (entry.Mode = "100644" || entry.Mode = "100755") && entry.Kind = "blob" && Supervisor.isObjectId entry.Oid ->
                 let! sizeResult = awaitHost host (host.RunGit [| "cat-file"; "-s"; entry.Oid |])
 
                 if not (succeeded sizeResult) then
                     if isMissingObject sizeResult then
-                        return Stop(ResolveOutcome.Blocked(DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some entry.Oid)))
+                        return Stop(ResolveOutcome.Blocked(DiffBlocker.LocalContentUnavailable(side, Some entry.Oid)))
                     else
                         return Stop(commandFailure "cat-file -s" sizeResult)
                 else
@@ -235,15 +275,15 @@ let private resolvePrevious (host: IResolverHost) (input: ResolverInput) (commit
 
                         if not (succeeded blob) then
                             if isMissingObject blob then
-                                return Stop(ResolveOutcome.Blocked(DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some entry.Oid)))
+                                return Stop(ResolveOutcome.Blocked(DiffBlocker.LocalContentUnavailable(side, Some entry.Oid)))
                             else
                                 return Stop(commandFailure "cat-file blob" blob)
                         else
                             match tryParseStrict blob.Stdout with
-                            | Some pointer -> return! resolveLfsObject host input DiffSide.Previous pointer None
+                            | Some pointer -> return! resolveLfsObject host input side pointer None
                             | None -> return Continue(ResolvedSide.GitBlob(entry.Oid, size))
                     | true, size -> return Continue(ResolvedSide.GitBlob(entry.Oid, size))
-            | Ok(Some entry) -> return Stop(ResolveOutcome.ReadError $"The HEAD tree entry has an unexpected mode {entry.Mode} {entry.Kind}.")
+            | Ok(Some entry) -> return Stop(ResolveOutcome.ReadError $"The committed tree entry has an unexpected mode {entry.Mode} {entry.Kind}.")
 }
 
 let private resolveCurrentFile (host: IResolverHost) (input: ResolverInput) (path: string) : Async<Step<ResolvedSide>> = async {
@@ -286,27 +326,50 @@ let private resolveCurrent (host: IResolverHost) (input: ResolverInput) : Async<
             return! resolveCurrentFile host input path
 }
 
+/// The source of the current side, fixed before any side is read.
+type private CurrentSource =
+    | WorkingFileSource
+    | CommitSource of commitId: string
+
 /// Resolves both sides. The previous side is decided first, so its blocker wins when both sides are blocked.
 let resolve (host: IResolverHost) (input: ResolverInput) : Async<ResolveOutcome> = async {
     try
-        let! head = resolveHead host
+        let! pinned = async {
+            match input.Comparison with
+            | DiffComparison.WorkingFile ->
+                match! resolveHead host with
+                | Stop outcome -> return Stop outcome
+                | Continue commitId -> return Continue(commitId, WorkingFileSource)
+            | DiffComparison.Revision revision ->
+                match! resolveRevision host revision with
+                | Stop outcome -> return Stop outcome
+                | Continue(commitId, parentId) -> return Continue(parentId, CommitSource commitId)
+        }
 
-        match head with
+        match pinned with
         | Stop outcome -> return outcome
-        | Continue commitId ->
-            let! previous = resolvePrevious host input commitId
+        | Continue(previousCommitId, currentSource) ->
+            let previousPath = input.PreviousPath |> Option.defaultValue input.Path
+            let! previous = resolveCommitted host input DiffSide.Previous previousCommitId previousPath
 
             match previous with
             | Stop outcome -> return outcome
             | Continue previous ->
-                let! current = resolveCurrent host input
+                let! current =
+                    match currentSource with
+                    | WorkingFileSource -> resolveCurrent host input
+                    | CommitSource commitId -> resolveCommitted host input DiffSide.Current (Some commitId) input.Path
 
                 match current with
                 | Stop outcome -> return outcome
                 | Continue current ->
                     return
                         ResolveOutcome.Resolved {
-                            CommitId = commitId
+                            PreviousCommitId = previousCommitId
+                            CurrentCommitId =
+                                match currentSource with
+                                | WorkingFileSource -> None
+                                | CommitSource commitId -> Some commitId
                             Previous = previous
                             Current = current
                         }

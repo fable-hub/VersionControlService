@@ -407,6 +407,7 @@ let private resolveStep (worker: Worker) (host: WorkerHost) (request: OpenDiffRe
             LfsMediaDirectory = owner.LfsMediaDirectory
             Path = path
             PreviousPath = previousPath
+            Comparison = request.Comparison
         }
 
         let runGit arguments =
@@ -987,7 +988,8 @@ let private describeSide (path: RepositoryPath) (commitId: string option) (opene
 
     let revision =
         match opened.Resolved, commitId with
-        | ResolvedSide.GitBlob _, Some id ->
+        | ResolvedSide.GitBlob _, Some id
+        | ResolvedSide.LfsObject(_, _, _, None), Some id ->
             match RevisionId.tryCreate id with
             | Ok value -> Some value
             | Error _ -> None
@@ -1017,8 +1019,8 @@ let private createStep (worker: Worker) (host: WorkerHost) (request: OpenDiffReq
     | SideState.SideOpen previous, SideState.SideOpen current, Some(Settled previousClass), Some(Settled currentClass), Some sources, Some storage ->
         let handle: DiffHandle = { Id = string host.Generation; Version = slot.Version }
         let previousPath = defaultArg request.PreviousPath request.Path
-        let previousInfo = describeSide previousPath sources.CommitId previous previousClass
-        let currentInfo = describeSide request.Path sources.CommitId current currentClass
+        let previousInfo = describeSide previousPath sources.PreviousCommitId previous previousClass
+        let currentInfo = describeSide request.Path sources.CurrentCommitId current currentClass
         slot.Infos <- Some(previousInfo, currentInfo)
 
         let reserve = envelopeReserve host handle previousInfo currentInfo

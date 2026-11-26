@@ -56,6 +56,7 @@ let private page: DiffPage = {
 let private openRequest: OpenDiffRequest = {
     Path = path "a.txt"
     PreviousPath = None
+    Comparison = DiffComparison.WorkingFile
     Preparation = None
     PreviousEncoding = None
     CurrentEncoding = None
@@ -119,7 +120,8 @@ type private PreparationHandler(issueFirstOpen: bool) =
     let binding (request: OpenDiffRequest) : PreparationBinding = {
         Path = RepositoryPath.value request.Path
         PreviousPath = request.PreviousPath |> Option.map RepositoryPath.value
-        CommitId = None
+        PreviousCommitId = None
+        CurrentCommitId = None
         Previous = SideIdentity.NoSource
         Current = SideIdentity.NoSource
     }

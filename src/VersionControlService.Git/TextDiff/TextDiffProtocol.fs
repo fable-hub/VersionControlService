@@ -698,6 +698,17 @@ let private decodeStoragePolicy: Decoder<DiffStoragePolicy> =
                 field "memoryBudgetBytes" decodeInt64 value |> Result.map DiffStoragePolicy.MemoryOnly)
         | _ -> None)
 
+let private encodeComparison (comparison: DiffComparison) =
+    match comparison with
+    | DiffComparison.WorkingFile -> tagged "WorkingFile" []
+    | DiffComparison.Revision revision -> tagged "Revision" [ "revision" ==> RevisionId.value revision ]
+
+let private decodeComparison: Decoder<DiffComparison> =
+    decodeTagged (function
+        | "WorkingFile" -> Some(fun _ -> Ok DiffComparison.WorkingFile)
+        | "Revision" -> Some(fun value -> field "revision" decodeRevisionId value |> Result.map DiffComparison.Revision)
+        | _ -> None)
+
 let private encodeOpenResult (result: OpenDiffResult) =
     match result with
     | OpenDiffResult.NotDiffable blocker -> tagged "NotDiffable" [ "blocker" ==> encodeBlocker blocker ]
@@ -852,6 +863,7 @@ let private encodeOpenRequest (request: OpenDiffRequest) =
     createObj [
         "path" ==> RepositoryPath.value request.Path
         "previousPath" ==> encodeOption (RepositoryPath.value >> box) request.PreviousPath
+        "comparison" ==> encodeComparison request.Comparison
         "preparation" ==> encodeOption encodeToken request.Preparation
         "previousEncoding" ==> encodeOption box request.PreviousEncoding
         "currentEncoding" ==> encodeOption box request.CurrentEncoding
@@ -864,6 +876,7 @@ let private decodeOpenRequest: Decoder<OpenDiffRequest> =
     decodeObject (fun value -> decode {
         let! path = field "path" decodeRepositoryPath value
         let! previousPath = field "previousPath" (decodeOption decodeRepositoryPath) value
+        let! comparison = field "comparison" decodeComparison value
         let! preparation = field "preparation" (decodeOption decodeToken) value
         let! previousEncoding = field "previousEncoding" (decodeOption decodeString) value
         let! currentEncoding = field "currentEncoding" (decodeOption decodeString) value
@@ -874,6 +887,7 @@ let private decodeOpenRequest: Decoder<OpenDiffRequest> =
         return {
             Path = path
             PreviousPath = previousPath
+            Comparison = comparison
             Preparation = preparation
             PreviousEncoding = previousEncoding
             CurrentEncoding = currentEncoding

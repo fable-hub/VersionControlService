@@ -16,12 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+-   `DiffComparison.Revision` compares the version in a revision with the version in its first parent. The comparison does not read the working tree. The Git provider accepts only a full object id as the revision.
+
 ### Changed
 
 -   The library is built and tested with Fable 5.26.0, and the package check no longer compiles the consumer with Fable 5.0.0-alpha.21.
 -   `OperationEffect.NoOp` is renamed to `OperationEffect.Unchanged`. Its `reason` field stays, and a match on `OperationEffect` has to use the new case name.
 -   `OperationOutcome.noOp` is renamed to `OperationOutcome.unchanged`. Its signature and behavior stay.
 -   `OperationResult.noOp` is renamed to `OperationResult.unchanged`. Its signature and behavior stay.
+-   `OpenDiffRequest` has a new required field `Comparison`, so record literals have to set it. `DiffComparison.WorkingFile` keeps the earlier behavior.
+-   A committed side of a text diff reports its revision in `DiffSourceInfo.Revision`, also when its content is a Git LFS object. Such a side used to report none.
 
 ### Removed
 

@@ -145,6 +145,7 @@ let private resolveWithLog (repository: string) (path: string) (previousPath: st
         LfsMediaDirectory = mediaDirectory repository
         Path = path
         PreviousPath = previousPath
+        Comparison = DiffComparison.WorkingFile
     }
 
     let! outcome = resolve (TextDiffWorker.localFileHost runGit) input |> Async.StartAsPromise
@@ -210,6 +211,7 @@ let private path value =
 let private openRequest (value: string) : OpenDiffRequest = {
     Path = path value
     PreviousPath = None
+    Comparison = DiffComparison.WorkingFile
     Preparation = None
     PreviousEncoding = None
     CurrentEncoding = None
@@ -307,7 +309,7 @@ Vitest.describe (
                 do! writeText (NodePath.join [| repository; "a.txt" |]) "two lines\n"
                 let! outcome = resolveIn repository "a.txt" None
                 let sources = expectResolved outcome
-                Vitest.expect(sources.CommitId).toEqual (Some head)
+                Vitest.expect(sources.PreviousCommitId).toEqual (Some head)
                 expectBlob oid 4L sources.Previous
                 expectWorkingFile (NodePath.join [| repository; "a.txt" |]) 10L sources.Current
             }
@@ -350,7 +352,7 @@ Vitest.describe (
                 do! writeText (NodePath.join [| repository; "a.txt" |]) "first\n"
                 let! outcome = resolveIn repository "a.txt" None
                 let sources = expectResolved outcome
-                Vitest.expect(sources.CommitId).toEqual None
+                Vitest.expect(sources.PreviousCommitId).toEqual None
                 Vitest.expect(sources.Previous).toEqual ResolvedSide.Absent
                 expectWorkingFile (NodePath.join [| repository; "a.txt" |]) 6L sources.Current
             }
@@ -402,6 +404,7 @@ Vitest.describe (
                     LfsMediaDirectory = mediaDirectory repository
                     Path = "a.txt"
                     PreviousPath = None
+                    Comparison = DiffComparison.WorkingFile
                 }
 
                 let! outcome = resolve (TextDiffWorker.localFileHost runMissing) input |> Async.StartAsPromise
@@ -683,7 +686,8 @@ Vitest.describe (
         let binding: PreparationBinding = {
             Path = "a.txt"
             PreviousPath = None
-            CommitId = Some(String.replicate 40 "a")
+            PreviousCommitId = Some(String.replicate 40 "a")
+            CurrentCommitId = None
             Previous = SideIdentity.ObjectId(String.replicate 40 "b")
             Current = SideIdentity.File identity
         }

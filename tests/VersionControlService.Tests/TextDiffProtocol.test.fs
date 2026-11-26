@@ -152,6 +152,7 @@ let private blockers = [|
 let private openRequest: OpenDiffRequest = {
     Path = path "a.txt"
     PreviousPath = Some(path "old/a.txt")
+    Comparison = DiffComparison.WorkingFile
     Preparation = Some token
     PreviousEncoding = Some "utf-8"
     CurrentEncoding = Some "utf-16le"
@@ -224,6 +225,7 @@ Vitest.describe (
                             {
                                 openRequest with
                                     PreviousPath = None
+                                    Comparison = DiffComparison.Revision(revision (String.replicate 40 "a"))
                                     Preparation = None
                                     PreviousEncoding = None
                                     CurrentEncoding = None

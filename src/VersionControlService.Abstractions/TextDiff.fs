@@ -113,6 +113,7 @@ type DiffPage = {
 /// Text metadata for one source in an opened diff.
 type DiffSourceInfo = {
     Path: RepositoryPath
+    /// The revision the side was read from, also when its content is a large object. A working file or an absent side has none.
     Revision: RevisionId option
     IsAbsent: bool
     ByteLength: int64
@@ -125,7 +126,7 @@ type DiffSourceInfo = {
 /// An encoding candidate with a preview of at most 2 KiB of decoded text.
 type EncodingCandidate = { Encoding: string; Preview: string }
 
-/// Binds the selected path, optional previous path, pinned commit, and source identities.
+/// Binds the selected path, optional previous path, pinned commits, and source identities.
 type PreparationToken = { Id: string }
 
 /// How a diff session keeps its temporary data.
@@ -138,10 +139,20 @@ type DiffStoragePolicy =
     /// below 576 KiB (a page envelope plus 64 KiB) blocks every committed Git blob.
     | MemoryOnly of memoryBudgetBytes: int64
 
-/// Input for opening a pinned diff session with optional encoding choices, continuation, and storage policy.
+/// What a diff compares.
+[<RequireQualifiedAccess>]
+type DiffComparison =
+    /// The working file against its version in the last revision.
+    | WorkingFile
+    /// The version in a revision against the version in its first parent.
+    | Revision of RevisionId
+
+/// Input for opening a pinned diff session. `Comparison` names what the diff compares, and a revision
+/// comparison does not read the working tree.
 type OpenDiffRequest = {
     Path: RepositoryPath
     PreviousPath: RepositoryPath option
+    Comparison: DiffComparison
     Preparation: PreparationToken option
     PreviousEncoding: string option
     CurrentEncoding: string option

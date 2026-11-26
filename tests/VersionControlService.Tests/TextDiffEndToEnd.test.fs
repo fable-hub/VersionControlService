@@ -231,6 +231,7 @@ let private context name = OperationContext.detached name
 let private openRequest relativePath = {
     Path = path relativePath
     PreviousPath = None
+    Comparison = DiffComparison.WorkingFile
     Preparation = None
     PreviousEncoding = None
     CurrentEncoding = None
@@ -590,6 +591,100 @@ let private readUserPages (service: TextDiffService) (request: OpenDiffRequest) 
     ignore (operationValue "Close" closed)
     return served, failure, cursor.IsNone
 }
+
+let private revisionOf (id: string) =
+    match RevisionId.tryCreate id with
+    | Ok value -> value
+    | Error message -> failwith message
+
+let private revisionRequest (relativePath: string) (commit: string) =
+    { openRequest relativePath with Comparison = DiffComparison.Revision(revisionOf commit) }
+
+let private revParse (repository: string) (expression: string) = promise {
+    let! output = runGit repository [| "rev-parse"; expression |]
+    return output.Trim()
+}
+
+let private commitRemoval (repository: string) (relativePath: string) = promise {
+    do! runGitOk repository [| "rm"; "-q"; "--"; relativePath |]
+    do! runGitOk repository [| "commit"; "-q"; "-m"; $"remove {relativePath}" |]
+}
+
+let private numberedLines (prefix: string) (count: int) =
+    String.concat "" [| for index in 0 .. count - 1 -> $"{prefix}-{index}\n" |]
+
+let private lfsObjectFile (repository: string) (oid: string) =
+    NodePath.join [| mediaDirectory repository; oid.Substring(0, 2); oid.Substring(2, 2); oid |]
+
+let private pointerFor (oid: string) (size: int) =
+    $"version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n"
+
+/// Runs the body with a service on the repository and closes the session afterwards.
+let private withSession (repository: string) (body: TextDiffService -> JS.Promise<unit>) = promise {
+    let session = createSession (currentFixture ()).Pool repository
+    let service = serviceFor session
+    let mutable failure = None
+
+    try
+        do! body service
+    with error ->
+        failure <- Some error
+
+    do! closeSession session failure
+}
+
+/// Calls Open until the answer is not Scanning and keeps a failure as a value.
+let private openRaw (service: TextDiffService) (initial: OpenDiffRequest) (operationName: string) = promise {
+    let mutable request = initial
+    let mutable answer = None
+
+    while answer.IsNone do
+        let! result = service.Open request (context operationName) |> Async.StartAsPromise
+
+        match result with
+        | Succeeded { Value = Resumable.Scanning(_, continuation, _) } ->
+            request <- { request with Continuation = Some continuation }
+        | other -> answer <- Some other
+
+    return answer.Value
+}
+
+/// Opens the diff, reads every page and closes it.
+let private revisionDiff (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! handle, previous, current, first = openedWithFirstPage service request operationName
+    let! pages = readAllPages service handle first (operationName + "-pages")
+    let! closed = service.Close handle (context (operationName + "-close")) |> Async.StartAsPromise
+    ignore (operationValue "Close" closed)
+    return previous, current, pages
+}
+
+let private openBlocker (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! opened = openUntilReady service request operationName
+
+    match opened with
+    | OpenDiffResult.NotDiffable blocker -> return blocker
+    | OpenDiffResult.Opened _ -> return raise (InvalidOperationException("Expected NotDiffable, got an opened diff."))
+}
+
+let private allRows (pages: DiffPage[]) =
+    pages
+    |> Array.collect (fun page -> page.Parts)
+    |> Array.collect (function
+        | DiffPart.Hunk hunk ->
+            match hunk.Body with
+            | HunkBody.AlignedRows rows -> rows
+            | HunkBody.UnalignedSides _ -> failwith "Expected aligned rows."
+        | _ -> Array.empty)
+
+let private lineText (line: DiffLine option) = line |> Option.map (fun line -> line.Slice.Text)
+
+/// The row kind with the previous and current text of every changed row.
+let private changedRows (pages: DiffPage[]) =
+    allRows pages
+    |> Array.filter changedRow
+    |> Array.map (fun row -> row.Kind, lineText row.Previous, lineText row.Current)
+
+let private revisionText (info: DiffSourceInfo) = info.Revision |> Option.map RevisionId.value
 
 Vitest.describe (
     "Git text diff end to end",
@@ -1409,6 +1504,35 @@ Vitest.describe (
         )
 
         Vitest.test (
+            "refuses the preparation token of a working file diff for a revision diff of the same path",
+            TestOptions(timeout = 120000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitBytes repository "token.csv" (lateUmlautFile -1 -1)
+                do! writeBytes (NodePath.join [| repository; "token.csv" |]) (lateUmlautFile 100000 599980)
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! opened = openUntilReady service (openRequest "token.csv") "token-working-open"
+
+                        let token =
+                            match opened with
+                            | OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(_, token, _)) -> token
+                            | other -> failwith $"Expected EncodingRequired, got %A{other}."
+
+                        do! commitBytes repository "token.csv" (lateUmlautFile 100000 599980)
+                        let! head = revParse repository "HEAD"
+                        let request = { revisionRequest "token.csv" head with Preparation = Some token }
+                        let! answer = openRaw service request "token-revision-open"
+
+                        match answer with
+                        | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.PreparationMismatch
+                        | other -> failwith $"Expected preparation_mismatch, got %A{other}."
+                    })
+            }
+        )
+
+        Vitest.test (
             "fails a session with an encoding mismatch when a late Windows-1252 byte follows the first page",
             TestOptions(timeout = 120000),
             fun () -> promise {
@@ -1952,6 +2076,368 @@ Vitest.describe (
                         Promise.lift (hasWorkerDirectoryDeletedSince (currentFixture ()).Events eventStart))
 
                 do! session.Close() |> Async.StartAsPromise
+            }
+        )
+
+        Vitest.test (
+            "revision diff compares a commit with its first parent and ignores later commits and the working file",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let first = "alpha\nbeta\ngamma\n"
+                let second = "alpha\nbeta changed\ngamma\ndelta\n"
+                do! commitText repository "f.txt" first
+                let! commit1 = revParse repository "HEAD"
+                do! commitText repository "f.txt" second
+                let! commit2 = revParse repository "HEAD"
+                do! commitText repository "f.txt" "totally\ndifferent\ncontent\n"
+                do! writeText (NodePath.join [| repository; "f.txt" |]) "working only\n"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! previous, current, pages = revisionDiff service (revisionRequest "f.txt" commit2) "revision-a"
+                        let changed = changedRows pages
+                        let previousTexts = changed |> Array.choose (fun (_, p, _) -> p)
+                        let currentTexts = changed |> Array.choose (fun (_, _, c) -> c)
+                        Vitest.expect(previousTexts).toEqual [| "beta" |]
+                        Vitest.expect(currentTexts).toEqual [| "beta changed"; "delta" |]
+                        Vitest.expect(revisionText previous).toEqual (Some commit1)
+                        Vitest.expect(revisionText current).toEqual (Some commit2)
+                        Vitest.expect(previous.ByteLength).toEqual (int64 first.Length)
+                        Vitest.expect(current.ByteLength).toEqual (int64 second.Length)
+                        Vitest.expect(previous.IsAbsent).toBe false
+                        Vitest.expect(current.IsAbsent).toBe false
+
+                        let allText =
+                            allRows pages
+                            |> Array.collect (fun row -> [| lineText row.Previous; lineText row.Current |])
+                            |> Array.choose id
+
+                        Vitest.expect(allText |> Array.exists (fun text -> text.Contains "totally" || text.Contains "working")).toBe false
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff of a root commit has an absent previous side and adds every line",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let content = "one\ntwo\nthree\n"
+                do! commitText repository "root.txt" content
+                let! root = revParse repository "HEAD"
+                do! commitText repository "root.txt" "later\n"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! previous, current, pages = revisionDiff service (revisionRequest "root.txt" root) "revision-b"
+                        Vitest.expect(previous.IsAbsent).toBe true
+                        Vitest.expect(previous.Revision).toEqual None
+                        Vitest.expect(previous.ByteLength).toEqual 0L
+                        Vitest.expect(revisionText current).toEqual (Some root)
+                        Vitest.expect(current.ByteLength).toEqual (int64 content.Length)
+                        let changed = changedRows pages
+                        Vitest.expect(changed |> Array.forall (fun (kind, _, _) -> kind = DiffRowKind.Added)).toBe true
+                        Vitest.expect(changed |> Array.choose (fun (_, _, c) -> c)).toEqual [| "one"; "two"; "three" |]
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff of an added file has an absent previous side and of a deleted file an absent current side",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "keep.txt" "keep\n"
+                do! commitText repository "new.txt" "n1\nn2\n"
+                let! added = revParse repository "HEAD"
+                do! commitRemoval repository "new.txt"
+                let! removed = revParse repository "HEAD"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! previous, current, pages = revisionDiff service (revisionRequest "new.txt" added) "revision-c-added"
+                        Vitest.expect(previous.IsAbsent).toBe true
+                        Vitest.expect(current.IsAbsent).toBe false
+                        Vitest.expect(revisionText current).toEqual (Some added)
+                        Vitest.expect(changedRows pages |> Array.choose (fun (_, _, c) -> c)).toEqual [| "n1"; "n2" |]
+
+                        let! previous, current, pages = revisionDiff service (revisionRequest "new.txt" removed) "revision-c-removed"
+                        Vitest.expect(previous.IsAbsent).toBe false
+                        Vitest.expect(current.IsAbsent).toBe true
+                        Vitest.expect(revisionText previous).toEqual (Some added)
+                        Vitest.expect(revisionText current).toEqual None
+                        let changed = changedRows pages
+                        Vitest.expect(changed |> Array.forall (fun (kind, _, _) -> kind = DiffRowKind.Removed)).toBe true
+                        Vitest.expect(changed |> Array.choose (fun (_, p, _) -> p)).toEqual [| "n1"; "n2" |]
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff of a merge commit compares it with its first parent",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "f.txt" "base\n"
+                do! runGitOk repository [| "checkout"; "-q"; "-b"; "side" |]
+                do! commitText repository "f.txt" "side\n"
+                do! runGitOk repository [| "checkout"; "-q"; "-" |]
+                do! commitText repository "main.txt" "main\n"
+                do! runGitOk repository [| "merge"; "-q"; "--no-ff"; "side"; "-m"; "merge side" |]
+                let! merge = revParse repository "HEAD"
+                let! firstParent = revParse repository "HEAD^1"
+                let! secondParent = revParse repository "HEAD^2"
+                Vitest.expect(firstParent <> secondParent).toBe true
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! previous, current, pages = revisionDiff service (revisionRequest "f.txt" merge) "revision-d"
+                        // Against the first parent f.txt changes base -> side. Against the second parent it would not change.
+                        Vitest.expect(revisionText previous).toEqual (Some firstParent)
+                        Vitest.expect(revisionText current).toEqual (Some merge)
+                        let changed = changedRows pages
+                        Vitest.expect(changed |> Array.choose (fun (_, p, _) -> p)).toEqual [| "base" |]
+                        Vitest.expect(changed |> Array.choose (fun (_, _, c) -> c)).toEqual [| "side" |]
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff of a renamed file uses the previous path for the parent",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "old.txt" "one\ntwo\nthree\n"
+                let! parent = revParse repository "HEAD"
+                do! runGitOk repository [| "mv"; "old.txt"; "new.txt" |]
+                do! writeText (NodePath.join [| repository; "new.txt" |]) "one\n2\nthree\n"
+                do! runGitOk repository [| "add"; "--"; "new.txt" |]
+                do! runGitOk repository [| "commit"; "-q"; "-m"; "rename and edit" |]
+                let! renamed = revParse repository "HEAD"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let request = { revisionRequest "new.txt" renamed with PreviousPath = Some(path "old.txt") }
+                        let! previous, current, pages = revisionDiff service request "revision-e"
+                        Vitest.expect(RepositoryPath.value previous.Path).toBe "old.txt"
+                        Vitest.expect(RepositoryPath.value current.Path).toBe "new.txt"
+                        Vitest.expect(revisionText previous).toEqual (Some parent)
+                        let changed = changedRows pages
+                        Vitest.expect(changed |> Array.choose (fun (_, p, _) -> p)).toEqual [| "two" |]
+                        Vitest.expect(changed |> Array.choose (fun (_, _, c) -> c)).toEqual [| "2" |]
+
+                        // Without the previous path the parent has no new.txt, so the whole file is added.
+                        let! withoutPrevious, _, pagesWithout = revisionDiff service (revisionRequest "new.txt" renamed) "revision-e-no-previous"
+                        Vitest.expect(withoutPrevious.IsAbsent).toBe true
+                        Vitest.expect(changedRows pagesWithout |> Array.choose (fun (_, _, c) -> c)).toEqual [| "one"; "2"; "three" |]
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff blocks a committed LFS pointer whose object is missing on either side",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let content = "lfs object content\n"
+                let oid = String.replicate 32 "5e"
+                do! commitText repository "pointer-previous.bin" (pointerFor oid content.Length)
+                do! commitText repository "pointer-previous.bin" "plain text now\n"
+                let! previousSide = revParse repository "HEAD"
+                do! commitText repository "pointer-current.bin" "plain text before\n"
+                do! commitText repository "pointer-current.bin" (pointerFor oid content.Length)
+                let! currentSide = revParse repository "HEAD"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! blockedPrevious = openBlocker service (revisionRequest "pointer-previous.bin" previousSide) "revision-f-previous"
+                        Vitest.expect(blockedPrevious).toEqual (DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some oid))
+                        let! blockedCurrent = openBlocker service (revisionRequest "pointer-current.bin" currentSide) "revision-f-current"
+                        Vitest.expect(blockedCurrent).toEqual (DiffBlocker.LocalContentUnavailable(DiffSide.Current, Some oid))
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff shows the LFS object contents instead of the pointer text when both objects exist",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                let oldContent = "lfs line one\nlfs line two\n"
+                let newContent = "lfs line one\nlfs line 2 changed\n"
+                let oldOid = String.replicate 32 "5e"
+                let newOid = String.replicate 32 "6f"
+                do! commitText repository "data.bin" (pointerFor oldOid oldContent.Length)
+                let! commit1 = revParse repository "HEAD"
+                do! commitText repository "data.bin" (pointerFor newOid newContent.Length)
+                let! commit2 = revParse repository "HEAD"
+                do! writeText (lfsObjectFile repository oldOid) oldContent
+                do! writeText (lfsObjectFile repository newOid) newContent
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! previous, current, pages = revisionDiff service (revisionRequest "data.bin" commit2) "revision-f-present"
+                        let changed = changedRows pages
+                        Vitest.expect(changed |> Array.choose (fun (_, p, _) -> p)).toEqual [| "lfs line two" |]
+                        Vitest.expect(changed |> Array.choose (fun (_, _, c) -> c)).toEqual [| "lfs line 2 changed" |]
+                        Vitest.expect(previous.ByteLength).toEqual (int64 oldContent.Length)
+                        Vitest.expect(current.ByteLength).toEqual (int64 newContent.Length)
+                        Vitest.expect(revisionText previous).toEqual (Some commit1)
+                        Vitest.expect(revisionText current).toEqual (Some commit2)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff reports committed binary content with the Binary blocker",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "b.dat" "plain text\n"
+                do! commitBytes repository "b.dat" [| 0x41; 0x00; 0x42; 0x00; 0x00; 0x43 |]
+                let! toBinary = revParse repository "HEAD"
+                do! commitText repository "b.dat" "plain text again\n"
+                let! fromBinary = revParse repository "HEAD"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! current = openBlocker service (revisionRequest "b.dat" toBinary) "revision-g-current"
+
+                        match current with
+                        | DiffBlocker.Binary(side, _) -> Vitest.expect(side).toEqual DiffSide.Current
+                        | other -> failwith $"Expected Binary on the current side, got %A{other}."
+
+                        let! previous = openBlocker service (revisionRequest "b.dat" fromBinary) "revision-g-previous"
+
+                        match previous with
+                        | DiffBlocker.Binary(side, _) -> Vitest.expect(side).toEqual DiffSide.Previous
+                        | other -> failwith $"Expected Binary on the previous side, got %A{other}."
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff does not end when the working file is edited or deleted while it is open",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "open.txt" (numberedLines "before" 1200)
+                do! commitText repository "open.txt" (numberedLines "after" 1200)
+                let! commit2 = revParse repository "HEAD"
+                do! commitText repository "open.txt" (numberedLines "latest" 1200)
+                let workingPath = NodePath.join [| repository; "open.txt" |]
+                do! writeText workingPath (numberedLines "working" 1200)
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! handle, _, _, first = openedWithFirstPage service (revisionRequest "open.txt" commit2) "revision-h"
+                        let cursor = first.NextCursor |> Option.defaultWith (fun () -> failwith "One complete page only.")
+                        do! writeText workingPath (numberedLines "working" 1200 + "edited after open\n")
+                        let! afterEdit = readPageRaw service handle cursor false "revision-h-edited"
+
+                        match afterEdit with
+                        | Succeeded outcome ->
+                            let mutable next = advanceCursor outcome
+                            do! removeWorkingFile repository "open.txt"
+
+                            while next.IsSome do
+                                let! result = readPageRaw service handle next.Value false "revision-h-deleted"
+
+                                match result with
+                                | Succeeded outcome -> next <- advanceCursor outcome
+                                | Failed failure -> failwith $"ReadPage failed after the working file changed: {failure.Code}"
+                                | PartiallySucceeded _ -> failwith "ReadPage returned partial success."
+                        | Failed failure -> failwith $"ReadPage failed after the working file was edited: {failure.Code}"
+                        | PartiallySucceeded _ -> failwith "ReadPage returned partial success."
+
+                        let! closed = service.Close handle (context "revision-h-close") |> Async.StartAsPromise
+                        ignore (operationValue "Close" closed)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "a diff against the working file still ends with source_changed after the working file is edited",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "open.txt" (numberedLines "before" 1200)
+                do! commitText repository "open.txt" (numberedLines "latest" 1200)
+                let workingPath = NodePath.join [| repository; "open.txt" |]
+                do! writeText workingPath (numberedLines "working" 1200)
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let! handle, _, _, first = openedWithFirstPage service (openRequest "open.txt") "revision-h-control"
+                        let cursor = first.NextCursor |> Option.defaultWith (fun () -> failwith "One complete page only.")
+                        do! writeText workingPath (numberedLines "working" 1200 + "edited after open\n")
+                        let! result = readPageRaw service handle cursor false "revision-h-control-read"
+
+                        match result with
+                        | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.SourceChanged
+                        | Succeeded _
+                        | PartiallySucceeded _ -> failwith "ReadPage succeeded after the working file changed."
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff of committed content on both sides opens and pages under MemoryOnly",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "mem.txt" (numberedLines "before" 1200)
+                do! commitText repository "mem.txt" (numberedLines "after" 1200)
+                let! commit2 = revParse repository "HEAD"
+                do! removeWorkingFile repository "mem.txt"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let request = { revisionRequest "mem.txt" commit2 with Storage = memoryOnly 67108864L }
+                        let! handle, first, storage = openForStorage service request "revision-i"
+
+                        match storage with
+                        | DiffStorage.InMemory _ -> ()
+                        | other -> failwith $"Expected in-memory storage, got %A{other}."
+
+                        let! pages = readAllPages service handle first "revision-i-pages"
+                        Vitest.expect(pages.Length > 1).toBe true
+                        Vitest.expect(pages[pages.Length - 1].OutputComplete).toBe true
+                        Vitest.expect(pages |> Array.exists pageHasChange).toBe true
+                        let! closed = service.Close handle (context "revision-i-close") |> Async.StartAsPromise
+                        ignore (operationValue "Close" closed)
+                    })
+            }
+        )
+
+        Vitest.test (
+            "revision diff fails with a read failure for a missing revision, a non-commit object and revisions that are not full object ids",
+            TestOptions(timeout = 180000),
+            fun () -> promise {
+                let! repository = newRepository ()
+                do! commitText repository "f.txt" "one\n"
+                let! commit1 = revParse repository "HEAD"
+                let! blob = revParse repository "HEAD:f.txt"
+
+                do!
+                    withSession repository (fun service -> promise {
+                        let candidates = [|
+                            "missing object", String.replicate 40 "a"
+                            "blob object", blob
+                            "branch name", "HEAD"
+                            "short id", commit1.Substring(0, 7)
+                            "upper-case id", commit1.ToUpperInvariant()
+                            "expression", commit1 + "^1"
+                        |]
+
+                        for label, revision in candidates do
+                            let! answer = openRaw service (revisionRequest "f.txt" revision) ("revision-j-" + label)
+
+                            match answer with
+                            | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.ReadFailed
+                            | other -> failwith $"Expected a failure for {label}, got %A{other}."
+                    })
             }
         )
 )
