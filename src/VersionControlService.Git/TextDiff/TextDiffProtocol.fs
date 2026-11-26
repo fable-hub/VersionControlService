@@ -626,7 +626,6 @@ let private encodeBlocker (blocker: DiffBlocker) =
             "candidates" ==> encodeArray encodeCandidate candidates
         ]
     | DiffBlocker.NotRegularFile side -> tagged "NotRegularFile" [ "side" ==> encodeSide side ]
-    | DiffBlocker.ProviderUnsupported -> tagged "ProviderUnsupported" []
     | DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes) ->
         tagged "BlobTooLargeForMemory" [
             "side" ==> encodeSide side
@@ -656,7 +655,6 @@ let private decodeBlocker: Decoder<DiffBlocker> =
                 return DiffBlocker.EncodingRequired(side, token, candidates)
             })
         | "NotRegularFile" -> Some(fun value -> field "side" decodeSide value |> Result.map DiffBlocker.NotRegularFile)
-        | "ProviderUnsupported" -> Some(fun _ -> Ok DiffBlocker.ProviderUnsupported)
         | "BlobTooLargeForMemory" ->
             Some(fun value -> decode {
                 let! side = field "side" decodeSide value

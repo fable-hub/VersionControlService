@@ -157,7 +157,6 @@ type DiffBlocker =
     | LocalContentUnavailable of DiffSide * objectId: string option
     | EncodingRequired of DiffSide * PreparationToken * EncodingCandidate[]
     | NotRegularFile of DiffSide
-    | ProviderUnsupported
     /// The session keeps its data in memory and the committed Git blob of this side is larger than the session
     /// may read into memory.
     | BlobTooLargeForMemory of DiffSide * blobBytes: int64 * limitBytes: int64

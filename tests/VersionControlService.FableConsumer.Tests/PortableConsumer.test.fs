@@ -362,145 +362,12 @@ Vitest.describe (
                 Vitest.expect(isLocallyAvailable).toBe (true)
             }
         )
-)
 
-Vitest.describe (
-    "Fallback services (Fable)",
-    fun () ->
         Vitest.test (
-            "availability reports fake services before fallback and all services after",
+            "availability reports the services the fake provider supplies",
             fun () -> promise {
                 let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-availability"
-
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    let before = WorkspaceSession.availability session
-                    let after = session |> WorkspaceSession.withFallbackServices |> WorkspaceSession.availability
-                    return before, after
-                }
-
-                let! before, after = Async.StartAsPromise workflow
-                let expectedBefore: ServiceAvailability = {
-                    Synchronization = true
-                    TextDiff = false
-                    ConflictResolution = true
-                    ObjectMaterialization = true
-                    StoragePolicy = false
-                    Maintenance = false
-                    RepositoryBrowser = false
-                }
-                let expectedAfter: ServiceAvailability = {
-                    Synchronization = true
-                    TextDiff = true
-                    ConflictResolution = true
-                    ObjectMaterialization = true
-                    StoragePolicy = true
-                    Maintenance = true
-                    RepositoryBrowser = true
-                }
-
-                Vitest.expect(before).toEqual (expectedBefore)
-                Vitest.expect(after).toEqual (expectedAfter)
-            }
-        )
-
-        Vitest.test (
-            "repository browser fallback returns a warned no-op",
-            fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-browser"
-
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
-                    let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let browser =
-                        filled.RepositoryBrowser
-                        |> Option.defaultWith (fun () -> failwith "Expected the fallback repository-browser service.")
-                    return! browser.GetRepositoryWebUrl context
-                }
-
-                let! result = Async.StartAsPromise workflow
-
-                match result with
-                | Succeeded outcome ->
-                    Vitest.expect(outcome.Effect).toEqual (NoOp(Some "The provider has no repository browser service."))
-                    Vitest.expect(outcome.Value).toEqual None
-                    Vitest.expect(outcome.Warnings.Length).toBe (1)
-                    Vitest.expect(outcome.Warnings[0].Code).toBe (FallbackServiceCodes.ServiceUnavailable)
-                | PartiallySucceeded _
-                | Failed _ -> failwith "The repository-browser fallback did not return a successful no-op."
-            }
-        )
-
-        Vitest.test (
-            "object materialization fallback returns a warned no-op",
-            fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-object-materialization"
-
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
-                    let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let objects =
-                        filled.ObjectMaterialization
-                        |> Option.defaultWith (fun () ->
-                            failwith "Expected the fallback object materialization service.")
-                    let! materialized = objects.Materialize [| fakePath |] context
-                    let! dematerialized = objects.Dematerialize [| fakePath |] context
-                    return materialized, dematerialized
-                }
-
-                let! materialized, dematerialized = Async.StartAsPromise workflow
-
-                [ materialized; dematerialized ]
-                |> List.iter (fun result ->
-                    match result with
-                    | Succeeded outcome ->
-                        Vitest
-                            .expect(outcome.Effect)
-                            .toEqual (NoOp(Some "The provider has no object materialization service."))
-                        Vitest.expect(outcome.Warnings.Length).toBe (1)
-                        Vitest.expect(outcome.Warnings[0].Code).toBe (FallbackServiceCodes.ServiceUnavailable)
-                    | PartiallySucceeded _
-                    | Failed _ -> failwith "The object materialization fallback did not return a successful no-op.")
-            }
-        )
-
-        Vitest.test (
-            "synchronization fallback reports the service-unavailable failure",
-            fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-synchronization"
-
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
-                    let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let synchronization =
-                        filled.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected the fallback synchronization service.")
-                    return! synchronization.Refresh context
-                }
-
-                let! result = Async.StartAsPromise workflow
-
-                match result with
-                | Failed failure ->
-                    Vitest.expect(failure.Category).toEqual (Unsupported)
-                    Vitest.expect(failure.Code).toBe (FallbackServiceCodes.ServiceUnavailable)
-                | Succeeded _
-                | PartiallySucceeded _ -> failwith "The synchronization fallback did not fail as unsupported."
-            }
-        )
-
-        Vitest.test (
-            "a wrapped factory opens a session with every service present",
-            fun () -> promise {
-                let factory = createFakeFactory () |> ProviderFactory.withFallbackServices
-                let context = OperationContext.detached "portable-fallback-factory"
+                let context = OperationContext.detached "portable-availability"
 
                 let workflow = async {
                     let! session = openFakeSession factory context
@@ -510,12 +377,12 @@ Vitest.describe (
                 let! availability = Async.StartAsPromise workflow
                 let expected: ServiceAvailability = {
                     Synchronization = true
-                    TextDiff = true
+                    TextDiff = false
                     ConflictResolution = true
                     ObjectMaterialization = true
-                    StoragePolicy = true
-                    Maintenance = true
-                    RepositoryBrowser = true
+                    StoragePolicy = false
+                    Maintenance = false
+                    RepositoryBrowser = false
                 }
 
                 Vitest.expect(availability).toEqual (expected)

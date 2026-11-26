@@ -327,6 +327,12 @@ let private openSession (factory: ProviderFactory) =
         return expectSucceeded "open" openResult
     }
 
+let private availabilityDescriptor: WorkspaceDescriptor = {
+    ProviderId = FakeProvider.providerId "fake.availability"
+    WorkspaceRoot = "/test/workspace"
+    Location = None
+}
+
 [<Tests>]
 let contractShapeTests =
     testList "ContractShapes" [
@@ -472,4 +478,41 @@ let contractShapeTests =
             | Succeeded _
             | PartiallySucceeded _ -> failtest "Expected the stale mutation to fail."
         }
+
+        testCase "availability reports only the services the provider supplies"
+        <| fun () ->
+            let coreOnly = WorkspaceSession.createCoreOnly availabilityDescriptor (FakeProvider.createCore ())
+            let withTwoServices = {
+                coreOnly with
+                    ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
+                    RepositoryBrowser = Some(FakeProvider.createBrowser ())
+            }
+            let noneAvailable: ServiceAvailability = {
+                Synchronization = false
+                TextDiff = false
+                ConflictResolution = false
+                ObjectMaterialization = false
+                StoragePolicy = false
+                Maintenance = false
+                RepositoryBrowser = false
+            }
+            let twoAvailable = { noneAvailable with ConflictResolution = true; RepositoryBrowser = true }
+
+            Expect.equal (WorkspaceSession.availability coreOnly) noneAvailable "A core-only session has no optional services."
+            Expect.equal (WorkspaceSession.availability withTwoServices) twoAvailable "Only provider services are reported."
+
+        testCase "availability reports the object materialization service only when the provider supplies it"
+        <| fun () ->
+            let coreOnly = WorkspaceSession.createCoreOnly availabilityDescriptor (FakeProvider.createCore ())
+            let withObjects = {
+                coreOnly with
+                    ObjectMaterialization = Some(FakeProvider.createFinalObjectMaterialization ())
+            }
+
+            Expect.isFalse
+                (WorkspaceSession.availability coreOnly).ObjectMaterialization
+                "A core-only session has no object materialization."
+            Expect.isTrue
+                (WorkspaceSession.availability withObjects).ObjectMaterialization
+                "A supplied object materialization service is reported."
     ]

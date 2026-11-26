@@ -7,10 +7,6 @@ namespace VersionControlService.Abstractions
 /// After prerelease stabilization this record and its service records are frozen: new
 /// capabilities are added as new optional service records, never as new members
 /// on already-published records.
-///
-/// A consumer that wants one code path for every provider fills the absent services
-/// with WorkspaceSession.withFallbackServices and reads WorkspaceSession.availability
-/// beforehand to learn what the provider really supplies.
 type WorkspaceSession = {
     Descriptor: WorkspaceDescriptor
     Core: CoreVersionControl
@@ -36,32 +32,9 @@ type ServiceAvailability = {
     RepositoryBrowser: bool
 }
 
-/// The code the fallback services report. It means the provider supplies no such
-/// service at all. A provider that has the service reports operation_not_supported
-/// for an operation it implements but cannot perform for the given input.
-module FallbackServiceCodes =
-
-    [<Literal>]
-    let ServiceUnavailable = "service_unavailable"
-
 module WorkspaceSession =
 
-    let private unsupported reason =
-        OperationResult.failed (
-            OperationFailure.create Unsupported FallbackServiceCodes.ServiceUnavailable reason
-        )
-
-    /// A fallback answer that changes nothing: a no-op with its reason, plus the same
-    /// code as a warning so a consumer recognizes a fallback answer without inspecting
-    /// the effect.
-    let private noOp (reason: string) (value: 'T) : OperationResult<'T> =
-        Succeeded {
-            OperationOutcome.noOp (Some reason) value with
-                Warnings = [| { Code = FallbackServiceCodes.ServiceUnavailable; Message = reason } |]
-        }
-
-    /// Which optional services the provider supplies. Read it before applying the
-    /// fallback, because a filled session reports every service as present.
+    /// Which optional services the provider supplies.
     let availability (session: WorkspaceSession) : ServiceAvailability = {
         Synchronization = session.Synchronization.IsSome
         TextDiff = session.TextDiff.IsSome
@@ -70,74 +43,6 @@ module WorkspaceSession =
         StoragePolicy = session.StoragePolicy.IsSome
         Maintenance = session.Maintenance.IsSome
         RepositoryBrowser = session.RepositoryBrowser.IsSome
-    }
-
-    let private textDiffReason = "The provider has no text diff service."
-
-    let private noOpTextDiff: TextDiffService = {
-        Open =
-            fun _ _ ->
-                async {
-                    return
-                        noOp
-                            textDiffReason
-                            (Resumable.Ready(OpenDiffResult.NotDiffable DiffBlocker.ProviderUnsupported))
-                }
-        ReadPage = fun _ _ -> async { return unsupported textDiffReason }
-        ReplayPage = fun _ _ -> async { return unsupported textDiffReason }
-        Expand = fun _ _ -> async { return unsupported textDiffReason }
-        ReadLine = fun _ _ -> async { return unsupported textDiffReason }
-        GetSourceInfo = fun _ _ -> async { return unsupported textDiffReason }
-        Close = fun _ _ -> async { return noOp textDiffReason () }
-    }
-
-    let private objectMaterializationReason = "The provider has no object materialization service."
-
-    let private noOpObjectMaterialization: ObjectMaterializationService = {
-        ListObjects = fun _ -> async { return noOp objectMaterializationReason [||] }
-        Materialize = fun _ _ -> async { return noOp objectMaterializationReason () }
-        Dematerialize = fun _ _ -> async { return noOp objectMaterializationReason () }
-    }
-
-    let private storagePolicyReason = "The provider has no storage policy service."
-
-    let private noOpStoragePolicy: StoragePolicyService = {
-        SetPathPolicy = fun _ _ _ -> async { return noOp storagePolicyReason () }
-        GetSettings = fun _ -> async { return noOp storagePolicyReason { AutoPolicyThresholdMb = None; MaterializeLargeObjects = true } }
-        SetSettings = fun _ _ -> async { return noOp storagePolicyReason () }
-    }
-
-    let private storageMaintenanceReason = "The provider has no storage maintenance service."
-
-    let private noOpStorageMaintenance: StorageMaintenanceService = {
-        Prune = fun _ -> async { return noOp storageMaintenanceReason storageMaintenanceReason }
-        Deduplicate = fun _ -> async { return noOp storageMaintenanceReason storageMaintenanceReason }
-        CanDeduplicate = fun _ -> async { return noOp storageMaintenanceReason false }
-    }
-
-    let private repositoryBrowserReason = "The provider has no repository browser service."
-
-    let private noOpRepositoryBrowser: RepositoryBrowserService = {
-        GetRepositoryWebUrl = fun _ -> async { return noOp repositoryBrowserReason None }
-    }
-
-    let private synchronizationReason = "The provider has no synchronization service."
-
-    let private noOpSynchronization: SynchronizationService = {
-        Refresh = fun _ -> async { return unsupported synchronizationReason }
-        PreviewUpdate = fun _ -> async { return unsupported synchronizationReason }
-        Update = fun _ _ -> async { return unsupported synchronizationReason }
-        Publish = fun _ _ -> async { return unsupported synchronizationReason }
-        Synchronize = fun _ _ -> async { return unsupported synchronizationReason }
-    }
-
-    let private conflictResolutionReason = "The provider has no conflict resolution service."
-
-    let private noOpConflictResolution: ConflictResolutionService = {
-        GetActiveSession = fun _ -> async { return noOp conflictResolutionReason None }
-        Resolve = fun _ _ -> async { return unsupported conflictResolutionReason }
-        Finalize = fun _ _ -> async { return unsupported conflictResolutionReason }
-        Cancel = fun _ _ -> async { return unsupported conflictResolutionReason }
     }
 
     /// A core-only session: every optional service absent. Providers add the
@@ -153,32 +58,6 @@ module WorkspaceSession =
         Maintenance = None
         RepositoryBrowser = None
         Close = fun () -> async.Return()
-    }
-
-    /// The session with every absent optional service filled by a fallback, for a
-    /// consumer that wants one code path for every provider. Present services are kept.
-    ///
-    /// Each successful fallback does nothing and carries a service_unavailable warning.
-    /// Opening a paged diff reports an unsupported provider. The text diff requests that read
-    /// a handle fail as Unsupported with the service_unavailable code, and Close succeeds with
-    /// the warning.
-    /// ListObjects returns an empty array, and GetSettings returns no threshold with
-    /// MaterializeLargeObjects = true. GetActiveSession and GetRepositoryWebUrl return None.
-    /// Prune and Deduplicate return the reason as their report. CanDeduplicate returns false.
-    /// Synchronization operations and the conflict session operations Resolve, Finalize and
-    /// Cancel fail as Unsupported with the service_unavailable code.
-    let withFallbackServices (session: WorkspaceSession) : WorkspaceSession = {
-        // Naming every field makes a newly added optional service fail compilation until this fallback handles it.
-        Descriptor = session.Descriptor
-        Core = session.Core
-        Synchronization = Some(Option.defaultValue noOpSynchronization session.Synchronization)
-        TextDiff = Some(Option.defaultValue noOpTextDiff session.TextDiff)
-        ConflictResolution = Some(Option.defaultValue noOpConflictResolution session.ConflictResolution)
-        ObjectMaterialization = Some(Option.defaultValue noOpObjectMaterialization session.ObjectMaterialization)
-        StoragePolicy = Some(Option.defaultValue noOpStoragePolicy session.StoragePolicy)
-        Maintenance = Some(Option.defaultValue noOpStorageMaintenance session.Maintenance)
-        RepositoryBrowser = Some(Option.defaultValue noOpRepositoryBrowser session.RepositoryBrowser)
-        Close = session.Close
     }
 
 /// Provider entry point: probing, verification, provisioning, binding, and opening
@@ -201,36 +80,3 @@ type ProviderFactory = {
     /// Attempts remediation for a component reported by CheckDependencies.
     InstallDependency: string -> OperationContext -> Async<OperationResult<DependencyStatus>>
 }
-
-module ProviderFactory =
-
-    /// Returns a factory whose Open member fills successful and partial sessions
-    /// with fallback services. Failed opens pass through unchanged. A composition root
-    /// wraps its factories before ProviderResolver.tryCreateCatalog and then never
-    /// checks optional service presence again.
-    ///
-    /// A wrapped factory never yields an unfilled session, and a filled session reports
-    /// every service as present. A host that needs the availability report keeps the
-    /// unwrapped factory, or applies WorkspaceSession.withFallbackServices itself after
-    /// reading WorkspaceSession.availability.
-    ///
-    /// Only Open is wrapped. A future member that returns a session has to be added here.
-    let withFallbackServices (factory: ProviderFactory) : ProviderFactory = {
-        factory with
-            Open =
-                fun binding context ->
-                    async {
-                        let! result = factory.Open binding context
-
-                        return
-                            match result with
-                            | Succeeded outcome ->
-                                Succeeded { outcome with Value = WorkspaceSession.withFallbackServices outcome.Value }
-                            | PartiallySucceeded(outcome, failure) ->
-                                PartiallySucceeded(
-                                    { outcome with Value = WorkspaceSession.withFallbackServices outcome.Value },
-                                    failure
-                                )
-                            | Failed failure -> Failed failure
-                    }
-    }

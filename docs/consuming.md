@@ -447,9 +447,7 @@ ordering.
 
 Every session has `Descriptor`, `Core` and `Close`. The eight services are `option`, and a
 provider leaves one absent when it has nothing to offer there. Feature discovery is an
-`Option.isSome` check, and there are two reasonable ways to write a host against that.
-
-### Direct: an absent service stays absent
+`Option.isSome` check.
 
 The host checks presence and enables the matching part of its interface. Someone using a
 provider without synchronization never sees a publish button.
@@ -486,112 +484,8 @@ let describe (session: WorkspaceSession) (context: OperationContext) = async {
 `WorkspaceSession.availability` returns a `ServiceAvailability` record with one boolean
 per service, which is easier to hand to a view model than eight options.
 
-### Filled: every service present, no-ops where the provider has nothing
-
-A host that would rather write one code path fills the gaps.
-`ProviderFactory.withFallbackServices` wraps a factory so every session it opens has
-every service. Wrap at the composition root, before building the catalog, and no later
-code checks presence again.
-
-```fsharp
-let createCatalog (factories: ProviderFactory seq) =
-    factories
-    |> Seq.map ProviderFactory.withFallbackServices
-    |> Resolver.tryCreateCatalog
-```
-
-Most filled operations change nothing, return `Succeeded` and carry a
-`service_unavailable` warning. The synchronization service and the conflict session
-operations `Resolve`, `Finalize` and `Cancel` fail with that code.
-
-A fallback read returns a neutral value. `ListObjects` returns an empty array.
-`GetActiveSession` and `GetRepositoryWebUrl` return `None`. `GetSettings` returns no
-threshold with `MaterializeLargeObjects = true`. `Prune` and `Deduplicate` return the
-reason as their report. `CanDeduplicate` returns `false`.
-
-The text diff fallback returns `NotDiffable ProviderUnsupported` from `Open`. Its
-`ReadPage`, `ReplayPage`, `Expand`, `ReadLine` and `GetSourceInfo` calls fail with
-`service_unavailable`. `Close` does nothing and returns `Succeeded` with that warning.
-lakeFS has no text diff service, so it gets this fallback.
-
-A fallback write also succeeds and changes nothing. `Materialize`, `Dematerialize`,
-`SetPathPolicy` and `SetSettings` return `Succeeded` with the same warning. Read the
-warning before you treat one of these as done. The storage settings reseed in
-[provider authoring](provider-authoring.md) shows why this matters. It tells a host to
-write its saved threshold through `SetSettings` and mark the migration complete only
-after success. On a filled session that success stored nothing, so a host doing that
-migration should check the warning or keep the unwrapped session for it.
-
-A caller that wants to tell a real answer from a filled one reads the warnings:
-
-```fsharp
-let private isFallback (warnings: OperationWarning[]) =
-    warnings
-    |> Array.exists (fun warning -> warning.Code = FallbackServiceCodes.ServiceUnavailable)
-
-let repositoryUrl (session: WorkspaceSession) (context: OperationContext) = async {
-    // Safe on a wrapped factory: every session it opens has every service.
-    let browser = session.RepositoryBrowser |> Option.get
-
-    let! result = browser.GetRepositoryWebUrl context
-
-    match result with
-    | Succeeded outcome -> return Ok(outcome.Value, isFallback outcome.Warnings)
-    | PartiallySucceeded(outcome, _) -> return Ok(outcome.Value, isFallback outcome.Warnings)
-    | Failed failure -> return Error failure
-}
-```
-
-Two groups of operations report the failure and do no quiet work: the whole
-synchronization service, and the conflict mutations `Resolve`, `Finalize` and `Cancel`.
-Both change what a user believes about where their work is. A publish that succeeded as a
-no-op would tell someone their work is safe on a server that never received it.
-
-```fsharp
-match result with
-| Failed failure when failure.Code = FallbackServiceCodes.ServiceUnavailable ->
-    // The provider has no synchronization at all. Hide the action for this workspace.
-    hidePublish ()
-| Failed failure -> showMessage failure.Message
-| Succeeded outcome
-| PartiallySucceeded(outcome, _) -> showState outcome.Value
-```
-
-`service_unavailable` means the provider has no such service. A provider that has the
-service and cannot perform one particular request reports its own
-`operation_not_supported`. The two are different answers and a host can treat them
-differently.
-
-### Reading availability and still filling
-
-A filled session reports every service as present, and a wrapped factory never yields an
-unfilled one. A host that wants the honest report and the uniform code path keeps the
-unwrapped factory and fills each session itself, after reading the report:
-
-```fsharp
-let openWithReport (factory: ProviderFactory) binding (context: OperationContext) = async {
-    let! opened = factory.Open binding context
-
-    match opened with
-    | Failed failure -> return Error failure
-    | Succeeded outcome
-    | PartiallySucceeded(outcome, _) ->
-        let services = WorkspaceSession.availability outcome.Value
-        return Ok(WorkspaceSession.withFallbackServices outcome.Value, services)
-}
-```
-
-### Choosing
-
-Fill the gaps when the host is generic over providers and a missing feature should
-degrade quietly. Keep them absent when the interface changes shape per provider, or when
-a host must never offer an action the provider cannot carry out. Two hosts can make
-opposite choices against the same provider, which is the intent.
-
 `ObjectMaterialization.Materialize` and `Dematerialize` take an array of paths, so one call
 serves a single file and a folder. A call with many paths is faster than one call per path.
-A filled session always has the service, but its fallback changes nothing, so read the
-`service_unavailable` warning before you treat the result as done.
 
 ## Paged text diffs
 
@@ -1458,9 +1352,6 @@ meters use `lakefs-download` and `lakefs-upload`, with the object key in `Item`,
 lakeFS also reports `selected-upload-complete` with the finished transfers in `Completed` and the selected
 paths in `Total`. These codes belong to the provider and are not part of the vocabulary. The providers do not
 normalize each other's messages or meters.
-
-The fallback services of a filled session report no progress. A host that wraps a session with
-`WorkspaceSession.withFallbackServices` receives the events of the provider's own services unchanged.
 
 ### Progress of Git transfers
 

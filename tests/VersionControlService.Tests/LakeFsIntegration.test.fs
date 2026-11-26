@@ -3762,23 +3762,15 @@ Vitest.describe (
             })
 
         liveTest
-            "a filled session keeps the raw event sequence and its fallback services report none"
+            "a refresh and a synchronize without publishing report their steps in order"
             (fun harness -> promise {
                 let! workspace = harness.CreateWorkspace()
-                let raw = workspace.Session
-                let filled = WorkspaceSession.withFallbackServices raw
+                let session = workspace.Session
 
-                let refreshOf (session: WorkspaceSession) (name: string) = promise {
-                    let reports, context = capture name
-                    let! result = run ((syncService session).Refresh context)
-                    expectOutcome "refresh" result |> ignore
-                    return reports
-                }
-
-                let! rawReports = refreshOf raw "step-events-raw-refresh"
-                let! filledReports = refreshOf filled "step-events-filled-refresh"
-                Vitest.expect(stepStarts rawReports).toEqual [| fetchStart |]
-                Vitest.expect(stepStarts filledReports).toEqual (stepStarts rawReports)
+                let refreshReports, refreshContext = capture "step-events-refresh"
+                let! refreshResult = run ((syncService session).Refresh refreshContext)
+                expectOutcome "refresh" refreshResult |> ignore
+                Vitest.expect(stepStarts refreshReports).toEqual [| fetchStart |]
 
                 do!
                     harness.AdvanceTarget workspace [|
@@ -3788,12 +3780,12 @@ Vitest.describe (
                         }
                     |]
 
-                let reports, context = capture "step-events-filled-synchronize"
+                let reports, context = capture "step-events-synchronize"
                 let! status = getStatus workspace
 
                 let! result =
                     run (
-                        (syncService filled).Synchronize
+                        (syncService session).Synchronize
                             {
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                                 ExpectedTargetRevision = None
@@ -3803,21 +3795,7 @@ Vitest.describe (
                             context
                     )
 
-                expectPerformed "filled synchronize" result |> ignore
+                expectPerformed "synchronize" result |> ignore
                 Vitest.expect(stepStarts reports).toEqual [| fetchStart; mergeStart; downloadStart |]
-
-                // The lakeFS session has no object materialization, so the filled one runs the no-op fallback.
-                Vitest.expect(raw.ObjectMaterialization.IsNone).toBe true
-                Vitest.expect(raw.StoragePolicy.IsNone).toBe true
-                Vitest.expect(raw.Maintenance.IsNone).toBe true
-                Vitest.expect(raw.RepositoryBrowser.IsNone).toBe true
-
-                let fallbackReports, fallbackContext = capture "step-events-fallback"
-                let! _ = run ((filled.ObjectMaterialization.Value).ListObjects fallbackContext)
-                let! _ = run ((filled.ObjectMaterialization.Value).Materialize [| mkPath "base.txt" |] fallbackContext)
-                let! _ = run ((filled.StoragePolicy.Value).GetSettings fallbackContext)
-                let! _ = run ((filled.Maintenance.Value).Prune fallbackContext)
-                let! _ = run ((filled.RepositoryBrowser.Value).GetRepositoryWebUrl fallbackContext)
-                Vitest.expect(fallbackReports.Count).toBe 0
             })
 )

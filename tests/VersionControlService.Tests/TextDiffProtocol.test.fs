@@ -146,7 +146,6 @@ let private blockers = [|
     DiffBlocker.LocalContentUnavailable(DiffSide.Previous, None)
     DiffBlocker.EncodingRequired(DiffSide.Current, token, [| { Encoding = "windows-1252"; Preview = "caf\u00e9" }; { Encoding = "latin1"; Preview = "" } |])
     DiffBlocker.NotRegularFile DiffSide.Current
-    DiffBlocker.ProviderUnsupported
     DiffBlocker.BlobTooLargeForMemory(DiffSide.Previous, large, Int64.MaxValue)
 |]
 

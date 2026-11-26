@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -   The library is built and tested with Fable 5.26.0, and the package check no longer compiles the consumer with Fable 5.0.0-alpha.21.
 
+### Removed
+
+-   `WorkspaceSession.withFallbackServices` and `ProviderFactory.withFallbackServices` are removed, together with the stand-in services that filled absent optional services.
+-   `FallbackServiceCodes` and its `FallbackServiceCodes.ServiceUnavailable` code (`service_unavailable`) are removed, because only the stand-in services reported it.
+-   `DiffBlocker.ProviderUnsupported` is removed, because only the stand-in text diff service returned it. A match on `DiffBlocker` has to drop the case.
+
 ## 0.5.0 - 2026-11-19
 
 ### Added
