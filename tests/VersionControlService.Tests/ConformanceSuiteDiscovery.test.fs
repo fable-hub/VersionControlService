@@ -17,7 +17,7 @@ let private registrations = [|
     ConflictProviderSuite.register fakeHarness
     ProvisioningProviderSuite.register fakeHarness
     OperationalProviderSuite.register fakeHarness
-    ExtensionProviderSuites.register fakeHarness
+    OptionalServiceProviderSuites.register fakeHarness
     ConsumerWorkflowSuite.register fakeHarness
 |]
 
@@ -35,7 +35,7 @@ Vitest.describe (
                     "fake / conflict-session profile"
                     "fake / provisioning profile"
                     "fake / operational profile"
-                    "fake / extension suites"
+                    "fake / optional service suites"
                     "fake / consumer workflow profile"
                 |]
 

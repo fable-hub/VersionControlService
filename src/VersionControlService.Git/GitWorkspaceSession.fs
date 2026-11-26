@@ -6113,7 +6113,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
     }
 
 // ---------------------------------------------------------------------------
-// Optional extensions available from the shell
+// Optional services available from the shell
 // ---------------------------------------------------------------------------
 
 let private createBrowser (state: SessionState) : RepositoryBrowserService = {

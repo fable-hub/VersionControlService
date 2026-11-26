@@ -57,7 +57,7 @@ The Git policy-aware constructor is `GitWorkspaceSession.createFactoryWithCreden
 
 ## Session contract
 
-Every `WorkspaceSession` supplies `CoreVersionControl`: status, refs, switching, selected-path revisions, restoration, and diff summaries. `WorkspaceSession.createCoreOnly` is the shortest correct starting point for a provider with no extensions.
+Every `WorkspaceSession` supplies `CoreVersionControl`: status, refs, switching, selected-path revisions, restoration, and diff summaries. `WorkspaceSession.createCoreOnly` is the shortest correct starting point for a provider with no optional services.
 
 Optional services advertise real capability:
 

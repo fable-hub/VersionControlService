@@ -776,7 +776,7 @@ let private registerProfiles () = [|
     ConflictProviderSuite.register lakeFsHarness
     ProvisioningProviderSuite.register lakeFsHarness
     OperationalProviderSuite.register lakeFsHarness
-    ExtensionProviderSuites.register lakeFsHarness
+    OptionalServiceProviderSuites.register lakeFsHarness
     ConsumerWorkflowSuite.register lakeFsHarness
 |]
 
@@ -2589,7 +2589,7 @@ Vitest.describe (
 )
 
 Vitest.describe (
-    "lakeFS / extension suites",
+    "lakeFS / optional service suites",
     fun () ->
         Vitest.test (
             "unclassifiable previews use a retryable provider-neutral failure",

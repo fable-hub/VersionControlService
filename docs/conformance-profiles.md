@@ -11,14 +11,14 @@ The shared Vitest profiles exercise behavior through `ProviderFactory` and `Work
 | Conflict | rotating handles, candidate and supplied-content resolution, finalize/cancel, and destination races |
 | Provisioning | access verification, initialize, clone, bind, destination rules, and dependency reporting |
 | Operational | progress, cancellation, independent sessions, interrupted-mutation cleanup, and redaction |
-| Extensions | advertised services, diff content, materialization, storage policy, maintenance, and browser URLs |
+| Optional services | advertised services, diff content, materialization, storage policy, maintenance, and browser URLs |
 | Consumer workflow | selected save, pending publish, update/conflict flow, branch creation, discard, and optional controls |
 | Step events | one start event for each common step that a refresh, a synchronize or a clone runs, with no numbers and a redacted message that names the step, and no event for a step that did not run |
 | Output | a command entry with its own id for each external call, follow-up entries that share the id of their command and come after it, and redaction of every entry, including against the secrets of the harness |
 
 The step events and output profiles are registered for the Git and lakeFS harnesses only. They stay outside the seven shared profiles, which the in-memory fake registers too, because the fake reports no progress and no output.
 
-Core is required for every opened session. A provider registers optional-profile expectations through `ExpectedServices`. The extension suite calls only services the harness says the provider supports and checks that discovery matches that declaration.
+Core is required for every opened session. A provider registers optional-profile expectations through `ExpectedServices`. The optional service suite calls only services the harness says the provider supports and checks that discovery matches that declaration.
 
 The consumer workflow profile is not an application-specific layer. It combines common operations in the order a typical host uses them and remains provider-neutral.
 

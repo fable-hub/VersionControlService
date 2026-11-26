@@ -407,7 +407,7 @@ let contractShapeTests =
             Expect.equal status.WorkspaceVersion "fake-token-1" "The core works without any optional service."
         }
 
-        testCaseAsync "a synchronization provider needs no object-storage extension"
+        testCaseAsync "a synchronization provider needs no object-storage service"
         <| async {
             let id = FakeProvider.providerId "fake.sync"
 
@@ -429,7 +429,7 @@ let contractShapeTests =
             | None -> failtest "Expected the synchronization service."
         }
 
-        testCaseAsync "an unknown external provider ID with one optional extension round-trips"
+        testCaseAsync "an unknown external provider ID with one optional service round-trips"
         <| async {
             let id = FakeProvider.providerId "vendor.example-vcs"
 
@@ -442,7 +442,7 @@ let contractShapeTests =
             Expect.equal (ProviderId.value factory.Id) "vendor.example-vcs" "External ID round-trips unchanged."
 
             let! session = openSession factory
-            Expect.equal (discoverFeatures session) [ "browser" ] "Only the browser extension is discovered."
+            Expect.equal (discoverFeatures session) [ "browser" ] "Only the browser service is discovered."
         }
 
         testCaseAsync "stale workspace versions are rejected with the stable concurrency code"

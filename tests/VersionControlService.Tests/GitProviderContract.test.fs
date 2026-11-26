@@ -562,7 +562,7 @@ let private registrations = [|
     ConflictProviderSuite.register gitHarness
     ProvisioningProviderSuite.register gitHarness
     OperationalProviderSuite.register gitHarness
-    ExtensionProviderSuites.register gitHarness
+    OptionalServiceProviderSuites.register gitHarness
     ConsumerWorkflowSuite.register gitHarness
 |]
 
@@ -1988,7 +1988,7 @@ Vitest.describe (
 )
 
 Vitest.describe (
-    "Git / extension suites",
+    "Git / optional service suites",
     fun () ->
         Vitest.test (
             "storage policy treats repository paths with glob metacharacters literally",

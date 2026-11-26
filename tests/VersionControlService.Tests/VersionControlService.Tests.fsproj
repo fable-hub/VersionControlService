@@ -11,7 +11,7 @@
     <Compile Include="Contracts\ConflictProviderSuite.fs" />
     <Compile Include="Contracts\ProvisioningProviderSuite.fs" />
     <Compile Include="Contracts\OperationalProviderSuite.fs" />
-    <Compile Include="Contracts\ExtensionProviderSuites.fs" />
+    <Compile Include="Contracts\OptionalServiceProviderSuites.fs" />
     <Compile Include="Contracts\ConsumerWorkflowSuite.fs" />
     <Compile Include="Contracts\StepEventsProviderSuite.fs" />
     <Compile Include="Contracts\OutputProviderSuite.fs" />

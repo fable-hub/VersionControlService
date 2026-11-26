@@ -1,4 +1,4 @@
-module VersionControlService.Tests.Contracts.ExtensionProviderSuites
+module VersionControlService.Tests.Contracts.OptionalServiceProviderSuites
 
 open Fable.Core
 open VersionControlService.Abstractions
@@ -6,10 +6,10 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
-/// Optional extension suites: each runs only when the harness advertises the service.
+/// Optional service suites: each runs only when the harness advertises the service.
 /// Absent services are absent — never stubs.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
-    let profileName = $"{harness.Name} / extension suites"
+    let profileName = $"{harness.Name} / optional service suites"
     let mutable testCount = 0
 
     Vitest.describe (
