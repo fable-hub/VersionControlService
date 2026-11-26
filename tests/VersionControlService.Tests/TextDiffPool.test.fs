@@ -338,7 +338,7 @@ let private failureCode (result: OperationResult<'T>) =
     | Failed failure -> failure.Code
     | other -> failwith $"Expected a failure, got %A{other}"
 
-let private readPage (service: TextDiffService) (handle: DiffHandle) cursor operationContext =
+let private readPage (service: TextDiffPool.TextDiffCalls) (handle: DiffHandle) cursor operationContext =
     service.ReadPage { Handle = handle; Cursor = cursor; Background = false } operationContext |> run
 
 let private waitUntil (condition: unit -> bool) = promise {

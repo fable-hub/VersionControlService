@@ -5,6 +5,8 @@ open Fable.Core.JsInterop
 open VersionControlService.Abstractions
 open VersionControlService.LakeFs
 open VersionControlService.Tests.LakeFsProviderContractTests
+open VersionControlService.Tests.Contracts.ProviderHarness
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -24,6 +26,12 @@ let private expectFailure operation = function
 
 let private repositoryPath value =
     RepositoryPath.tryCreate value |> Result.defaultWith failwith
+
+/// Opens the folder of the workspace again, as a second repository of the provider.
+let private openRequestOf (workspace: HarnessWorkspace) : OpenRequest = {
+    RepositoryRoot = folderOf workspace
+    ConnectionProfileId = (locationOf workspace).ConnectionProfileId
+}
 
 Vitest.describe (
     "lakeFS integration",
@@ -49,22 +57,16 @@ Vitest.describe (
                     NodeFileSystem.writeFileSync unrelatedPath unrelatedBytes NodeFileSystem.TextEncoding.Utf8
 
                     let! initialized =
-                        harness.Factory.Initialize
+                        harness.Provider.Initialize
                             {
                                 TargetPath = workspaceRoot
-                                Location = Some anchor.Binding.Location
+                                Location = Some(locationOf anchor)
                             }
                             (OperationContext.detached "integration-initialize-existing")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let binding = expectValue "initialize existing workspace" initialized
-                    let! opened =
-                        harness.Factory.Open
-                            binding
-                            (OperationContext.detached "integration-open-existing")
-                        |> Async.StartAsPromise
-
-                    let session = expectValue "open initialized workspace" opened
+                    let repository = expectValue "initialize existing workspace" initialized
 
                     Vitest.expect(
                         NodeFileSystem.readFileSync collidingPath NodeFileSystem.TextEncoding.Utf8
@@ -75,7 +77,8 @@ Vitest.describe (
                     ).toBe unrelatedBytes
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "integration-initialize-existing-status")
+                        harness.Provider.GetStatus repository (OperationContext.detached "integration-initialize-existing-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "initialized workspace status" statusResult
@@ -113,12 +116,12 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
 
                     let index =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected a persisted index before the restore collision."
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     for path, content in [|
@@ -150,32 +153,35 @@ Vitest.describe (
 
                     match
                         LakeFsWorkspaceIndex.save
-                            (stateDirectoryForBinding workspace.Binding)
+                            (stateDirectoryOf workspace)
                             { index with WorkspaceRevision = Some commit.Id }
                     with
                     | Error message -> failwith message
                     | Ok _ -> ()
 
                     let! reopened =
-                        harness.Factory.Open
-                            workspace.Binding
+                        harness.Provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "integration-restore-collision-reopen")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "reopen for restore collision" reopened
+                    let repository = expectValue "reopen for restore collision" reopened
                     let! statusResult =
-                        session.Core.GetStatus
+                        harness.Provider.GetStatus repository
                             (OperationContext.detached "integration-restore-collision-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "restore collision status" statusResult
                     let! restoreResult =
-                        session.Core.RestorePaths
+                        harness.Provider.RestorePaths repository
                             {
                                 Paths = [| repositoryPath "Case.txt"; repositoryPath "case.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "integration-restore-collision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     if workspace.LocalFileSystemAliasesCase then
@@ -217,13 +223,14 @@ Vitest.describe (
                     do! workspace.WriteFile "zzz-restore-second.txt" "tracked second bytes\n"
 
                     let! revisionStatusResult =
-                        workspace.Session.Core.GetStatus
+                        workspace.Provider.GetStatus workspace.Repository
                             (OperationContext.detached "restore-materialization-revision-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let revisionStatus = expectValue "restore materialization revision status" revisionStatusResult
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: tracked restore objects"
                                 Paths = [|
@@ -233,13 +240,14 @@ Vitest.describe (
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (OperationContext.detached "restore-materialization-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "restore materialization revision" revisionResult |> ignore
                     do! workspace.WriteFile "000-restore-first.txt" "dirty first bytes\n"
                     do! workspace.WriteFile "zzz-restore-second.txt" "dirty second bytes\n"
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "materialization-apply-object" then
@@ -250,20 +258,22 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! reopened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "restore-materialization-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "restore materialization open" reopened
-                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let repository = expectValue "restore materialization open" reopened
+                    let stateDirectory = stateDirectoryOf workspace
                     let before =
                         match LakeFsWorkspaceIndex.load stateDirectory with
                         | LakeFsWorkspaceIndex.Loaded index -> index
@@ -284,13 +294,14 @@ Vitest.describe (
                         |> Array.find (fun stat -> stat.Path = "000-restore-first.txt")
 
                     let! statusResult =
-                        session.Core.GetStatus
+                        provider.GetStatus repository
                             (OperationContext.detached "restore-materialization-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "restore materialization status" statusResult
                     let! restored =
-                        session.Core.RestorePaths
+                        provider.RestorePaths repository
                             {
                                 Paths = [|
                                     repositoryPath "000-restore-first.txt"
@@ -299,6 +310,7 @@ Vitest.describe (
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "restore-materialization-restore")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -395,9 +407,9 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    linkedDirectory <- NodePath.join [| workspace.Binding.RepositoryRoot; "nested" |]
-                    backupDirectory <- NodePath.join [| workspace.Binding.RepositoryRoot; "nested-safe" |]
-                    outsideDirectory <- workspace.Binding.RepositoryRoot + "-outside"
+                    linkedDirectory <- NodePath.join [| folderOf workspace; "nested" |]
+                    backupDirectory <- NodePath.join [| folderOf workspace; "nested-safe" |]
+                    outsideDirectory <- folderOf workspace + "-outside"
                     NodeFileSystem.mkdirSync outsideDirectory (NodeFileSystem.MkdirOptions(recursive = true))
                     do! workspace.WriteFile "nested/selected.txt" "safe selected bytes\n"
                     NodeFileSystem.writeFileSync
@@ -405,7 +417,7 @@ Vitest.describe (
                         "outside secret must not upload\n"
                         NodeFileSystem.TextEncoding.Utf8
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "selected-revision-sources-classified" then
@@ -421,43 +433,47 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "integration-source-swap-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "open source-swap session" opened
+                    let repository = expectValue "open source-swap session" opened
                     let beforeIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected an index before the selected-source race."
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "integration-source-swap-status")
+                        provider.GetStatus repository (OperationContext.detached "integration-source-swap-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "source-swap status" statusResult
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: reject source swap"
                                 Paths = [| repositoryPath "nested/selected.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "integration-source-swap-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     do! cleanupRace ()
                     Vitest.expect(barrierRan).toBe true
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! branchResult =
@@ -471,7 +487,7 @@ Vitest.describe (
                     let branch = branchResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     Vitest.expect(Some branch.CommitId).toEqual beforeIndex.WorkspaceRevision
 
-                    match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                    match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                     | LakeFsWorkspaceIndex.Loaded afterIndex ->
                         Vitest.expect(afterIndex.WorkspaceRevision).toEqual beforeIndex.WorkspaceRevision
                     | _ -> failwith "Expected the selected-source race to preserve the index."
@@ -513,11 +529,11 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    selectedPath <- NodePath.join [| workspace.Binding.RepositoryRoot; "selected.txt" |]
-                    backupPath <- NodePath.join [| workspace.Binding.RepositoryRoot; "selected-original.txt" |]
+                    selectedPath <- NodePath.join [| folderOf workspace; "selected.txt" |]
+                    backupPath <- NodePath.join [| folderOf workspace; "selected-original.txt" |]
                     do! workspace.WriteFile "selected.txt" "classified selected bytes\n"
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "selected-revision-sources-classified" then
@@ -531,43 +547,47 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "integration-source-replace-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "open source-replace session" opened
+                    let repository = expectValue "open source-replace session" opened
                     let beforeIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected an index before the selected-source replacement race."
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "integration-source-replace-status")
+                        provider.GetStatus repository (OperationContext.detached "integration-source-replace-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "source-replace status" statusResult
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: reject source replacement"
                                 Paths = [| repositoryPath "selected.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "integration-source-replace-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     cleanupRace ()
                     Vitest.expect(barrierRan).toBe true
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! branchResult =
@@ -581,7 +601,7 @@ Vitest.describe (
                     let branch = branchResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     Vitest.expect(Some branch.CommitId).toEqual beforeIndex.WorkspaceRevision
 
-                    match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                    match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                     | LakeFsWorkspaceIndex.Loaded afterIndex ->
                         Vitest.expect(afterIndex.WorkspaceRevision).toEqual beforeIndex.WorkspaceRevision
                     | _ -> failwith "Expected the selected-source replacement race to preserve the index."
@@ -612,7 +632,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let branchName = "materialization-prepare-cancel"
@@ -654,7 +674,7 @@ Vitest.describe (
 
                     committed |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "materialization-prepare-object" then
@@ -665,26 +685,29 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "materialization-prepare-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "materialization prepare open" opened
+                    let repository = expectValue "materialization prepare open" opened
                     let before =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before prepare cancellation."
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "materialization-prepare-status")
+                        provider.GetStatus repository (OperationContext.detached "materialization-prepare-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "materialization prepare status" statusResult
@@ -695,12 +718,13 @@ Vitest.describe (
                             ignore
 
                     let! switched =
-                        session.Core.SwitchRef
+                        provider.SwitchRef repository
                             {
                                 TargetRef = ProviderRef.tryCreate $"lakefs:{branchName}" |> Result.defaultWith failwith
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             switchContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure =
@@ -718,14 +742,14 @@ Vitest.describe (
                     Vitest.expect(first).toEqual None
                     Vitest.expect(second).toEqual None
 
-                    match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                    match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                     | LakeFsWorkspaceIndex.Loaded after ->
                         Vitest.expect(after.WorkspaceRevision).toEqual before.WorkspaceRevision
                         Vitest.expect(after.Entries).toEqual before.Entries
                     | _ -> failwith "Expected prepare cancellation to preserve the index."
 
                     let transactionsDirectory =
-                        NodePath.join [| stateDirectoryForBinding workspace.Binding; "transactions" |]
+                        NodePath.join [| stateDirectoryOf workspace; "transactions" |]
 
                     Vitest.expect(NodeFileSystem.readdirSync transactionsDirectory).toEqual [||]
                     do! harness.Cleanup()
@@ -748,7 +772,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let branchName = "materialization-apply-failure"
@@ -808,7 +832,7 @@ Vitest.describe (
                     do! workspace.WriteFile "000-apply-first.txt" "old first bytes\n"
                     do! workspace.WriteFile "zzz-apply-second.txt" "old second bytes\n"
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "materialization-apply-object" then
@@ -819,37 +843,41 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "materialization-apply-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "materialization apply open" opened
-                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let repository = expectValue "materialization apply open" opened
+                    let stateDirectory = stateDirectoryOf workspace
                     let before =
                         match LakeFsWorkspaceIndex.load stateDirectory with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before apply failure."
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "materialization-apply-status")
+                        provider.GetStatus repository (OperationContext.detached "materialization-apply-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "materialization apply status" statusResult
                     let! switched =
-                        session.Core.SwitchRef
+                        provider.SwitchRef repository
                             {
                                 TargetRef = ProviderRef.tryCreate $"lakefs:{branchName}" |> Result.defaultWith failwith
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "materialization-apply-switch")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -925,7 +953,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let branchName = "materialization-apply-cancellation"
@@ -985,7 +1013,7 @@ Vitest.describe (
                     do! workspace.WriteFile "000-cancel-first.txt" "old first bytes\n"
                     do! workspace.WriteFile "zzz-cancel-second.txt" "old second bytes\n"
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "materialization-apply-object" then
@@ -996,27 +1024,30 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "materialization-apply-cancel-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "materialization apply cancellation open" opened
-                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let repository = expectValue "materialization apply cancellation open" opened
+                    let stateDirectory = stateDirectoryOf workspace
                     let before =
                         match LakeFsWorkspaceIndex.load stateDirectory with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before apply cancellation."
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "materialization-apply-cancel-status")
+                        provider.GetStatus repository (OperationContext.detached "materialization-apply-cancel-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "materialization apply cancellation status" statusResult
@@ -1027,12 +1058,13 @@ Vitest.describe (
                             ignore
 
                     let! switched =
-                        session.Core.SwitchRef
+                        provider.SwitchRef repository
                             {
                                 TargetRef = ProviderRef.tryCreate $"lakefs:{branchName}" |> Result.defaultWith failwith
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             switchContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -1100,8 +1132,8 @@ Vitest.describe (
                     let! first = harness.CreateWorkspace()
                     let! second = harness.CreateLinkedWorkspace first
 
-                    let firstIndex = LakeFsWorkspaceIndex.load (stateDirectoryForBinding first.Binding)
-                    let secondIndex = LakeFsWorkspaceIndex.load (stateDirectoryForBinding second.Binding)
+                    let firstIndex = LakeFsWorkspaceIndex.load (stateDirectoryOf first)
+                    let secondIndex = LakeFsWorkspaceIndex.load (stateDirectoryOf second)
 
                     let firstWorkspaceIndex =
                         match firstIndex with
@@ -1118,14 +1150,15 @@ Vitest.describe (
                     Vitest.expect(secondWorkspaceIndex.OwnershipToken.Length).toBeGreaterThan (20)
 
                     let firstLeaf =
-                        first.Binding.RepositoryRoot.Replace('\\', '/').TrimEnd('/').Split('/')
+                        (folderOf first).Replace('\\', '/').TrimEnd('/').Split('/')
                         |> Array.last
                         |> _.ToLowerInvariant()
 
                     Vitest.expect(firstWorkspaceIndex.WorkspaceBranch).toContain (firstLeaf)
 
                     let! refsResult =
-                        first.Session.Core.ListRefs(OperationContext.detached "integration-list-refs")
+                        first.Provider.ListRefs first.Repository (OperationContext.detached "integration-list-refs")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let logicalRefs = expectValue "list refs" refsResult
@@ -1138,7 +1171,7 @@ Vitest.describe (
                     ).toBe (false)
 
                     let parsedLocation =
-                        LakeFsTypes.LakeFsLocation.tryParse first.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf first).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! branches =
@@ -1172,12 +1205,13 @@ Vitest.describe (
                     do! workspace.WriteFile "interrupted.txt" "interrupted content\n"
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "interruption-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "interruption-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "interruption status" statusResult
                     let before =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before interruption."
 
@@ -1191,13 +1225,14 @@ Vitest.describe (
                                     cancelAfterUpload.Cancel())
 
                     let! interruptedResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "interrupted selected revision"
                                 Paths = [| repositoryPath "interrupted.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             interruptContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     let interrupted = expectFailure "interrupted selected revision" interruptedResult
@@ -1205,14 +1240,14 @@ Vitest.describe (
                     Vitest.expect(interrupted.StateChanged).toBe false
 
                     let afterCleanup =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after interruption cleanup."
 
                     Vitest.expect(afterCleanup.WorkspaceRevision).toEqual (before.WorkspaceRevision)
                     Vitest.expect(afterCleanup.Generation).toBe (before.Generation)
 
-                    let parsed = LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation |> Result.defaultWith failwith
+                    let parsed = LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation |> Result.defaultWith failwith
                     let! cleanedBranchResult =
                         LakeFsApi.getBranch
                             (connection ())
@@ -1225,30 +1260,33 @@ Vitest.describe (
                     Vitest.expect(Some cleanedBranch.CommitId).toEqual (before.WorkspaceRevision)
 
                     let! retryStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "interruption-retry-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "interruption-retry-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let retryStatus = expectValue "retry status" retryStatusResult
                     let! retryResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "retry interrupted selected revision"
                                 Paths = [| repositoryPath "interrupted.txt" |]
                                 ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                             }
                             (OperationContext.detached "interruption-retry")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "interruption retry" retryResult |> ignore
 
                     do! workspace.WriteFile "moved-during-interruption.txt" "selected content in moved branch\n"
                     let! movedStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "moved-interruption-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "moved-interruption-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let movedStatus = expectValue "moved interruption status" movedStatusResult
                     let beforeMoved =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the moved interruption."
 
@@ -1267,13 +1305,14 @@ Vitest.describe (
                                     cancelMoved.Cancel())
 
                     let! movedResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "interrupted while workspace branch moves"
                                 Paths = [| repositoryPath "moved-during-interruption.txt" |]
                                 ExpectedRepositoryVersion = movedStatus.RepositoryVersion
                             }
                             movedContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     let movedFailure = expectFailure "moved interrupted revision" movedResult
@@ -1293,7 +1332,7 @@ Vitest.describe (
                     Vitest.expect(Some movedBranch.CommitId).not.toEqual (beforeMoved.WorkspaceRevision)
 
                     let afterMoved =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the moved interruption."
 
@@ -1317,9 +1356,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do!
                         harness.AdvanceTarget workspace [|
@@ -1327,11 +1363,11 @@ Vitest.describe (
                         |]
 
                     let before =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the update race."
 
-                    let parsed = LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation |> Result.defaultWith failwith
+                    let parsed = LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation |> Result.defaultWith failwith
                     let! targetResult =
                         LakeFsApi.getBranch
                             (connection ())
@@ -1342,7 +1378,8 @@ Vitest.describe (
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-race-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-race-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "update race status" statusResult
@@ -1353,9 +1390,10 @@ Vitest.describe (
                         |]
 
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "update-race")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -1400,7 +1438,7 @@ Vitest.describe (
                     | None -> failwith "The merge changed the workspace branch and must report partial success."
 
                     let after =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the update race."
 
@@ -1435,9 +1473,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do!
                         harness.AdvanceTarget workspace [|
@@ -1447,7 +1482,8 @@ Vitest.describe (
                     do! workspace.WriteFile "base.txt" "local base content\n"
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "update-preserve-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "update-preserve-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "update preserve preview" previewResult
@@ -1455,14 +1491,16 @@ Vitest.describe (
                     Vitest.expect(preview.WouldCreateConflictSession).toBe false
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-preserve-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "update preserve status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "update-preserve")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "update preserve" updateResult |> ignore
@@ -1473,7 +1511,8 @@ Vitest.describe (
                     Vitest.expect(localContent).toEqual(Some "local base content\n")
 
                     let! afterStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-after-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-preserve-after-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let afterStatus = expectValue "update preserve after status" afterStatusResult
@@ -1500,27 +1539,26 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do! workspace.WriteFile "committed-local.txt" "committed local content\n"
 
                     let! beforeRevisionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-local-commit-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-preserve-local-commit-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let beforeRevisionStatus =
                         expectValue "update preserve local commit status" beforeRevisionStatusResult
 
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: commit local file before update"
                                 Paths = [| repositoryPath "committed-local.txt" |]
                                 ExpectedRepositoryVersion = beforeRevisionStatus.RepositoryVersion
                             }
                             (OperationContext.detached "update-preserve-local-commit-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "update preserve local commit revision" revisionResult |> ignore
@@ -1533,7 +1571,8 @@ Vitest.describe (
                         |]
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "update-preserve-local-commit-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "update-preserve-local-commit-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "update preserve local commit preview" previewResult
@@ -1541,14 +1580,16 @@ Vitest.describe (
                     Vitest.expect(preview.WouldCreateConflictSession).toBe false
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-local-commit-update-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-preserve-local-commit-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "update preserve local commit update status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "update-preserve-local-commit-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "update preserve local commit" updateResult |> ignore
@@ -1557,7 +1598,8 @@ Vitest.describe (
                     Vitest.expect(localContent).toEqual(Some "uncommitted local content\n")
 
                     let! afterStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-preserve-local-commit-after-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-preserve-local-commit-after-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let afterStatus = expectValue "update preserve local commit after status" afterStatusResult
@@ -1584,9 +1626,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do! workspace.RemoveFile "base.txt"
 
@@ -1596,14 +1635,16 @@ Vitest.describe (
                         |]
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-local-deletion-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-local-deletion-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "local deletion status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "update-local-deletion")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "local deletion update" updateResult |> ignore
@@ -1614,7 +1655,8 @@ Vitest.describe (
                     Vitest.expect(targetContent).toEqual(Some "target after deletion\n")
 
                     let! afterStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "update-local-deletion-after-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "update-local-deletion-after-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let afterStatus = expectValue "local deletion after status" afterStatusResult
@@ -1649,7 +1691,7 @@ Vitest.describe (
                         |]
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -1661,7 +1703,7 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "materialization-prepare-object" then
@@ -1672,25 +1714,25 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "post-merge-materialization-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "post-merge materialization open" opened
-                    let synchronization =
-                        session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+                    let repository = expectValue "post-merge materialization open" opened
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "post-merge-materialization-preview")
+                        provider.Synchronization.PreviewUpdate repository (OperationContext.detached "post-merge-materialization-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "post-merge materialization preview" previewResult
@@ -1698,14 +1740,16 @@ Vitest.describe (
                     Vitest.expect(preview.WouldCreateConflictSession).toBe false
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "post-merge-materialization-status")
+                        provider.GetStatus repository (OperationContext.detached "post-merge-materialization-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "post-merge materialization status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        provider.Synchronization.Update repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "post-merge-materialization-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -1739,9 +1783,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do! workspace.RemoveFile "base.txt"
                     do! workspace.WriteFile "base.txt" "recreated locally after target deletion\n"
@@ -1751,31 +1792,31 @@ Vitest.describe (
                         |]
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "finalize-deletion-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "finalize-deletion-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "finalize deletion preview" previewResult
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-deletion-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-deletion-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "finalize deletion status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "finalize-deletion-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectFailure "finalize deletion update" updateResult |> ignore
 
-                    let conflicts =
-                        workspace.Session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
-
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-deletion-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "finalize-deletion-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -1783,12 +1824,13 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-deletion-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-deletion-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "finalize deletion resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -1796,22 +1838,25 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (OperationContext.detached "finalize-deletion-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "finalize deletion resolution" resolutionResult
                     let! finalizeStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-deletion-finalize-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-deletion-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectValue "finalize deletion finalize status" finalizeStatusResult
                     let! finalizeResult =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "finalize target deletion"
                             }
                             (OperationContext.detached "finalize-deletion-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "finalize target deletion" finalizeResult |> ignore
@@ -1819,7 +1864,7 @@ Vitest.describe (
                     Vitest.expect(content).toEqual None
 
                     let afterIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the conflict finalize."
 
@@ -1848,16 +1893,16 @@ Vitest.describe (
 
                     // The foreign object is staged from the barrier after the merge, because lakeFS
                     // refuses to merge into a branch that already has uncommitted changes.
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "finalize-merge-verified" then
                                     let parsedForStage =
-                                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                                         |> Result.defaultWith failwith
 
                                     let indexForStage =
-                                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                                         | LakeFsWorkspaceIndex.Loaded value -> value
                                         | _ -> failwith "Expected an index before staging the unrelated object."
 
@@ -1867,43 +1912,43 @@ Vitest.describe (
                                             parsedForStage.Repository
                                             indexForStage.WorkspaceBranch
                                             "staged-unrelated.txt"
-                                            (NodePath.join [| workspace.Binding.RepositoryRoot; "conflict.txt" |])
+                                            (NodePath.join [| folderOf workspace; "conflict.txt" |])
                                             (OperationContext.detached "finalize-paths-stage-unrelated")
 
                                     staged |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! hookedOpen =
-                        factory.Open workspace.Binding (OperationContext.detached "finalize-paths-open")
+                        provider.Open (openRequestOf workspace) (OperationContext.detached "finalize-paths-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "finalize paths open" hookedOpen
-
-                    let synchronization =
-                        session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+                    let repository = expectValue "finalize paths open" hookedOpen
 
                     do! workspace.WriteFile "conflict.txt" "workspace conflict content\n"
                     let! beforeRevisionStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-paths-save-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-paths-save-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let beforeRevisionStatus = expectValue "finalize paths save status" beforeRevisionStatusResult
                     let! beforeRevisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: workspace conflict content"
                                 Paths = [| repositoryPath "conflict.txt" |]
                                 ExpectedRepositoryVersion = beforeRevisionStatus.RepositoryVersion
                             }
                             (OperationContext.detached "finalize-paths-save")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "finalize paths save" beforeRevisionResult |> ignore
@@ -1913,7 +1958,7 @@ Vitest.describe (
                         |]
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -1926,35 +1971,36 @@ Vitest.describe (
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     let beforeIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the conflict update."
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "finalize-paths-preview")
+                        provider.Synchronization.PreviewUpdate repository (OperationContext.detached "finalize-paths-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "finalize paths preview" previewResult
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-paths-update-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-paths-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "finalize paths update status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        provider.Synchronization.Update repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "finalize-paths-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectFailure "finalize paths update" updateResult |> ignore
-                    let conflicts =
-                        session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
 
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-paths-session")
+                        provider.ConflictResolution.GetActiveSession repository (OperationContext.detached "finalize-paths-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -1962,12 +2008,13 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
                     let! resolutionStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-paths-resolution-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-paths-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "finalize paths resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        provider.ConflictResolution.Resolve repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -1975,22 +2022,25 @@ Vitest.describe (
                                 Resolution = PickCandidate "workspace"
                             }
                             (OperationContext.detached "finalize-paths-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "finalize paths resolution" resolutionResult
                     let! finalizeStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-paths-finalize-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-paths-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectValue "finalize paths finalize status" finalizeStatusResult
                     let! finalizeResult =
-                        conflicts.Finalize
+                        provider.ConflictResolution.Finalize repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "finalize only reviewed paths"
                             }
                             (OperationContext.detached "finalize-paths-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizedRevision = expectValue "finalize only reviewed paths" finalizeResult
@@ -2046,9 +2096,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do!
                         harness.AdvanceTarget workspace [|
@@ -2057,41 +2104,43 @@ Vitest.describe (
                     do! workspace.WriteFile "new-conflict.txt" "workspace new content\n"
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "unadvertised-base-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "unadvertised-base-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "unadvertised base preview" previewResult
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "unadvertised-base-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "unadvertised-base-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "unadvertised base status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "unadvertised-base-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectFailure "unadvertised base update" updateResult |> ignore
-                    let conflicts =
-                        workspace.Session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
 
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "unadvertised-base-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "unadvertised-base-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
                         expectValue "unadvertised base session" sessionResult
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "unadvertised-base-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "unadvertised-base-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "unadvertised base resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -2099,6 +2148,7 @@ Vitest.describe (
                                 Resolution = PickCandidate "base"
                             }
                             (OperationContext.detached "unadvertised-base-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectFailure "unadvertised base resolution" resolutionResult
@@ -2123,9 +2173,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do!
                         harness.AdvanceTarget workspace [|
@@ -2137,7 +2184,7 @@ Vitest.describe (
                     do! workspace.WriteFile "dirty-unrelated.txt" "dirty local content\n"
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -2150,32 +2197,32 @@ Vitest.describe (
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "finalize-write-set-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "finalize-write-set-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "finalize write set preview" previewResult
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let! updateStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-write-set-update-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-write-set-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateStatus = expectValue "finalize write set update status" updateStatusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (OperationContext.detached "finalize-write-set-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateFailure = expectFailure "finalize write set update" updateResult
                     Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
 
-                    let conflicts =
-                        workspace.Session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
-
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-write-set-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "finalize-write-set-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -2183,12 +2230,13 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-write-set-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-write-set-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "finalize write set resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -2196,22 +2244,25 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (OperationContext.detached "finalize-write-set-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "finalize write set resolution" resolutionResult
                     let! finalizeStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-write-set-finalize-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-write-set-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectValue "finalize write set finalize status" finalizeStatusResult
                     let! finalizeResult =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "finalize reviewed write set"
                             }
                             (OperationContext.detached "finalize-write-set-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "finalize write set finalize" finalizeResult |> ignore
@@ -2222,7 +2273,7 @@ Vitest.describe (
                     Vitest.expect(dirtyUnrelated).toEqual(Some "dirty local content\n")
 
                     let afterIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the conflict finalize."
 
@@ -2247,7 +2298,7 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "finalize-before-completion" && cancelFirstFinalize then
@@ -2256,22 +2307,21 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "finalize-cancel-after-merge-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "finalize cancel after merge open" opened
-                    let synchronization =
-                        session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+                    let repository = expectValue "finalize cancel after merge open" opened
 
                     do!
                         harness.AdvanceTarget workspace [|
@@ -2283,7 +2333,7 @@ Vitest.describe (
                     do! workspace.WriteFile "dirty-unrelated.txt" "dirty local content\n"
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -2296,30 +2346,31 @@ Vitest.describe (
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "finalize-cancel-after-merge-preview")
+                        provider.Synchronization.PreviewUpdate repository (OperationContext.detached "finalize-cancel-after-merge-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "finalize cancel after merge preview" previewResult
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let! updateStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-update-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-cancel-after-merge-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateStatus = expectValue "finalize cancel after merge update status" updateStatusResult
                     let! updateResult =
-                        synchronization.Update
+                        provider.Synchronization.Update repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (OperationContext.detached "finalize-cancel-after-merge-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectFailure "finalize cancel after merge update" updateResult |> ignore
-                    let conflicts =
-                        session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
 
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-cancel-after-merge-session")
+                        provider.ConflictResolution.GetActiveSession repository (OperationContext.detached "finalize-cancel-after-merge-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -2327,12 +2378,13 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
                     let! resolutionStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-resolution-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-cancel-after-merge-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "finalize cancel after merge resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        provider.ConflictResolution.Resolve repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -2340,16 +2392,18 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (OperationContext.detached "finalize-cancel-after-merge-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "finalize cancel after merge resolution" resolutionResult
                     let! finalizeStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-finalize-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-cancel-after-merge-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectValue "finalize cancel after merge finalize status" finalizeStatusResult
                     let beforeIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before conflict finalize."
 
@@ -2369,13 +2423,14 @@ Vitest.describe (
                             ignore
 
                     let! firstFinalizeResult =
-                        conflicts.Finalize
+                        provider.ConflictResolution.Finalize repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "finalize reviewed write set"
                             }
                             firstFinalizeContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     let firstFailure =
@@ -2401,7 +2456,8 @@ Vitest.describe (
                     Vitest.expect(branchAfter.CommitId).not.toEqual branchBefore.CommitId
 
                     let! activeAfterFailureResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-cancel-after-merge-session-after")
+                        provider.ConflictResolution.GetActiveSession repository (OperationContext.detached "finalize-cancel-after-merge-session-after")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let activeAfterFailure =
@@ -2409,18 +2465,20 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "The conflict session closed after canceled finalize.")
 
                     let! retryStatusResult =
-                        session.Core.GetStatus(OperationContext.detached "finalize-cancel-after-merge-retry-status")
+                        provider.GetStatus repository (OperationContext.detached "finalize-cancel-after-merge-retry-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let retryStatus = expectValue "finalize cancel after merge retry status" retryStatusResult
                     let! retryResult =
-                        conflicts.Finalize
+                        provider.ConflictResolution.Finalize repository
                             {
                                 Handle = activeAfterFailure.Handle
                                 ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                 Message = Some "retry finalize reviewed write set"
                             }
                             (OperationContext.detached "finalize-cancel-after-merge-retry")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "finalize cancel after merge retry" retryResult |> ignore
@@ -2428,7 +2486,7 @@ Vitest.describe (
                     Vitest.expect(targetUnrelated).toEqual(Some "target unrelated content\n")
 
                     let afterIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after conflict finalize."
 
@@ -2452,9 +2510,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do!
                         harness.AdvanceTarget workspace [|
@@ -2468,25 +2523,27 @@ Vitest.describe (
                     // The local edit is committed, so the destination-wins merge already holds it and the
                     // workspace pick changes nothing on the branch.
                     let! revisionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-revision-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-merge-commit-revision-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let revisionStatus = expectValue "finalize merge commit revision status" revisionStatusResult
 
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: local conflict content"
                                 Paths = [| repositoryPath "conflict.txt" |]
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (OperationContext.detached "finalize-merge-commit-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "finalize merge commit revision" revisionResult |> ignore
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -2499,32 +2556,32 @@ Vitest.describe (
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "finalize-merge-commit-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "finalize-merge-commit-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "finalize merge commit preview" previewResult
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let! updateStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-update-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-merge-commit-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateStatus = expectValue "finalize merge commit update status" updateStatusResult
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (OperationContext.detached "finalize-merge-commit-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateFailure = expectFailure "finalize merge commit update" updateResult
                     Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
 
-                    let conflicts =
-                        workspace.Session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
-
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-merge-commit-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "finalize-merge-commit-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -2532,12 +2589,13 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-merge-commit-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "finalize merge commit resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -2545,22 +2603,25 @@ Vitest.describe (
                                 Resolution = PickCandidate "workspace"
                             }
                             (OperationContext.detached "finalize-merge-commit-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "finalize merge commit resolution" resolutionResult
                     let! finalizeStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-merge-commit-finalize-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-merge-commit-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectValue "finalize merge commit finalize status" finalizeStatusResult
                     let! finalizeResult =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "finalize unchanged resolution"
                             }
                             (OperationContext.detached "finalize-merge-commit-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizedRevision =
@@ -2578,7 +2639,7 @@ Vitest.describe (
                     Vitest.expect(unrelatedTarget).toEqual(Some "target unrelated content\n")
 
                     let afterIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the conflict finalize."
 
@@ -2626,30 +2687,29 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     let index =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected an index before removing the synchronized base."
 
                     match
                         LakeFsWorkspaceIndex.save
-                            (stateDirectoryForBinding workspace.Binding)
+                            (stateDirectoryOf workspace)
                             { index with BaseRevision = None }
                     with
                     | Error message -> failwith message
                     | Ok _ -> ()
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "missing-base-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "missing-base-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "missing base status" statusResult
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "missing-base-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (OperationContext.detached "missing-base-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let previewFailure = expectFailure "missing base preview" previewResult
@@ -2657,9 +2717,10 @@ Vitest.describe (
                     Vitest.expect(previewFailure.Message).toContain ("no synchronized base revision")
 
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "missing-base-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateFailure = expectFailure "missing base update" updateResult
@@ -2667,7 +2728,8 @@ Vitest.describe (
                     Vitest.expect(updateFailure.Message).toContain ("no synchronized base revision")
 
                     let! refreshResult =
-                        synchronization.Refresh(OperationContext.detached "missing-base-refresh")
+                        workspace.Provider.Synchronization.Refresh workspace.Repository (OperationContext.detached "missing-base-refresh")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectValue "missing base refresh" refreshResult
@@ -2694,18 +2756,20 @@ Vitest.describe (
                     do! workspace.WriteFile "local-before-merge.txt" "local commit content\n"
 
                     let! localStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "post-merge-local-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "post-merge-local-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let localStatus = expectValue "post-merge local status" localStatusResult
                     let! localRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: local revision before update merge"
                                 Paths = [| repositoryPath "local-before-merge.txt" |]
                                 ExpectedRepositoryVersion = localStatus.RepositoryVersion
                             }
                             (OperationContext.detached "post-merge-local-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "post-merge local revision" localRevisionResult |> ignore
@@ -2716,10 +2780,10 @@ Vitest.describe (
                         |]
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
-                    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point _ -> async {
                                 if point = "materialization-prepare-object" then
@@ -2730,25 +2794,25 @@ Vitest.describe (
                             })
                     }
 
-                    let factory =
-                        LakeFsWorkspaceSession.createFactoryWithHooks
-                            lakeFsProviderOptions
-                            hooks
-                            (LakeFsCredentials.fixedConnection (connection ()))
+                    let provider =
+                        LakeFsProvider.create {
+                            lakeFsProviderOptions with
+                                Hooks = hooks
+                                Credentials = LakeFsCredentials.fixedConnection (connection ())
+                        }
 
                     let! opened =
-                        factory.Open
-                            workspace.Binding
+                        provider.Open
+                            (openRequestOf workspace)
                             (OperationContext.detached "post-merge-local-materialization-open")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let session = expectValue "post-merge local materialization open" opened
-                    let synchronization =
-                        session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+                    let repository = expectValue "post-merge local materialization open" opened
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "post-merge-local-materialization-preview")
+                        provider.Synchronization.PreviewUpdate repository (OperationContext.detached "post-merge-local-materialization-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectValue "post-merge local materialization preview" previewResult
@@ -2756,14 +2820,16 @@ Vitest.describe (
                     Vitest.expect(preview.WouldCreateConflictSession).toBe false
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "post-merge-local-materialization-status")
+                        provider.GetStatus repository (OperationContext.detached "post-merge-local-materialization-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "post-merge local materialization status" statusResult
                     let! updateResult =
-                        synchronization.Update
+                        provider.Synchronization.Update repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (OperationContext.detached "post-merge-local-materialization-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -2774,7 +2840,7 @@ Vitest.describe (
                         | Succeeded _ -> failwith "Post-merge local materialization failure unexpectedly succeeded."
 
                     let index =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected a persisted index after the merged update."
 
@@ -2811,36 +2877,35 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     do! workspace.WriteFile "local-before-publish.txt" "local content\n"
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "publish-race-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "publish-race-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectValue "publish race status" statusResult
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "local revision before publish race"
                                 Paths = [| repositoryPath "local-before-publish.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "publish-race-local-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "publish race local revision" revisionResult |> ignore
 
                     let before =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the publish race."
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -2854,7 +2919,8 @@ Vitest.describe (
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
 
                     let! publishStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "publish-race-publish-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "publish-race-publish-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let publishStatus = expectValue "publish race publish status" publishStatusResult
@@ -2865,12 +2931,13 @@ Vitest.describe (
                         |]
 
                     let! publishResult =
-                        synchronization.Publish
+                        workspace.Provider.Synchronization.Publish workspace.Repository
                             {
                                 ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = Some(RevisionId.tryCreate target.CommitId |> Result.defaultWith failwith)
                             }
                             (OperationContext.detached "publish-race")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -2914,7 +2981,7 @@ Vitest.describe (
                     | None -> failwith "The merge changed the target and must report partial success."
 
                     let after =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the publish race."
 
@@ -2958,46 +3025,44 @@ Vitest.describe (
 
                     do! workspace.WriteFile "base.txt" "workspace conflict content\n"
                     let! saveStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-save-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-race-save-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let saveStatus = expectValue "finalize race save status" saveStatusResult
                     let! saveResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "workspace conflict before finalize race"
                                 Paths = [| repositoryPath "base.txt" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (OperationContext.detached "finalize-race-save")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "finalize race save" saveResult |> ignore
 
                     let! updateStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-update-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-race-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateStatus = expectValue "finalize race update status" updateStatusResult
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (OperationContext.detached "finalize-race-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateFailure = expectFailure "finalize race conflicting update" updateResult
                     Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
 
-                    let conflicts =
-                        workspace.Session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
-
                     let! sessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-race-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "finalize-race-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -3005,12 +3070,13 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-race-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectValue "finalize race resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -3018,16 +3084,17 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (OperationContext.detached "finalize-race-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "finalize race resolution" resolutionResult
                     let before =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the finalize race."
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let! targetResult =
@@ -3040,7 +3107,8 @@ Vitest.describe (
 
                     let target = targetResult |> Result.defaultWith (fun failure -> failwith failure.Message)
                     let! finalizeStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-finalize-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-race-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectValue "finalize race finalize status" finalizeStatusResult
@@ -3051,13 +3119,14 @@ Vitest.describe (
                         |]
 
                     let! finalizeResult =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "finalize during destination race"
                             }
                             (OperationContext.detached "finalize-race")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let partialRevision, failure =
@@ -3116,7 +3185,7 @@ Vitest.describe (
                     Vitest.expect(mergeCommit.Parents).toContain observedDestination
 
                     let afterPartial =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the raced finalize."
 
@@ -3124,7 +3193,8 @@ Vitest.describe (
                     Vitest.expect(afterPartial.WorkspaceRevision).toEqual before.WorkspaceRevision
 
                     let! liveSessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-race-live-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "finalize-race-live-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let liveSession =
@@ -3133,25 +3203,28 @@ Vitest.describe (
 
                     Vitest.expect(liveSession.Handle.Version).not.toBe resolution.RefreshedHandle.Version
                     let! retryStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "finalize-race-retry-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "finalize-race-retry-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let retryStatus = expectValue "finalize race retry status" retryStatusResult
                     let! retryResult =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = liveSession.Handle
                                 ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                 Message = Some "confirm raced conflict finalize"
                             }
                             (OperationContext.detached "finalize-race-retry")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let retryRevision = expectValue "finalize race retry" retryResult
                     Vitest.expect(retryRevision |> Option.map RevisionId.value).toEqual (Some observedResult)
 
                     let! closedSessionResult =
-                        conflicts.GetActiveSession(OperationContext.detached "finalize-race-closed-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (OperationContext.detached "finalize-race-closed-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     Vitest.expect(expectValue "closed raced session" closedSessionResult).toEqual None
@@ -3182,21 +3255,25 @@ Vitest.describe (
 
                 let harness = createLakeFsHarness ()
                 let credentials = LakeFsCredentials.fixedConnection (connection ())
+                let cleanupOptions = { lakeFsProviderOptions with Credentials = credentials }
 
                 try
                     let! workspace = harness.CreateWorkspace()
+                    let folder = folderOf workspace
+                    let profileId = (locationOf workspace).ConnectionProfileId
+
                     let index =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before cleanup."
 
                     let parsed =
-                        LakeFsTypes.LakeFsLocation.tryParse workspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf workspace).ProviderLocation
                         |> Result.defaultWith failwith
 
-                    // Closing a reusable session releases in-process resources but
+                    // Closing a reusable repository releases in-process resources but
                     // does not discard the persisted workspace branch.
-                    do! workspace.Session.Close() |> Async.StartAsPromise
+                    do! workspace.Provider.Close workspace.Repository |> Async.StartAsPromise
                     let! afterCloseResult =
                         LakeFsApi.getBranch
                             (connection ())
@@ -3209,10 +3286,9 @@ Vitest.describe (
 
                     let! foreignResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
-                            lakeFsProviderOptions
-                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
-                            credentials
-                            workspace.Binding
+                            cleanupOptions
+                            folder
+                            profileId
                             "foreign-ownership-token"
                             index.WorkspaceRevision
                             (OperationContext.detached "cleanup-foreign-owner")
@@ -3232,7 +3308,7 @@ Vitest.describe (
 
                     stillOwnedResult |> Result.defaultWith (fun failure -> failwith failure.Message) |> ignore
 
-                    let raceHooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+                    let raceHooks: LakeFsProviderOptions.LakeFsSessionHooks = {
                         Barrier =
                             Some(fun _ point context -> async {
                                 if point = "cleanup-precheck-done" then
@@ -3261,10 +3337,9 @@ Vitest.describe (
 
                     let! racedResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
-                            lakeFsProviderOptions
-                            raceHooks
-                            credentials
-                            workspace.Binding
+                            { cleanupOptions with Hooks = raceHooks }
+                            folder
+                            profileId
                             index.OwnershipToken
                             index.WorkspaceRevision
                             (OperationContext.detached "cleanup-raced-head")
@@ -3289,10 +3364,9 @@ Vitest.describe (
 
                     let! cleanedResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
-                            lakeFsProviderOptions
-                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
-                            credentials
-                            workspace.Binding
+                            cleanupOptions
+                            folder
+                            profileId
                             index.OwnershipToken
                             (Some advanced.CommitId)
                             (OperationContext.detached "cleanup-owned-head")
@@ -3302,10 +3376,9 @@ Vitest.describe (
 
                     let! missingResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
-                            lakeFsProviderOptions
-                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
-                            credentials
-                            workspace.Binding
+                            cleanupOptions
+                            folder
+                            profileId
                             index.OwnershipToken
                             (Some advanced.CommitId)
                             (OperationContext.detached "cleanup-abandoned-branch")
@@ -3321,12 +3394,12 @@ Vitest.describe (
 
                     let! permissionWorkspace = harness.CreateWorkspace()
                     let permissionIndex =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding permissionWorkspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf permissionWorkspace) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected an index for permission cleanup."
 
                     let permissionLocation =
-                        LakeFsTypes.LakeFsLocation.tryParse permissionWorkspace.Binding.Location.ProviderLocation
+                        LakeFsTypes.LakeFsLocation.tryParse (locationOf permissionWorkspace).ProviderLocation
                         |> Result.defaultWith failwith
 
                     let unauthorized =
@@ -3337,10 +3410,9 @@ Vitest.describe (
 
                     let! permissionResult =
                         LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch
-                            lakeFsProviderOptions
-                            LakeFsWorkspaceSession.LakeFsSessionHooks.none
-                            unauthorized
-                            permissionWorkspace.Binding
+                            { cleanupOptions with Credentials = unauthorized }
+                            (folderOf permissionWorkspace)
+                            ((locationOf permissionWorkspace).ConnectionProfileId)
                             permissionIndex.OwnershipToken
                             permissionIndex.WorkspaceRevision
                             (OperationContext.detached "cleanup-permission-denied")
@@ -3424,7 +3496,7 @@ let private synchronizeWithoutPublish (workspace: HarnessWorkspace) (context: Op
 
     return!
         run (
-            (syncService workspace.Session).Synchronize
+            workspace.Provider.Synchronization.Synchronize workspace.Repository
                 {
                     ExpectedRepositoryVersion = status.RepositoryVersion
                     ExpectedTargetRevision = None
@@ -3432,6 +3504,7 @@ let private synchronizeWithoutPublish (workspace: HarnessWorkspace) (context: Op
                     PublishLocalRevisions = false
                 }
                 context
+            |> executed
         )
 }
 
@@ -3440,13 +3513,14 @@ let private createRevisionOf (workspace: HarnessWorkspace) (paths: string[]) (co
 
     return!
         run (
-            workspace.Session.Core.CreateRevision
+            workspace.Provider.CreateRevision workspace.Repository
                 {
                     Message = "step events revision"
                     Paths = paths |> Array.map mkPath
                     ExpectedRepositoryVersion = status.RepositoryVersion
                 }
                 context
+            |> executed
         )
 }
 
@@ -3525,11 +3599,12 @@ Vitest.describe (
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             context
+                        |> executed
                     )
 
                 expectUnchanged "update of an up-to-date workspace" result |> ignore
@@ -3558,11 +3633,12 @@ Vitest.describe (
 
                 let! updateResult =
                     run (
-                        (syncService workspace.Session).Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             context
+                        |> executed
                     )
 
                 let failure = carriedFailure "conflicting update" updateResult
@@ -3573,7 +3649,7 @@ Vitest.describe (
 
                 // The finalization uploads the resolution as one batch.
                 let! sessionResult =
-                    run ((conflictService workspace.Session).GetActiveSession(ctx "step-events-conflict-session"))
+                    run (executed (workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (ctx "step-events-conflict-session")))
 
                 let summary =
                     match expectValue "active conflict session" sessionResult with
@@ -3584,7 +3660,7 @@ Vitest.describe (
 
                 let! resolveResult =
                     run (
-                        (conflictService workspace.Session).Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolveStatus.RepositoryVersion
@@ -3592,6 +3668,7 @@ Vitest.describe (
                                 Resolution = SupplyResolvedContent "resolved content\n"
                             }
                             (ctx "step-events-conflict-resolve")
+                        |> executed
                     )
 
                 let resolution = expectValue "conflict resolution" resolveResult
@@ -3600,13 +3677,14 @@ Vitest.describe (
 
                 let! finalizeResult =
                     run (
-                        (conflictService workspace.Session).Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "step events finalize"
                             }
                             finalizeContext
+                        |> executed
                     )
 
                 expectValue "conflict finalization" finalizeResult |> ignore
@@ -3665,12 +3743,13 @@ Vitest.describe (
 
                     let! result =
                         run (
-                            (syncService workspace.Session).Publish
+                            workspace.Provider.Synchronization.Publish workspace.Repository
                                 {
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 context
+                            |> executed
                         )
 
                     return reports, result
@@ -3707,7 +3786,7 @@ Vitest.describe (
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
+                        workspace.Provider.Synchronization.Synchronize workspace.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -3715,6 +3794,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             context
+                        |> executed
                     )
 
                 expectPerformed "synchronize with publishing" result |> ignore
@@ -3723,7 +3803,7 @@ Vitest.describe (
             })
 
         liveTest
-            "a clone reports the clone step and the open of the clone reports the download"
+            "a clone reports the clone step and then the download, and a reopen of the clone reports nothing"
             (fun harness -> promise {
                 let! anchor = harness.CreateWorkspace()
                 let! clonePath = harness.CreateLocalPath()
@@ -3731,32 +3811,37 @@ Vitest.describe (
 
                 let! cloneResult =
                     run (
-                        harness.Factory.Clone
+                        harness.Provider.Clone
                             {
-                                Location = anchor.Binding.Location
+                                Location = locationOf anchor
                                 TargetPath = clonePath
                                 TargetRef = None
                                 MaterializeAllObjects = true
                             }
                             cloneContext
+                        |> executed
                     )
 
-                let binding = expectValue "clone" cloneResult
-                Vitest.expect(stepStarts cloneReports).toEqual [| cloneStart |]
-                Vitest.expect((metersOf "lakefs-download" cloneReports).Length).toBe 0
-
-                let openReports, openContext = capture "step-events-clone-open"
-                let! openResult = run (harness.Factory.Open binding openContext)
-                expectValue "open of the clone" openResult |> ignore
-
-                Vitest.expect(stepStarts openReports).toEqual [| downloadStart |]
+                expectValue "clone" cloneResult |> ignore
+                Vitest.expect(stepStarts cloneReports).toEqual [| cloneStart; downloadStart |]
 
                 expectMetersAfter
-                    (indexOfPhase ProgressPhaseCodes.DownloadObjects openReports)
-                    (metersOf "lakefs-download" openReports)
+                    (indexOfPhase ProgressPhaseCodes.DownloadObjects cloneReports)
+                    (metersOf "lakefs-download" cloneReports)
 
                 let reopenReports, reopenContext = capture "step-events-clone-reopen"
-                let! reopenResult = run (harness.Factory.Open binding reopenContext)
+
+                let! reopenResult =
+                    run (
+                        harness.Provider.Open
+                            {
+                                RepositoryRoot = clonePath
+                                ConnectionProfileId = (locationOf anchor).ConnectionProfileId
+                            }
+                            reopenContext
+                        |> executed
+                    )
+
                 expectValue "reopen of the clone" reopenResult |> ignore
                 Vitest.expect(reopenReports.Count).toBe 0
             })
@@ -3765,10 +3850,12 @@ Vitest.describe (
             "a refresh and a synchronize without publishing report their steps in order"
             (fun harness -> promise {
                 let! workspace = harness.CreateWorkspace()
-                let session = workspace.Session
 
                 let refreshReports, refreshContext = capture "step-events-refresh"
-                let! refreshResult = run ((syncService session).Refresh refreshContext)
+
+                let! refreshResult =
+                    run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository refreshContext))
+
                 expectOutcome "refresh" refreshResult |> ignore
                 Vitest.expect(stepStarts refreshReports).toEqual [| fetchStart |]
 
@@ -3785,7 +3872,7 @@ Vitest.describe (
 
                 let! result =
                     run (
-                        (syncService session).Synchronize
+                        workspace.Provider.Synchronization.Synchronize workspace.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -3793,9 +3880,118 @@ Vitest.describe (
                                 PublishLocalRevisions = false
                             }
                             context
+                        |> executed
                     )
 
                 expectPerformed "synchronize" result |> ignore
                 Vitest.expect(stepStarts reports).toEqual [| fetchStart; mergeStart; downloadStart |]
+            })
+)
+
+Vitest.describe (
+    "lakeFS functions it does not have",
+    fun () ->
+        liveTest
+            "a missing function answers NoOp, a subscription to it fails, and a subscription to a function lakeFS has returns its direct result"
+            (fun harness -> promise {
+                let! workspace = harness.CreateWorkspace()
+                let provider = workspace.Provider
+
+                let functions =
+                    match Subscribe.all provider with
+                    | Ok functions -> functions
+                    | Error reason -> failwith $"Expected a provider built from a function list: {reason}"
+
+                let missingReason (entry: Entry<'T>) =
+                    match entry with
+                    | Missing reason -> reason
+                    | Implemented _ -> failwith "Expected the function to be missing."
+
+                let noHistory = missingReason functions.History.ListRevisions
+                let noInstall = missingReason functions.InstallDependency
+
+                let expectNoOp (reason: string) (result: CallResult<'T>) =
+                    match result with
+                    | NoOp actual -> Vitest.expect(actual).toBe reason
+                    | Executed _ -> failwith "Expected the provider to answer NoOp."
+
+                let! history =
+                    run (
+                        provider.History.ListRevisions
+                            workspace.Repository
+                            { Cursor = None; Limit = 10 }
+                            (ctx "missing-history")
+                    )
+
+                expectNoOp noHistory history
+
+                let! install = run (provider.InstallDependency "git" (ctx "missing-install"))
+                expectNoOp noInstall install
+
+                match Subscribe.single (fun functions -> functions.History.ListRevisions) provider with
+                | Error reason -> Vitest.expect(reason).toBe noHistory
+                | Ok _ -> failwith "Expected a subscription to ListRevisions to fail."
+
+                match Subscribe.single (fun functions -> functions.InstallDependency) provider with
+                | Error reason -> Vitest.expect(reason).toBe noInstall
+                | Ok _ -> failwith "Expected a subscription to InstallDependency to fail."
+
+                match Subscribe.single (fun functions -> functions.GetStatus) provider with
+                | Error reason -> failwith $"Expected a subscription to GetStatus to succeed: {reason}"
+                | Ok directStatus ->
+                    let! direct = run (directStatus workspace.Repository (ctx "subscribed-status"))
+                    let! viaInterface = getStatus workspace
+                    let subscribed = expectValue "subscribed status" direct
+                    Vitest.expect(subscribed.RepositoryVersion).toEqual viaInterface.RepositoryVersion
+            })
+)
+
+Vitest.describe (
+    "lakeFS probe",
+    fun () ->
+        liveTest
+            "a cloned or initialized folder is detected and a folder without state is not"
+            (fun harness -> promise {
+                let! anchor = harness.CreateWorkspace()
+                let! clonePath = harness.CreateLocalPath()
+                let! initializePath = harness.CreateLocalPath()
+                let! withoutStatePath = harness.CreateLocalPath()
+
+                let! cloned =
+                    run (
+                        harness.Provider.Clone
+                            {
+                                Location = locationOf anchor
+                                TargetPath = clonePath
+                                TargetRef = None
+                                MaterializeAllObjects = true
+                            }
+                            (ctx "probe-clone")
+                        |> executed
+                    )
+
+                expectValue "clone" cloned |> ignore
+
+                let! initialized =
+                    run (
+                        harness.Provider.Initialize
+                            {
+                                TargetPath = initializePath
+                                Location = Some(locationOf anchor)
+                            }
+                            (ctx "probe-initialize")
+                        |> executed
+                    )
+
+                expectValue "initialize" initialized |> ignore
+
+                for folder in [| clonePath; initializePath |] do
+                    match! run (harness.Provider.Probe folder) with
+                    | Detected(root, _, _) -> Vitest.expect(root).toBe folder
+                    | other -> failwith $"Expected the folder to be detected: {other}"
+
+                match! run (harness.Provider.Probe withoutStatePath) with
+                | NotDetected -> ()
+                | other -> failwith $"Expected a folder without state to stay undetected: {other}"
             })
 )

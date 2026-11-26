@@ -4,8 +4,10 @@ open System
 open Fable.Core
 open Fable.Core.JsInterop
 open VersionControlService.Abstractions
+open VersionControlService.Git
 open VersionControlService.Tests.NodePath
 open Vitest
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
@@ -77,6 +79,23 @@ let private expectValue (operationName: string) (result: OperationResult<'T>) : 
     | PartiallySucceeded(_, failure) ->
         failwith $"{operationName} unexpectedly returned partial success ({failure.Code})."
     | Failed failure -> failwith $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
+
+/// Opens the folder with the given provider settings and connection profile.
+let private openRepository
+    (options: GitProviderOptions)
+    (workPath: string)
+    (profile: string option)
+    : JS.Promise<IVersionControl * Repository> =
+    promise {
+        let provider = GitProvider.create options
+
+        let! result =
+            provider.Open { RepositoryRoot = workPath; ConnectionProfileId = profile } (ctx "open-fixture")
+            |> executed
+            |> Async.StartAsPromise
+
+        return provider, expectValue "open" result
+    }
 
 let private toFileRemoteUrl (path: string) =
     let normalized = path.Replace("\\", "/")
@@ -259,45 +278,24 @@ Vitest.describe (
                                     }
                         }
 
-                        let binding: WorkspaceBinding = {
-                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                            ProviderId = gitProviderId
-                            RepositoryRoot = workPath
-                            ProviderStateRef = None
-                            Location = {
-                                ProviderId = gitProviderId
-                                DisplayName = None
-                                ProviderLocation = remoteUrl
-                                ConnectionProfileId = Some "token-profile"
-                            }
-                            ConnectionProfileId = Some "token-profile"
-                        }
+                        let! provider, repository = openRepository { GitProviderOptions.defaults with Credentials = strategy } workPath (Some "token-profile")
 
-                        let session =
-                            GitWorkspaceSession.createSessionWithCredentials
-                                GitWorkspaceSession.GitSessionHooks.none
-                                strategy
-                                binding
-
-                        let materialization =
-                            session.ObjectMaterialization
-                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         stopObserving <- observeGitSpawnArguments observedCommands
 
                         let! materializeResult =
-                            materialization.Materialize
+                            provider.ObjectMaterialization.Materialize repository
                                 [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "credential-materialize-transfer")
-                            |> Async.StartAsPromise
+                            |> executed |> Async.StartAsPromise
 
                         expectValue "credential materialization" materializeResult |> ignore
 
                         let! _ =
-                            materialization.Dematerialize
+                            provider.ObjectMaterialization.Dematerialize repository
                                 [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "credential-dematerialize-transfer")
-                            |> Async.StartAsPromise
+                            |> executed |> Async.StartAsPromise
 
                         stopObserving ()
                         stopObserving <- ignore
@@ -388,37 +386,16 @@ Vitest.describe (
                                     }
                         }
 
-                        let binding: WorkspaceBinding = {
-                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                            ProviderId = gitProviderId
-                            RepositoryRoot = workPath
-                            ProviderStateRef = None
-                            Location = {
-                                ProviderId = gitProviderId
-                                DisplayName = None
-                                ProviderLocation = remoteUrl
-                                ConnectionProfileId = Some "token-profile"
-                            }
-                            ConnectionProfileId = Some "token-profile"
-                        }
+                        let! provider, repository = openRepository { GitProviderOptions.defaults with Credentials = strategy } workPath (Some "token-profile")
 
-                        let session =
-                            GitWorkspaceSession.createSessionWithCredentials
-                                GitWorkspaceSession.GitSessionHooks.none
-                                strategy
-                                binding
-
-                        let materialization =
-                            session.ObjectMaterialization
-                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
 
                         let! materializeResult =
-                            materialization.Materialize
+                            provider.ObjectMaterialization.Materialize repository
                                 [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "credential-userinfo-materialize")
-                            |> Async.StartAsPromise
+                            |> executed |> Async.StartAsPromise
 
                         stopObserving.Value ()
                         stopObserving.Value <- ignore
@@ -505,37 +482,16 @@ Vitest.describe (
                                     }
                         }
 
-                        let binding: WorkspaceBinding = {
-                            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                            ProviderId = gitProviderId
-                            RepositoryRoot = workPath
-                            ProviderStateRef = None
-                            Location = {
-                                ProviderId = gitProviderId
-                                DisplayName = None
-                                ProviderLocation = remoteUrl
-                                ConnectionProfileId = Some "token-profile"
-                            }
-                            ConnectionProfileId = Some "token-profile"
-                        }
+                        let! provider, repository = openRepository { GitProviderOptions.defaults with Credentials = strategy } workPath (Some "token-profile")
 
-                        let session =
-                            GitWorkspaceSession.createSessionWithCredentials
-                                GitWorkspaceSession.GitSessionHooks.none
-                                strategy
-                                binding
-
-                        let materialization =
-                            session.ObjectMaterialization
-                            |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                         stopObserving.Value <- observeGitSpawnArguments observedCommands
 
                         let! materializeResult =
-                            materialization.Materialize
+                            provider.ObjectMaterialization.Materialize repository
                                 [| RepositoryPath.tryCreate relativePath |> Result.defaultWith failwith |]
                                 (ctx "listing-once-materialize")
-                            |> Async.StartAsPromise
+                            |> executed |> Async.StartAsPromise
 
                         stopObserving.Value ()
                         stopObserving.Value <- ignore
@@ -635,7 +591,7 @@ Vitest.describe (
                                 })
                 }
 
-                let factory = GitWorkspaceSession.createFactoryWithCredentials hooks strategy
+                let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks; Credentials = strategy }
 
                 let cases = [
                     "https://example.invalid:3443/org/repo.git",
@@ -658,7 +614,7 @@ Vitest.describe (
                     }
 
                     let! result =
-                        Async.StartAsPromise(factory.VerifyLocation request (ctx "port-scoped-auth-header"))
+                        Async.StartAsPromise(executed (provider.VerifyLocation request (ctx "port-scoped-auth-header")))
 
                     expectValue "verify port-scoped credential header" result |> ignore
 
@@ -767,30 +723,12 @@ Vitest.describe (
                                 }
                     }
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = workPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = testHttpsUrl
-                            ConnectionProfileId = Some "token-profile"
-                        }
-                        ConnectionProfileId = Some "token-profile"
-                    }
+                    let! provider, repository = openRepository { GitProviderOptions.defaults with Hooks = hooks; Credentials = strategy } workPath (Some "token-profile")
 
-                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
-
-                    let syncService =
-                        match session.Synchronization with
-                        | Some service -> service
-                        | None -> failwith "Expected the synchronization service."
 
                     // Token HTTPS: refresh succeeds and the credential travels as a
                     // host-scoped extraHeader on the fetch invocation.
-                    let! refreshResult = Async.StartAsPromise(syncService.Refresh(ctx "cred-refresh"))
+                    let! refreshResult = Async.StartAsPromise(executed (provider.Synchronization.Refresh repository (ctx "cred-refresh")))
                     expectValue "token refresh" refreshResult |> ignore
 
                     let expectedHeaderPrefix = $"http.https://{testHost}/.extraHeader=Authorization: Basic "
@@ -814,11 +752,11 @@ Vitest.describe (
                     Vitest.expect(strategyCalls.ToArray()).toEqual [| testHost, Some "token-profile" |]
 
                     do! writeUtf8FileAsync (join [| workPath; "authenticated-publish.txt" |]) "published\n"
-                    let! revisionStatusResult = session.Core.GetStatus(ctx "credential-revision-status") |> Async.StartAsPromise
+                    let! revisionStatusResult = provider.GetStatus repository (ctx "credential-revision-status") |> executed |> Async.StartAsPromise
                     let revisionStatus = expectValue "credential revision status" revisionStatusResult
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: authenticated publish"
                                 Paths =
@@ -829,19 +767,21 @@ Vitest.describe (
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "credential-revision")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectValue "credential revision" revisionResult |> ignore
-                    let! publishStatusResult = session.Core.GetStatus(ctx "credential-publish-status") |> Async.StartAsPromise
+                    let! publishStatusResult = provider.GetStatus repository (ctx "credential-publish-status") |> executed |> Async.StartAsPromise
                     let publishStatus = expectValue "credential publish status" publishStatusResult
 
                     let! publishResult =
-                        syncService.Publish
+                        provider.Synchronization.Publish
+                            repository
                             {
                                 ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "credential-publish")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "credential publish" publishResult |> ignore
@@ -875,26 +815,23 @@ Vitest.describe (
                     let! _ = runGitIn workPath [| "commit"; "-m"; "test: add materialized lfs file" |]
                     let! _ = runGitIn workPath [| "push"; "origin"; "main" |]
 
-                    let materialization =
-                        session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
 
                     strategyCalls.Clear()
                     observedCommands.Clear()
 
                     let! dematerializeResult =
-                        materialization.Dematerialize
+                        provider.ObjectMaterialization.Dematerialize repository
                             [| RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith |]
                             (ctx "credential-dematerialize")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectValue "credential dematerialization" dematerializeResult |> ignore
 
                     let! materializeResult =
-                        materialization.Materialize
+                        provider.ObjectMaterialization.Materialize repository
                             [| RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith |]
                             (ctx "credential-materialize")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectValue "credential materialization" materializeResult |> ignore
 
@@ -910,65 +847,64 @@ Vitest.describe (
 
                     strategyCalls.Clear()
 
-                    let maintenance =
-                        session.Maintenance
-                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
 
-                    let! pruneResult = maintenance.Prune(ctx "credential-prune") |> Async.StartAsPromise
+                    let! pruneResult = provider.Maintenance.Prune repository (ctx "credential-prune") |> executed |> Async.StartAsPromise
                     expectValue "credential prune" pruneResult |> ignore
                     Vitest.expect(strategyCalls.ToArray()).toEqual [||]
 
-                    // Anonymous local-path remote: a session with the anonymous strategy
+                    // Anonymous local-path remote: a repository opened with the anonymous strategy
                     // and no global token machinery synchronizes fine.
-                    let anonymousBinding = {
-                        binding with
-                            Location = {
-                                binding.Location with
-                                    ProviderLocation = barePath
-                                    ConnectionProfileId = None
-                            }
-                            ConnectionProfileId = None
-                    }
+                    let! anonymousProvider, anonymousRepository =
+                        openRepository GitProviderOptions.defaults workPath None
 
-                    let anonymousSession =
-                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none anonymousBinding
+                    let! anonymousRefresh =
+                        Async.StartAsPromise(
+                            executed (
+                                anonymousProvider.Synchronization.Refresh anonymousRepository (ctx "anon-refresh")
+                            )
+                        )
 
-                    match anonymousSession.Synchronization with
-                    | Some anonymousSync ->
-                        let! anonymousRefresh = Async.StartAsPromise(anonymousSync.Refresh(ctx "anon-refresh"))
-                        expectValue "anonymous refresh" anonymousRefresh |> ignore
-                    | None -> failwith "Expected the synchronization service."
+                    expectValue "anonymous refresh" anonymousRefresh |> ignore
 
                     // scp-like SSH and local/file remote forms are accepted by Bind.
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let bindProvider = GitProvider.create GitProviderOptions.defaults
 
                     let! scpBind =
                         Async.StartAsPromise(
-                            factory.Bind
-                                {
-                                    RepositoryRoot = workPath
-                                    Location = {
-                                        ProviderId = gitProviderId
-                                        DisplayName = None
-                                        ProviderLocation = "git@github.com:example/repo.git"
-                                        ConnectionProfileId = None
+                            executed (
+                                bindProvider.Bind
+                                    {
+                                        RepositoryRoot = workPath
+                                        Location = {
+                                            ProviderId = gitProviderId
+                                            DisplayName = None
+                                            ProviderLocation = "git@github.com:example/repo.git"
+                                            ConnectionProfileId = None
+                                        }
                                     }
-                                }
-                                (ctx "scp-bind")
+                                    (ctx "scp-bind")
+                            )
                         )
 
-                    let scpBinding = expectValue "scp-like bind" scpBind
-                    Vitest.expect(scpBinding.Location.ProviderLocation).toBe ("git@github.com:example/repo.git")
+                    let scpRepository = expectValue "scp-like bind" scpBind
+                    Vitest.expect(scpRepository.Descriptor.Location.Value.ProviderLocation).toBe ("git@github.com:example/repo.git")
 
                     // Re-bind to the local path remote (also a valid form) and restore.
                     let! localBind =
                         Async.StartAsPromise(
-                            factory.Bind
-                                {
-                                    RepositoryRoot = workPath
-                                    Location = anonymousBinding.Location
-                                }
-                                (ctx "local-bind")
+                            executed (
+                                bindProvider.Bind
+                                    {
+                                        RepositoryRoot = workPath
+                                        Location = {
+                                            ProviderId = gitProviderId
+                                            DisplayName = None
+                                            ProviderLocation = barePath
+                                            ConnectionProfileId = None
+                                        }
+                                    }
+                                    (ctx "local-bind")
+                            )
                         )
 
                     expectValue "local-path bind" localBind |> ignore
@@ -995,7 +931,7 @@ Vitest.describe (
 
                     observedCommands.Clear()
                     failAuthenticatedFetch <- true
-                    let! failingRefresh = Async.StartAsPromise(syncService.Refresh(ctx "failing-refresh"))
+                    let! failingRefresh = Async.StartAsPromise(executed (provider.Synchronization.Refresh repository (ctx "failing-refresh")))
 
                     match failingRefresh with
                     | Failed failure ->
@@ -1055,31 +991,10 @@ Vitest.describe (
                                 }
                     }
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = workPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = workPath
-                            ConnectionProfileId = Some "token-profile"
-                        }
-                        ConnectionProfileId = Some "token-profile"
-                    }
+                    let! provider, repository = openRepository { GitProviderOptions.defaults with Credentials = strategy } workPath (Some "token-profile")
 
-                    let session =
-                        GitWorkspaceSession.createSessionWithCredentials
-                            GitWorkspaceSession.GitSessionHooks.none
-                            strategy
-                            binding
 
-                    let maintenance =
-                        session.Maintenance
-                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
-
-                    let! _ = maintenance.Prune(ctx "scoped-prune") |> Async.StartAsPromise
+                    let! _ = provider.Maintenance.Prune repository (ctx "scoped-prune") |> executed |> Async.StartAsPromise
                     Vitest.expect(strategyCalls.ToArray()).toEqual [| testHost, Some "token-profile" |]
 
                     do! removeDirectoryAsync root
@@ -1108,39 +1023,23 @@ Vitest.describe (
                     let missingRemote = join [| root; "missing-remote.git" |]
                     let! _ = runGitIn workPath [| "remote"; "add"; "origin"; missingRemote |]
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = workPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = missingRemote
-                            ConnectionProfileId = None
-                        }
-                        ConnectionProfileId = None
-                    }
+                    let! provider, repository = openRepository GitProviderOptions.defaults workPath None
 
-                    let session =
-                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
 
-                    let syncService =
-                        match session.Synchronization with
-                        | Some service -> service
-                        | None -> failwith "Expected the synchronization service."
-
-                    let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "missing-remote-status"))
+                    let! statusResult = Async.StartAsPromise(executed (provider.GetStatus repository (ctx "missing-remote-status")))
                     let status = expectValue "status" statusResult
 
                     let! publishResult =
                         Async.StartAsPromise(
-                            syncService.Publish
-                                {
-                                    ExpectedRepositoryVersion = status.RepositoryVersion
-                                    ExpectedTargetRevision = None
-                                }
-                                (ctx "missing-remote-publish")
+                            executed (
+                                provider.Synchronization.Publish
+                                    repository
+                                    {
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
+                                        ExpectedTargetRevision = None
+                                    }
+                                    (ctx "missing-remote-publish")
+                            )
                         )
 
                     match publishResult with
@@ -1418,21 +1317,7 @@ Vitest.describe (
                                 }
                     }
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = workPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = testHttpsUrl
-                            ConnectionProfileId = Some "token-profile"
-                        }
-                        ConnectionProfileId = Some "token-profile"
-                    }
-
-                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+                    let! provider, repository = openRepository { GitProviderOptions.defaults with Hooks = hooks; Credentials = strategy } workPath (Some "token-profile")
                     let batches = ResizeArray<OperationOutput[]>()
 
                     let context =
@@ -1442,11 +1327,8 @@ Vitest.describe (
                             ignore
                             batches.Add
 
-                    let synchronization =
-                        session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected the Git synchronization service.")
 
-                    let! _ = synchronization.Refresh context |> Async.StartAsPromise
+                    let! _ = provider.Synchronization.Refresh repository context |> executed |> Async.StartAsPromise
                     let entries = batches |> Seq.collect id |> Seq.toArray
 
                     Vitest.expect(

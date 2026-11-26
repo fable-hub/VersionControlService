@@ -3,10 +3,10 @@ module VersionControlService.Tests.GitHistoryTests
 open System
 open Fable.Core
 open VersionControlService.Abstractions
+open VersionControlService.Git
 open Vitest
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
-module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
-module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
@@ -145,31 +145,6 @@ let private revList (work: string) = promise {
     return output.Split('\n', StringSplitOptions.RemoveEmptyEntries) |> Array.map (fun line -> line.Trim())
 }
 
-let private historyOf (work: string) : HistoryService =
-    let binding: WorkspaceBinding = {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = ProviderId.tryCreate "git" |> Result.defaultWith failwith
-        RepositoryRoot = work
-        ProviderStateRef = None
-        Location = {
-            ProviderId = ProviderId.tryCreate "git" |> Result.defaultWith failwith
-            DisplayName = None
-            ProviderLocation = work
-            ConnectionProfileId = None
-        }
-        ConnectionProfileId = None
-    }
-
-    let session =
-        GitWorkspaceSession.createSessionWithOptions
-            { Hooks = GitWorkspaceSession.GitSessionHooks.none; TextDiff = None }
-            GitCredentialStrategy.anonymous
-            GitCredentialStrategy.anonymousIdentity
-            RevisionPolicyStrategy.automatic
-            binding
-
-    session.History |> Option.defaultWith (fun () -> failwith "The Git session has no history service.")
-
 let private context name = OperationContext.detached name
 
 let private operationValue operationName result =
@@ -185,8 +160,27 @@ let private operationFailure operationName result =
     | Succeeded _
     | PartiallySucceeded _ -> failwith $"{operationName} was expected to fail."
 
-let private listPageResult (history: HistoryService) (cursor: string option) (limit: int) =
-    history.ListRevisions { Cursor = cursor; Limit = limit } (context "list-revisions") |> Async.StartAsPromise
+/// The provider and the repository whose history a test reads.
+type private OpenedHistory = { Provider: IVersionControl; Repository: Repository }
+
+let private historyOf (work: string) : JS.Promise<OpenedHistory> = promise {
+    let provider = GitProvider.create GitProviderOptions.defaults
+
+    let! result =
+        executed (provider.Open { RepositoryRoot = work; ConnectionProfileId = None } (context "open-history-fixture"))
+        |> Async.StartAsPromise
+
+    return { Provider = provider; Repository = operationValue "Open" result }
+}
+
+let private listPageResult (history: OpenedHistory) (cursor: string option) (limit: int) =
+    executed (
+        history.Provider.History.ListRevisions
+            history.Repository
+            { Cursor = cursor; Limit = limit }
+            (context "list-revisions")
+    )
+    |> Async.StartAsPromise
 
 let private listPage history cursor limit = promise {
     let! result = listPageResult history cursor limit
@@ -196,8 +190,11 @@ let private listPage history cursor limit = promise {
 let private revisionId (value: string) =
     RevisionId.tryCreate value |> Result.defaultWith failwith
 
-let private changesResult (history: HistoryService) (id: string) =
-    history.GetRevisionChanges (revisionId id) (context "revision-changes") |> Async.StartAsPromise
+let private changesResult (history: OpenedHistory) (id: string) =
+    executed (
+        history.Provider.History.GetRevisionChanges history.Repository (revisionId id) (context "revision-changes")
+    )
+    |> Async.StartAsPromise
 
 let private idsOf (page: RevisionPage) =
     page.Revisions |> Array.map (fun entry -> RevisionId.value entry.Id)
@@ -282,7 +279,8 @@ Vitest.describe (
                 do! commitEmptyAs work author committer "Second subject\n\nBody line one.\nBody line two."
                 let! ids = revList work
 
-                let! page = listPage (historyOf work) None 10
+                let! history = historyOf work
+                let! page = listPage history None 10
 
                 Vitest.expect(idsOf page).toEqual ids
                 let newest = page.Revisions[0]
@@ -308,7 +306,8 @@ Vitest.describe (
                 do! commitEmpty work "Grüße, 日本語"
                 do! commitEmptyAs work odd odd "Odd author"
 
-                let! entries = listAll (historyOf work)
+                let! history = historyOf work
+                let! entries = listAll history
 
                 Vitest.expect(entries |> Array.map (fun entry -> entry.Message)).toEqual
                     [| "Odd author"; "Grüße, 日本語"; ""; "Subject\n\nSecond paragraph\nthird line" |]
@@ -328,7 +327,7 @@ Vitest.describe (
                     do! commitEmpty work $"commit {index}"
 
                 let! ids = revList work
-                let history = historyOf work
+                let! history = historyOf work
 
                 let! first = listPage history None 2
                 let! second = listPage history first.NextCursor 2
@@ -350,7 +349,7 @@ Vitest.describe (
                     do! commitEmpty work $"commit {index}"
 
                 let! ids = revList work
-                let history = historyOf work
+                let! history = historyOf work
                 let! first = listPage history None 2
                 do! commitEmpty work "arrives between the pages"
 
@@ -365,7 +364,7 @@ Vitest.describe (
             fun () -> promise {
                 let! work = newRepository ()
                 do! fastImportCommits work 201
-                let history = historyOf work
+                let! history = historyOf work
 
                 let! none = listPage history None 0
                 let! negative = listPage history None -5
@@ -385,7 +384,8 @@ Vitest.describe (
             fun () -> promise {
                 let! work = newRepository ()
 
-                let! page = listPage (historyOf work) None 10
+                let! history = historyOf work
+                let! page = listPage history None 10
 
                 Vitest.expect(page.Revisions.Length).toBe 0
                 Vitest.expect(page.NextCursor).toEqual None
@@ -401,7 +401,8 @@ Vitest.describe (
                 let! ids = revList work
                 let! _ = git work [| "checkout"; "-q"; "--detach" |]
 
-                let! page = listPage (historyOf work) None 10
+                let! history = historyOf work
+                let! page = listPage history None 10
 
                 Vitest.expect(idsOf page).toEqual ids
                 Vitest.expect(page.Revisions[0].Refs |> Array.map describeRef).toEqual [| "main local current=false git-local:main" |]
@@ -420,7 +421,8 @@ Vitest.describe (
                 let! _ = git work [| "update-ref"; "refs/remotes/origin/main"; "HEAD" |]
                 let! _ = git work [| "symbolic-ref"; "refs/remotes/origin/HEAD"; "refs/remotes/origin/main" |]
 
-                let! entries = listAll (historyOf work)
+                let! history = historyOf work
+                let! entries = listAll history
 
                 Vitest.expect(entries[0].Refs |> Array.map describeRef |> Array.sort).toEqual
                     [|
@@ -443,7 +445,7 @@ Vitest.describe (
                     do! commitEmpty work $"commit {index}"
 
                 let! _ = git work [| "push"; "-q"; "origin"; "main" |]
-                let history = historyOf work
+                let! history = historyOf work
                 let! pushed = listAll history
 
                 do! commitEmpty work "local one"
@@ -467,7 +469,7 @@ Vitest.describe (
                 for index in 1..5 do
                     do! commitEmpty work $"local {index}"
 
-                let history = historyOf work
+                let! history = historyOf work
                 let! first = listPage history None 2
                 let! second = listPage history first.NextCursor 2
                 let! third = listPage history second.NextCursor 2
@@ -490,7 +492,8 @@ Vitest.describe (
                 do! commitEmpty work "main three"
                 let! _ = git work [| "merge"; "-q"; "--no-ff"; "-m"; "merge topic"; "topic" |]
 
-                let! entries = listAll (historyOf work)
+                let! history = historyOf work
+                let! entries = listAll history
 
                 let described =
                     entries |> Array.map (fun entry -> $"{entry.Summary} {publicationOf entry}") |> Array.sort
@@ -514,7 +517,8 @@ Vitest.describe (
                 do! commitEmpty work "one"
                 do! commitEmpty work "two"
 
-                let! entries = listAll (historyOf work)
+                let! history = historyOf work
+                let! entries = listAll history
 
                 Vitest.expect(entries |> Array.map publicationOf).toEqual [| "local"; "local" |]
             }
@@ -526,7 +530,7 @@ Vitest.describe (
                 let! work = newRepository ()
                 do! commitEmpty work "one"
                 let! tip = head work
-                let history = historyOf work
+                let! history = historyOf work
 
                 for cursor in [ "garbage"; "abc:1"; $"{tip}:-1"; $"{tip}:x"; $"{tip}:1:2" ] do
                     let! result = listPageResult history (Some cursor) 10
@@ -545,7 +549,8 @@ Vitest.describe (
                 do! commitAll work "root"
                 let! root = head work
 
-                let! changes = changesOf (historyOf work) root
+                let! history = historyOf work
+                let! changes = changesOf history root
 
                 Vitest.expect(changes).toEqual [| "A a.txt"; "A dir/b.txt" |]
             }
@@ -563,7 +568,8 @@ Vitest.describe (
                 let! _ = git work [| "merge"; "-q"; "--no-ff"; "-m"; "merge topic"; "topic" |]
                 let! merge = head work
 
-                let! changes = changesOf (historyOf work) merge
+                let! history = historyOf work
+                let! changes = changesOf history merge
 
                 Vitest.expect(changes).toEqual [| "A b.txt" |]
             }
@@ -582,7 +588,7 @@ Vitest.describe (
                 do! writeFile work "inexact.txt" (String.concat "" (Array.append [| "changed 1\n"; "changed 2\n" |] lines[2..]))
                 do! commitAll work "inexact rename"
                 let! inexact = head work
-                let history = historyOf work
+                let! history = historyOf work
 
                 let! exactChanges = changesOf history exact
                 let! inexactChanges = changesOf history inexact
@@ -601,7 +607,8 @@ Vitest.describe (
                 do! commitAll work "delete"
                 let! deletion = head work
 
-                let! changes = changesOf (historyOf work) deletion
+                let! history = historyOf work
+                let! changes = changesOf history deletion
 
                 Vitest.expect(changes).toEqual [| "D a.txt" |]
             }
@@ -616,7 +623,8 @@ Vitest.describe (
                 do! commitAll work "names"
                 let! tip = head work
 
-                let! changes = changesOf (historyOf work) tip
+                let! history = historyOf work
+                let! changes = changesOf history tip
 
                 Vitest.expect(Array.sort changes).toEqual
                     (Array.sort [| "A my file.txt"; "A grüße/日本語.txt" |])
@@ -631,7 +639,8 @@ Vitest.describe (
                 do! commitEmpty work "nothing"
                 let! tip = head work
 
-                let! changes = changesOf (historyOf work) tip
+                let! history = historyOf work
+                let! changes = changesOf history tip
 
                 Vitest.expect(changes.Length).toBe 0
             }
@@ -673,7 +682,8 @@ Vitest.describe (
                 let! tip = head clone
                 let! missingBefore = countMissing ()
 
-                let! changes = changesOf (historyOf clone) tip
+                let! history = historyOf clone
+                let! changes = changesOf history tip
 
                 let! missingAfter = countMissing ()
                 Vitest.expect(missingBefore > 0).toBe true
@@ -696,7 +706,7 @@ Vitest.describe (
                 let! ids = revList work
                 let! _ = git work [| "config"; "log.diffMerges"; "off" |]
                 let! _ = git work [| "config"; "log.showRoot"; "false" |]
-                let history = historyOf work
+                let! history = historyOf work
 
                 let! mergeChanges = changesOf history merge
                 let! rootChanges = changesOf history (Array.last ids)
@@ -742,9 +752,10 @@ Vitest.describe (
                 let! work = newRepository ()
                 do! commitEmpty work "one"
                 let! tip = head work
+                let! history = historyOf work
 
                 for revision in [ tip.Substring(0, 10); "HEAD"; tip.ToUpperInvariant() ] do
-                    let! result = changesResult (historyOf work) revision
+                    let! result = changesResult history revision
                     Vitest.expect((operationFailure "GetRevisionChanges" result).Code).toBe "invalid_revision"
             }
         )
@@ -755,7 +766,8 @@ Vitest.describe (
                 let! work = newRepository ()
                 do! commitEmpty work "one"
 
-                let! result = changesResult (historyOf work) (String.replicate 40 "a")
+                let! history = historyOf work
+                let! result = changesResult history (String.replicate 40 "a")
 
                 let failure = operationFailure "GetRevisionChanges" result
                 Vitest.expect(failure.Code).toBe "revision_not_found"

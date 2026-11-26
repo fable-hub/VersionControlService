@@ -30,9 +30,20 @@ type ListRevisionsRequest = {
 
 type RevisionPage = { Revisions: RevisionEntry[]; NextCursor: string option }
 
-/// Optional history service: the revisions that lead to the current one, newest first.
-type HistoryService = {
-    ListRevisions: ListRevisionsRequest -> OperationContext -> Async<OperationResult<RevisionPage>>
-    /// The objects a revision changed against its first parent. A root revision reports every object as added.
-    GetRevisionChanges: RevisionId -> OperationContext -> Async<OperationResult<DiffSummary>>
+/// The history functions of a provider, one entry for each.
+type HistoryFunctions = {
+    ListRevisions: Entry<Repository -> ListRevisionsRequest -> OperationContext -> Async<OperationResult<RevisionPage>>>
+    GetRevisionChanges: Entry<Repository -> RevisionId -> OperationContext -> Async<OperationResult<DiffSummary>>>
 }
+
+/// History: the revisions that lead to the current one, newest first.
+type IHistory =
+    abstract ListRevisions:
+        repository: Repository ->
+        request: ListRevisionsRequest ->
+        context: OperationContext ->
+            Async<CallResult<RevisionPage>>
+
+    /// The objects a revision changed against its first parent. A root revision reports every object as added.
+    abstract GetRevisionChanges:
+        repository: Repository -> revision: RevisionId -> context: OperationContext -> Async<CallResult<DiffSummary>>

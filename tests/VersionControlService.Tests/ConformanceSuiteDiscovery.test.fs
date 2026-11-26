@@ -67,17 +67,23 @@ Vitest.describe (
                             { Path = "two.txt"; Content = Some "two\n" }
                         |]
 
-                    let! statusResult = workspace.Session.Core.GetStatus(ctx "fake-synchronize-race-status") |> run
+                    let! statusResult =
+                        executed (workspace.Provider.GetStatus workspace.Repository (ctx "fake-synchronize-race-status"))
+                        |> run
+
                     let status = expectValue "fake synchronize race status" statusResult
                     let! result =
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "fake-synchronize-race")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "fake-synchronize-race")
+                        )
                         |> run
 
                     expectPerformed "fake synchronize race" result |> ignore
@@ -86,7 +92,14 @@ Vitest.describe (
                     Vitest.expect(first).toEqual (Some "one\n")
                     Vitest.expect(second).toEqual (None)
 
-                    let! refreshResult = (syncService workspace.Session).Refresh(ctx "fake-synchronize-race-refresh") |> run
+                    let! refreshResult =
+                        executed (
+                            workspace.Provider.Synchronization.Refresh
+                                workspace.Repository
+                                (ctx "fake-synchronize-race-refresh")
+                        )
+                        |> run
+
                     let refreshed = expectValue "fake synchronize race refresh" refreshResult
                     Vitest.expect(refreshed.Relationship).toEqual (TargetAhead)
 

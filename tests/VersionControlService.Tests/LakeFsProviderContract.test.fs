@@ -7,6 +7,7 @@ open VersionControlService.Abstractions
 open VersionControlService.LakeFs.LakeFsTypes
 open VersionControlService.Tests.Contracts
 open VersionControlService.Tests.Contracts.ProviderHarness
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open VersionControlService.Tests.NodePath
 open Vitest
 
@@ -14,12 +15,12 @@ module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsConflictSession = VersionControlService.LakeFs.LakeFsConflictSession
 module LakeFsMaterialization = VersionControlService.LakeFs.LakeFsMaterialization
+module LakeFsProvider = VersionControlService.LakeFs.LakeFsProvider
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsPathSafety = VersionControlService.LakeFs.LakeFsPathSafety
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module LakeFsSynchronization = VersionControlService.LakeFs.LakeFsSynchronization
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
-module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 module RuntimeNodePath = VersionControlService.Runtime.Node.Path
 module RuntimeNodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module RuntimeNodeInterop = VersionControlService.Runtime.Node.Interop
@@ -66,12 +67,24 @@ let private injectNextTransactionCleanupFailure () : (unit -> unit) = jsNative
 let lakeFsProviderOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
     StateRoot = join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-provider-state" |]
     PathCaseSensitivity = CaseInsensitive
+    Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+    Credentials = LakeFsCredentials.unconfigured
 }
 
-let stateDirectoryForBinding (binding: WorkspaceBinding) =
-    match LakeFsStateStore.resolve lakeFsProviderOptions binding.RepositoryRoot binding.ProviderStateRef with
-    | Ok state -> state.StateDirectory
+/// The folder of the workspace as its repository reports it.
+let folderOf (workspace: HarnessWorkspace) = workspace.Repository.Descriptor.RepositoryRoot
+
+/// The provider state of a folder, found the way the provider finds it.
+let resolvedStateOfFolder (folder: string) : LakeFsStateStore.ResolvedState =
+    match
+        LakeFsStateStore.findByFolder lakeFsProviderOptions folder
+        |> Result.bind (fun stateId -> LakeFsStateStore.resolve lakeFsProviderOptions folder stateId)
+    with
+    | Ok state -> state
     | Error failure -> failwith $"Resolving test provider state failed ({failure.Code}): {failure.Message}"
+
+let stateDirectoryOf (workspace: HarnessWorkspace) =
+    (resolvedStateOfFolder (folderOf workspace)).StateDirectory
 
 let integrationEnabled () =
     getEnvironmentVariable "LAKEFS_INTEGRATION" = "1"
@@ -166,6 +179,8 @@ let private createMaterializationRecoveryScenario () = promise {
     let options: LakeFsProviderOptions.LakeFsProviderOptions = {
         StateRoot = stateRoot
         PathCaseSensitivity = CaseInsensitive
+        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+        Credentials = LakeFsCredentials.unconfigured
     }
 
     let state =
@@ -360,7 +375,7 @@ let private parseLocation (location: RepositoryLocation) =
 
 type private WorkspaceControl = {
     Location: RepositoryLocation
-    Binding: WorkspaceBinding
+    Root: string
     mutable RaceMutations: TargetMutation[] option
     mutable SlowTransfer: bool
 }
@@ -409,23 +424,6 @@ let createLakeFsHarness () : ProviderTestHarness =
         ConnectionProfileId = profile
     }
 
-    let bindingFor (root: string) (location: RepositoryLocation) : WorkspaceBinding =
-        let state =
-            match LakeFsStateStore.create lakeFsProviderOptions root with
-            | Ok value -> value
-            | Error failure -> failwith $"Creating test provider state failed ({failure.Code}): {failure.Message}"
-
-        stateDirectories.Add state.StateDirectory
-
-        {
-            SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-            ProviderId = location.ProviderId
-            RepositoryRoot = root
-            ProviderStateRef = Some state.StateId
-            Location = location
-            ConnectionProfileId = location.ConnectionProfileId
-        }
-
     let advanceRef
         (location: RepositoryLocation)
         (reference: string)
@@ -471,7 +469,7 @@ let createLakeFsHarness () : ProviderTestHarness =
         let parsed = parseLocation location
         advanceRef location parsed.TargetRef mutations
 
-    let hooks: LakeFsWorkspaceSession.LakeFsSessionHooks = {
+    let hooks: LakeFsProviderOptions.LakeFsSessionHooks = {
         Barrier =
             Some(fun root point operationContext -> async {
                 match controls.TryGetValue root with
@@ -501,7 +499,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
 
-                            match LakeFsWorkspaceIndex.load (stateDirectoryForBinding control.Binding) with
+                            match LakeFsWorkspaceIndex.load ((resolvedStateOfFolder control.Root).StateDirectory) with
                             | LakeFsWorkspaceIndex.Loaded index ->
                                 do!
                                     Async.AwaitPromise(
@@ -524,7 +522,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
 
-                            match LakeFsWorkspaceIndex.load (stateDirectoryForBinding control.Binding) with
+                            match LakeFsWorkspaceIndex.load ((resolvedStateOfFolder control.Root).StateDirectory) with
                             | LakeFsWorkspaceIndex.Loaded index ->
                                 do!
                                     Async.AwaitPromise(
@@ -543,7 +541,7 @@ let createLakeFsHarness () : ProviderTestHarness =
                         | Some mutations ->
                             control.RaceMutations <- None
 
-                            match LakeFsWorkspaceIndex.load (stateDirectoryForBinding control.Binding) with
+                            match LakeFsWorkspaceIndex.load ((resolvedStateOfFolder control.Root).StateDirectory) with
                             | LakeFsWorkspaceIndex.Loaded index ->
                                 do!
                                     Async.AwaitPromise(
@@ -581,8 +579,8 @@ let createLakeFsHarness () : ProviderTestHarness =
             })
     }
 
-    let factory =
-        LakeFsWorkspaceSession.createFactoryWithHooks lakeFsProviderOptions hooks credentials
+    let provider =
+        LakeFsProvider.create { lakeFsProviderOptions with Hooks = hooks; Credentials = credentials }
 
     let createLocationWithProfile profile = promise {
         let repository = $"vcs-{nextId ()}"
@@ -591,29 +589,35 @@ let createLakeFsHarness () : ProviderTestHarness =
         return locationFor repository profile
     }
 
-    let openWorkspace (binding: WorkspaceBinding) = promise {
-        let! opened = factory.Open binding (context "harness-open") |> Async.StartAsPromise
+    let openWorkspace (root: string) (location: RepositoryLocation) = promise {
+        let! opened =
+            provider.Bind { RepositoryRoot = root; Location = location } (context "harness-open")
+            |> executed
+            |> Async.StartAsPromise
 
-        let session =
+        let repository =
             match opened with
             | Succeeded outcome -> outcome.Value
             | PartiallySucceeded(_, failure)
             | Failed failure ->
-                failwith $"lakeFS session open failed ({failure.Category}/{failure.Code}): {failure.Message}"
+                failwith $"lakeFS repository open failed ({failure.Category}/{failure.Code}): {failure.Message}"
 
-        controls[binding.RepositoryRoot] <- {
-            Location = binding.Location
-            Binding = binding
+        let providerState = resolvedStateOfFolder root
+        stateDirectories.Add providerState.StateDirectory
+
+        controls[root] <- {
+            Location = location
+            Root = root
             RaceMutations = None
             SlowTransfer = false
         }
 
         return {
-            Session = session
-            Binding = binding
-            WriteFile = fun path content -> writeUtf8FileAsync (join [| binding.RepositoryRoot; path |]) content
-            ReadFile = fun path -> tryReadUtf8FileAsync (join [| binding.RepositoryRoot; path |])
-            RemoveFile = fun path -> removeFileAsync (join [| binding.RepositoryRoot; path |])
+            Provider = provider
+            Repository = repository
+            WriteFile = fun path content -> writeUtf8FileAsync (join [| root; path |]) content
+            ReadFile = fun path -> tryReadUtf8FileAsync (join [| root; path |])
+            RemoveFile = fun path -> removeFileAsync (join [| root; path |])
             // Windows and macOS default filesystems alias case, and only Windows enforces its
             // reserved names. Linux runners do neither, so the flags follow the platform.
             LocalFileSystemAliasesCase = localFileSystemAliasesCase ()
@@ -658,12 +662,12 @@ let createLakeFsHarness () : ProviderTestHarness =
         let! location = createLocationWithProfile (Some "default")
         do! seedBase location
         let! root = createRoot ()
-        return! openWorkspace (bindingFor root location)
+        return! openWorkspace root location
     }
 
     {
         Name = "lakeFS"
-        Factory = factory
+        Provider = provider
         ExpectedServices = [ "conflicts"; "synchronization" ]
         CreateLocation = fun () -> createLocationWithProfile (Some "default")
         CreateUnauthorizedLocation = fun () -> createLocationWithProfile (Some "unauthorized")
@@ -672,23 +676,31 @@ let createLakeFsHarness () : ProviderTestHarness =
         CreateLinkedWorkspace =
             fun anchor -> promise {
                 let! root = createRoot ()
-                let linkedLocation = { anchor.Binding.Location with ConnectionProfileId = Some "linked" }
-                return! openWorkspace (bindingFor root linkedLocation)
+                let linkedLocation = { locationOf anchor with ConnectionProfileId = Some "linked" }
+                return! openWorkspace root linkedLocation
             }
-        OpenSecondSession =
+        OpenSecondRepository =
             fun anchor -> promise {
-                let! opened = factory.Open anchor.Binding (context "harness-open-second") |> Async.StartAsPromise
+                let! opened =
+                    provider.Open
+                        {
+                            RepositoryRoot = folderOf anchor
+                            ConnectionProfileId = (locationOf anchor).ConnectionProfileId
+                        }
+                        (context "harness-open-second")
+                    |> executed
+                    |> Async.StartAsPromise
 
                 return
                     match opened with
                     | Succeeded outcome -> outcome.Value
                     | PartiallySucceeded(_, failure)
-                    | Failed failure -> failwith $"second lakeFS session failed: {failure.Message}"
+                    | Failed failure -> failwith $"second lakeFS repository failed: {failure.Message}"
             }
-        AdvanceTarget = fun workspace mutations -> advanceTarget workspace.Binding.Location mutations
+        AdvanceTarget = fun workspace mutations -> advanceTarget (locationOf workspace) mutations
         SeedRevisionOnNewRef =
             fun workspace refName files -> promise {
-                let parsed = parseLocation workspace.Binding.Location
+                let parsed = parseLocation (locationOf workspace)
                 let! created =
                     LakeFsApi.createBranch
                         (connection ())
@@ -739,12 +751,12 @@ let createLakeFsHarness () : ProviderTestHarness =
             }
         ArmDestinationRace =
             fun workspace mutations -> promise {
-                controls[workspace.Binding.RepositoryRoot].RaceMutations <- Some mutations
+                controls[folderOf workspace].RaceMutations <- Some mutations
                 return ()
             }
         ArmSlowTransfer =
             fun workspace -> promise {
-                controls[workspace.Binding.RepositoryRoot].SlowTransfer <- true
+                controls[folderOf workspace].SlowTransfer <- true
                 return ()
             }
         Cleanup =
@@ -834,14 +846,15 @@ Vitest.describe (
                     cancellation.Cancel()
 
                     let! result =
-                        harness.Factory.Clone
+                        harness.Provider.Clone
                             {
-                                Location = anchor.Binding.Location
+                                Location = locationOf anchor
                                 TargetPath = targetPath
                                 TargetRef = None
                                 MaterializeAllObjects = true
                             }
                             (OperationContext.create "pre-canceled-clone" cancellation.Cancellation ignore)
+                        |> executed
                         |> Async.StartAsPromise
 
                     match result with
@@ -870,17 +883,19 @@ Vitest.describe (
                 let stateRoot = RuntimeNodePath.join [| root; "provider-state" |]
 
                 try
-                    let options: LakeFsProviderOptions.LakeFsProviderOptions = {
-                        StateRoot = stateRoot
-                        PathCaseSensitivity = CaseInsensitive
-                    }
-
                     let credentials =
                         LakeFsCredentials.fixedConnection {
                             Endpoint = "http://127.0.0.1:1"
                             AccessKeyId = "unused"
                             SecretAccessKey = "unused"
                         }
+
+                    let options: LakeFsProviderOptions.LakeFsProviderOptions = {
+                        StateRoot = stateRoot
+                        PathCaseSensitivity = CaseInsensitive
+                        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                        Credentials = credentials
+                    }
 
                     let location: RepositoryLocation = {
                         ProviderId = ProviderId.tryCreate "lakefs" |> Result.defaultWith failwith
@@ -889,11 +904,11 @@ Vitest.describe (
                         ConnectionProfileId = None
                     }
 
-                    let factory = LakeFsWorkspaceSession.createFactory options credentials
+                    let provider = LakeFsProvider.create options
                     let targetRef = ProviderRef.tryCreate "lakefs:other" |> Result.defaultWith failwith
 
                     let! result =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = location
                                 TargetPath = targetPath
@@ -901,6 +916,7 @@ Vitest.describe (
                                 MaterializeAllObjects = false
                             }
                             (context "clone-target-ref-mismatch")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match result with
@@ -935,35 +951,36 @@ let private createSingleFileConflict harness = promise {
     do! workspace.WriteFile "base.txt" "workspace base\n"
 
     let! saveStatusResult =
-        workspace.Session.Core.GetStatus(context "conflict-staleness-save-status")
+        workspace.Provider.GetStatus workspace.Repository (context "conflict-staleness-save-status")
+        |> executed
         |> Async.StartAsPromise
 
     let saveStatus = expectOperationValue "conflict staleness save status" saveStatusResult
     let! saveResult =
-        workspace.Session.Core.CreateRevision
+        workspace.Provider.CreateRevision workspace.Repository
             {
                 Message = "create conflict staleness workspace revision"
                 Paths = [| repositoryPath "base.txt" |]
                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
             }
             (context "conflict-staleness-save")
+        |> executed
         |> Async.StartAsPromise
 
     expectOperationValue "conflict staleness workspace revision" saveResult |> ignore
 
     let! updateStatusResult =
-        workspace.Session.Core.GetStatus(context "conflict-staleness-update-status")
+        workspace.Provider.GetStatus workspace.Repository (context "conflict-staleness-update-status")
+        |> executed
         |> Async.StartAsPromise
 
     let updateStatus = expectOperationValue "conflict staleness update status" updateStatusResult
-    let synchronization =
-        workspace.Session.Synchronization
-        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
     let! updateResult =
-        synchronization.Update
+        workspace.Provider.Synchronization.Update workspace.Repository
             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
             (context "conflict-staleness-update")
+        |> executed
         |> Async.StartAsPromise
 
     let updateFailure =
@@ -975,19 +992,16 @@ let private createSingleFileConflict harness = promise {
     Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
     Vitest.expect(updateFailure.Code).toBe "conflicts_detected"
 
-    let conflicts =
-        workspace.Session.ConflictResolution
-        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
-
     let! sessionResult =
-        conflicts.GetActiveSession(context "conflict-staleness-session")
+        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (context "conflict-staleness-session")
+        |> executed
         |> Async.StartAsPromise
 
     let summary =
         expectOperationValue "conflict staleness session" sessionResult
         |> Option.defaultWith (fun () -> failwith "Expected an active conflict session.")
 
-    return workspace, conflicts, summary
+    return workspace, summary
 }
 
 Vitest.describe (
@@ -1003,15 +1017,10 @@ Vitest.describe (
                 let harness = createLakeFsHarness ()
 
                 try
-                    let! canceledWorkspace, canceledConflicts, canceledSummary =
-                        createSingleFileConflict harness
+                    let! canceledWorkspace, canceledSummary = createSingleFileConflict harness
 
                     let canceledTemporaryDirectory =
-                        join [|
-                            lakeFsProviderOptions.StateRoot
-                            canceledWorkspace.Binding.ProviderStateRef.Value
-                            "temporary"
-                        |]
+                        join [| stateDirectoryOf canceledWorkspace; "temporary" |]
 
                     let candidatesBeforeCancel =
                         RuntimeNodeFileSystem.readdirSync canceledTemporaryDirectory
@@ -1020,17 +1029,19 @@ Vitest.describe (
                     Vitest.expect(candidatesBeforeCancel.Length > 0).toBe(true)
 
                     let! cancelStatusResult =
-                        canceledWorkspace.Session.Core.GetStatus(context "recovery-cancel-status")
+                        canceledWorkspace.Provider.GetStatus canceledWorkspace.Repository (context "recovery-cancel-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let cancelStatus = expectOperationValue "recovery cancel status" cancelStatusResult
                     let! cancelResult =
-                        canceledConflicts.Cancel
+                        canceledWorkspace.Provider.ConflictResolution.Cancel canceledWorkspace.Repository
                             {
                                 Handle = canceledSummary.Handle
                                 ExpectedRepositoryVersion = cancelStatus.RepositoryVersion
                             }
                             (context "recovery-cancel")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectOperationValue "recovery cancel" cancelResult |> ignore
@@ -1041,25 +1052,21 @@ Vitest.describe (
 
                     Vitest.expect(candidatesAfterCancel).toEqual [||]
 
-                    let! finalizedWorkspace, finalizedConflicts, finalizedSummary =
-                        createSingleFileConflict harness
+                    let! finalizedWorkspace, finalizedSummary = createSingleFileConflict harness
 
                     let finalizedTemporaryDirectory =
-                        join [|
-                            lakeFsProviderOptions.StateRoot
-                            finalizedWorkspace.Binding.ProviderStateRef.Value
-                            "temporary"
-                        |]
+                        join [| stateDirectoryOf finalizedWorkspace; "temporary" |]
 
                     let! resolutionStatusResult =
-                        finalizedWorkspace.Session.Core.GetStatus(context "recovery-finalize-resolution-status")
+                        finalizedWorkspace.Provider.GetStatus finalizedWorkspace.Repository (context "recovery-finalize-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus =
                         expectOperationValue "recovery finalize resolution status" resolutionStatusResult
 
                     let! resolutionResult =
-                        finalizedConflicts.Resolve
+                        finalizedWorkspace.Provider.ConflictResolution.Resolve finalizedWorkspace.Repository
                             {
                                 Handle = finalizedSummary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -1067,24 +1074,27 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (context "recovery-finalize-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution =
                         expectOperationValue "recovery finalize resolution" resolutionResult
 
                     let! finalizeStatusResult =
-                        finalizedWorkspace.Session.Core.GetStatus(context "recovery-finalize-status")
+                        finalizedWorkspace.Provider.GetStatus finalizedWorkspace.Repository (context "recovery-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectOperationValue "recovery finalize status" finalizeStatusResult
                     let! finalizeResult =
-                        finalizedConflicts.Finalize
+                        finalizedWorkspace.Provider.ConflictResolution.Finalize finalizedWorkspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "cleanup candidates"
                             }
                             (context "recovery-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectOperationValue "recovery finalize" finalizeResult |> ignore
@@ -1126,20 +1136,18 @@ Vitest.describe (
                         |]
 
                     let! beforeUpdateResult =
-                        workspace.Session.Core.GetStatus(context "recovery-gating-before-update")
+                        workspace.Provider.GetStatus workspace.Repository (context "recovery-gating-before-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let beforeUpdate = expectOperationValue "recovery gating before update" beforeUpdateResult
-                    armMaterializationApplyFailure workspace.Binding.RepositoryRoot
-
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
+                    armMaterializationApplyFailure (folderOf workspace)
 
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (context "recovery-gating-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let partialFailure =
@@ -1152,7 +1160,8 @@ Vitest.describe (
                     Vitest.expect(partialFailure.AffectedPaths.Length).toBe 1
 
                     let! partialStatusResult =
-                        workspace.Session.Core.GetStatus(context "recovery-gating-partial-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "recovery-gating-partial-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let partialStatus = expectOperationValue "recovery gating partial status" partialStatusResult
@@ -1163,28 +1172,24 @@ Vitest.describe (
                         |> Array.exists (fun change -> RepositoryPath.value change.Path = partialFailure.AffectedPaths[0])
                     ).toBe(false)
 
-                    let resolvedState =
-                        LakeFsStateStore.resolve
-                            lakeFsProviderOptions
-                            workspace.Binding.RepositoryRoot
-                            workspace.Binding.ProviderStateRef
-                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let resolvedState = resolvedStateOfFolder (folderOf workspace)
 
                     let referencedTransaction =
                         RuntimeNodeFileSystem.readdirSync resolvedState.TransactionsDirectory
                         |> Array.exactlyOne
                         |> fun name -> join [| resolvedState.TransactionsDirectory; name |]
 
-                    let! _ = harness.OpenSecondSession workspace
+                    let! _ = harness.OpenSecondRepository workspace
                     Vitest.expect(RuntimeNodeFileSystem.existsSync referencedTransaction).toBe(true)
 
                     let! emptyRestoreResult =
-                        workspace.Session.Core.RestorePaths
+                        workspace.Provider.RestorePaths workspace.Repository
                             {
                                 Paths = [||]
                                 ExpectedRepositoryVersion = partialStatus.RepositoryVersion
                             }
                             (context "recovery-gating-empty-restore")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match emptyRestoreResult with
@@ -1202,21 +1207,23 @@ Vitest.describe (
                         | PartiallySucceeded _ -> failwith $"{operation} unexpectedly mutated during recovery."
 
                     let! createRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "blocked during materialization recovery"
                                 Paths = [| replacedPath |]
                                 ExpectedRepositoryVersion = partialStatus.RepositoryVersion
                             }
                             (context "recovery-gating-create-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectBlocked "CreateRevision" createRevisionResult
 
                     let! blockedUpdateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = partialStatus.RepositoryVersion }
                             (context "recovery-gating-blocked-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectBlocked "Update" blockedUpdateResult
@@ -1224,18 +1231,20 @@ Vitest.describe (
                     do! workspace.WriteFile "caller-only.txt" "caller-selected edit\n"
 
                     let! callerStatusResult =
-                        workspace.Session.Core.GetStatus(context "recovery-gating-caller-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "recovery-gating-caller-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let callerStatus = expectOperationValue "recovery caller status" callerStatusResult
 
                     let! replayResult =
-                        workspace.Session.Core.RestorePaths
+                        workspace.Provider.RestorePaths workspace.Repository
                             {
                                 Paths = [| repositoryPath "caller-only.txt" |]
                                 ExpectedRepositoryVersion = callerStatus.RepositoryVersion
                             }
                             (context "recovery-gating-replay")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match replayResult with
@@ -1245,7 +1254,7 @@ Vitest.describe (
                     | Failed failure ->
                         failwith $"Recovery followed by the caller restore failed: {failure.Code}"
 
-                    let stateDirectory = stateDirectoryForBinding workspace.Binding
+                    let stateDirectory = stateDirectoryOf workspace
                     let recoveryDirectory = join [| stateDirectory; "recovery" |]
                     Vitest.expect(RuntimeNodeFileSystem.readdirSync recoveryDirectory).toEqual [||]
 
@@ -1290,8 +1299,10 @@ Vitest.describe (
                     let options: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = stateRoot
                         PathCaseSensitivity = CaseInsensitive
+                        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                        Credentials = credentials
                     }
-                    let factory = LakeFsWorkspaceSession.createFactory options credentials
+                    let provider = LakeFsProvider.create options
                     let location: RepositoryLocation = {
                         ProviderId = ProviderId.tryCreate "lakefs" |> Result.defaultWith failwith
                         DisplayName = None
@@ -1299,21 +1310,27 @@ Vitest.describe (
                         ConnectionProfileId = Some "profile"
                     }
 
+                    // Nothing listens at the endpoint, so the first open of the folder cannot finish. The state
+                    // entry of the folder stays behind.
                     let! initialized =
-                        factory.Initialize
+                        provider.Initialize
                             {
                                 TargetPath = workspaceRoot
                                 Location = Some location
                             }
                             (context "external-state-initialize")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let binding = expectOperationValue "external-state initialize" initialized
-                    Vitest.expect(binding.ProviderStateRef.IsSome).toBe true
-                    Vitest.expect(RuntimeNodePath.isAbsolute binding.ProviderStateRef.Value).toBe false
+                    match initialized with
+                    | Failed _ -> ()
+                    | _ -> failwith "Expected the first open against an unreachable endpoint to fail."
 
                     let resolvedState =
-                        match LakeFsStateStore.resolve options workspaceRoot binding.ProviderStateRef with
+                        match
+                            LakeFsStateStore.findByFolder options workspaceRoot
+                            |> Result.bind (fun stateId -> LakeFsStateStore.resolve options workspaceRoot stateId)
+                        with
                         | Ok state -> state
                         | Error failure -> failwith $"State resolution failed: {failure.Code}"
 
@@ -1326,12 +1343,27 @@ Vitest.describe (
                     let! existing = tryReadUtf8FileAsync existingPath
                     Vitest.expect(existing).toEqual(Some "existing user bytes\u0000remain")
 
+                    let openRequest: OpenRequest = {
+                        RepositoryRoot = workspaceRoot
+                        ConnectionProfileId = location.ConnectionProfileId
+                    }
+
+                    let! unfinishedOpen =
+                        provider.Open openRequest (context "external-state-first-open-incomplete")
+                        |> executed
+                        |> Async.StartAsPromise
+
+                    match unfinishedOpen with
+                    | Failed failure -> Vitest.expect(failure.Code).toBe "first_open_incomplete"
+                    | _ -> failwith "Expected an interrupted first open to fail instead of continuing."
+
                     match LakeFsStateStore.markReady resolvedState with
                     | Error failure -> failwith $"State readiness update failed: {failure.Code}"
                     | Ok _ -> ()
 
                     let! missingReadyIndex =
-                        factory.Open binding (context "external-state-ready-index-missing")
+                        provider.Open openRequest (context "external-state-ready-index-missing")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match missingReadyIndex with
@@ -1339,7 +1371,7 @@ Vitest.describe (
                     | _ -> failwith "Expected ready provider state with a missing index to fail without recreation."
 
                     let! cloneIntoNonempty =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = location
                                 TargetPath = workspaceRoot
@@ -1347,6 +1379,7 @@ Vitest.describe (
                                 MaterializeAllObjects = true
                             }
                             (context "external-state-clone-nonempty")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match cloneIntoNonempty with
@@ -1357,7 +1390,7 @@ Vitest.describe (
                     do! writeUtf8FileAsync cloneFileTarget "consumer-owned file"
 
                     let! cloneIntoFile =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = location
                                 TargetPath = cloneFileTarget
@@ -1365,24 +1398,18 @@ Vitest.describe (
                                 MaterializeAllObjects = true
                             }
                             (context "external-state-clone-file")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match cloneIntoFile with
                     | Failed failure -> Vitest.expect(failure.Code).toBe "target_not_empty"
                     | _ -> failwith "Expected clone to reject an existing file target structurally."
 
-                    let! missingReference =
-                        factory.Open
-                            { binding with ProviderStateRef = None }
-                            (context "external-state-missing-ref")
-                        |> Async.StartAsPromise
-
-                    match missingReference with
-                    | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_ref_missing"
-                    | _ -> failwith "Expected a missing state reference to fail."
-
                     do! writeUtf8FileAsync (LakeFsWorkspaceIndex.indexPath stateDirectory) "corrupt index {"
-                    let! corrupt = factory.Open binding (context "external-state-corrupt") |> Async.StartAsPromise
+                    let! corrupt =
+                        provider.Open openRequest (context "external-state-corrupt")
+                        |> executed
+                        |> Async.StartAsPromise
 
                     match corrupt with
                     | Failed failure -> Vitest.expect(failure.Code).toBe "index_corrupt"
@@ -1405,14 +1432,23 @@ Vitest.describe (
                     | Error message -> failwith message
                     | Ok _ -> ()
 
-                    let! mismatched = factory.Open binding (context "external-state-mismatch") |> Async.StartAsPromise
+                    let! reopened =
+                        provider.Open openRequest (context "external-state-index-location")
+                        |> executed
+                        |> Async.StartAsPromise
 
-                    match mismatched with
-                    | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_mismatch"
-                    | _ -> failwith "Expected mismatched state to fail without retargeting."
+                    // Open has no location of its own to compare, so the index decides where the repository points.
+                    match reopened with
+                    | Succeeded outcome ->
+                        Vitest.expect(outcome.Value.Descriptor.Location |> Option.map _.ProviderLocation)
+                            .toEqual(Some "lakefs://another-repository/main")
+                    | _ -> failwith "Expected Open to take the location from the index."
 
                     do! removeDirectoryAsync stateDirectory
-                    let! missing = factory.Open binding (context "external-state-missing") |> Async.StartAsPromise
+                    let! missing =
+                        provider.Open openRequest (context "external-state-missing")
+                        |> executed
+                        |> Async.StartAsPromise
 
                     match missing with
                     | Failed failure -> Vitest.expect(failure.Code).toBe "provider_state_missing"
@@ -1434,6 +1470,8 @@ Vitest.describe (
                 let options: LakeFsProviderOptions.LakeFsProviderOptions = {
                     StateRoot = stateRoot
                     PathCaseSensitivity = CaseInsensitive
+                    Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                    Credentials = LakeFsCredentials.unconfigured
                 }
                 let restoreCleanupFailure = injectNextTransactionCleanupFailure ()
 
@@ -1512,7 +1550,7 @@ Vitest.describe (
                     let orphan = join [| state.TemporaryDirectory; "conflict-candidate-orphan.tmp" |]
                     do! writeUtf8FileAsync orphan "orphan"
 
-                    match LakeFsStateStore.resolve options workspaceRoot (Some state.StateId) with
+                    match LakeFsStateStore.resolve options workspaceRoot state.StateId with
                     | Error failure -> failwith $"Reopening provider state failed: {failure.Code}"
                     | Ok reopened ->
                         LakeFsStateStore.sweepTransientEntries reopened
@@ -2403,16 +2441,17 @@ Vitest.describe (
                 let harness = createLakeFsHarness ()
 
                 try
-                    let! workspace, conflicts, summary = createSingleFileConflict harness
+                    let! workspace, summary = createSingleFileConflict harness
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(context "recovery-conflict-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "recovery-conflict-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus =
                         expectOperationValue "recovery conflict resolution status" resolutionStatusResult
 
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -2420,24 +2459,21 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (context "recovery-conflict-preresolve")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution =
                         expectOperationValue "recovery conflict preresolve" resolutionResult
 
                     let! pendingStatusResult =
-                        workspace.Session.Core.GetStatus(context "recovery-conflict-pending-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "recovery-conflict-pending-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let pendingStatus =
                         expectOperationValue "recovery conflict pending status" pendingStatusResult
 
-                    let state =
-                        LakeFsStateStore.resolve
-                            lakeFsProviderOptions
-                            workspace.Binding.RepositoryRoot
-                            workspace.Binding.ProviderStateRef
-                        |> Result.defaultWith (fun failure -> failwith failure.Message)
+                    let state = resolvedStateOfFolder (folderOf workspace)
 
                     let index =
                         match LakeFsWorkspaceIndex.load state.StateDirectory with
@@ -2480,7 +2516,7 @@ Vitest.describe (
                             .toEqual [| RuntimeNodePath.basename recoveryPath |]
 
                     let! blockedResolve =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = pendingStatus.RepositoryVersion
@@ -2488,29 +2524,32 @@ Vitest.describe (
                                 Resolution = PickCandidate "workspace"
                             }
                             (context "recovery-conflict-blocked-resolve")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectRecoveryGate "resolve" blockedResolve
 
                     let! blockedFinalize =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = pendingStatus.RepositoryVersion
                                 Message = Some "must remain blocked"
                             }
                             (context "recovery-conflict-blocked-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectRecoveryGate "finalize" blockedFinalize
 
                     let! blockedCancel =
-                        conflicts.Cancel
+                        workspace.Provider.ConflictResolution.Cancel workspace.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = pendingStatus.RepositoryVersion
                             }
                             (context "recovery-conflict-blocked-cancel")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectRecoveryGate "cancel" blockedCancel
@@ -2620,15 +2659,12 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let parsed = parseLocation workspace.Binding.Location
+                    let parsed = parseLocation (locationOf workspace)
                     do! deleteRepository parsed.Repository
 
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization.")
-
                     let! previewResult =
-                        synchronization.PreviewUpdate(context "preview-target-diff-failure")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (context "preview-target-diff-failure")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match previewResult with
@@ -2659,7 +2695,8 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(context "configured-target-ref")
+                        workspace.Provider.GetStatus workspace.Repository (context "configured-target-ref")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectOperationValue "configured target status" statusResult
@@ -2695,16 +2732,17 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let! initialStatusResult =
-                        workspace.Session.Core.GetStatus(context "selected-revision-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "selected-revision-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let initialStatus = expectOperationValue "initial status" initialStatusResult
                     let initialIndex =
-                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected a persisted workspace index."
 
-                    let parsed = parseLocation workspace.Binding.Location
+                    let parsed = parseLocation (locationOf workspace)
                     let! targetBeforeResult =
                         LakeFsApi.getBranch
                             (connection ())
@@ -2719,19 +2757,21 @@ Vitest.describe (
                     do! workspace.WriteFile "unselected.txt" "unselected content\n"
 
                     let! statusBeforeRevisionResult =
-                        workspace.Session.Core.GetStatus(context "selected-revision-dirty-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "selected-revision-dirty-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let statusBeforeRevision = expectOperationValue "dirty status" statusBeforeRevisionResult
 
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "save selected literal path"
                                 Paths = [| repositoryPath "selected[1].txt" |]
                                 ExpectedRepositoryVersion = statusBeforeRevision.RepositoryVersion
                             }
                             (context "selected-revision-create")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let revision = expectOperationValue "selected revision" revisionResult
@@ -2771,7 +2811,8 @@ Vitest.describe (
                     Vitest.expect(commit.Parents).toContain (initialIndex.WorkspaceRevision.Value)
 
                     let! statusAfterResult =
-                        workspace.Session.Core.GetStatus(context "selected-revision-status-after")
+                        workspace.Provider.GetStatus workspace.Repository (context "selected-revision-status-after")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let statusAfter = expectOperationValue "status after selected revision" statusAfterResult
@@ -2779,12 +2820,13 @@ Vitest.describe (
 
                     do! workspace.WriteFile "selected[1].txt" "selected content after race\n"
                     let! raceStatusResult =
-                        workspace.Session.Core.GetStatus(context "selected-revision-race-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "selected-revision-race-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let raceStatus = expectOperationValue "race status" raceStatusResult
                     let indexBeforeRace =
-                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before the race."
 
@@ -2794,13 +2836,14 @@ Vitest.describe (
                         |]
 
                     let! racedRevision =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "race selected revision"
                                 Paths = [| repositoryPath "selected[1].txt" |]
                                 ExpectedRepositoryVersion = raceStatus.RepositoryVersion
                             }
                             (context "selected-revision-race")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match racedRevision with
@@ -2811,7 +2854,7 @@ Vitest.describe (
                         Vitest.expect(failure.Code).toBe "precondition_failed"
 
                     let indexAfterRace =
-                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match VersionControlService.LakeFs.LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | VersionControlService.LakeFs.LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after the race."
 
@@ -2840,7 +2883,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let index =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded value -> value
                         | _ -> failwith "Expected a persisted workspace index."
 
@@ -2852,7 +2895,7 @@ Vitest.describe (
 
                     do! harness.AdvanceTarget workspace remoteMutations
 
-                    let parsed = parseLocation workspace.Binding.Location
+                    let parsed = parseLocation (locationOf workspace)
                     let! targetResult =
                         LakeFsApi.getBranch
                             (connection ())
@@ -2863,7 +2906,8 @@ Vitest.describe (
 
                     let target = targetResult |> expectApi "read advanced target"
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(context "core-reads-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "core-reads-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectOperationValue "core read status" statusResult
@@ -2880,7 +2924,8 @@ Vitest.describe (
                     Vitest.expect(remotePaths).toContain "paged/object-104.txt"
 
                     let! refsResult =
-                        workspace.Session.Core.ListRefs(context "core-reads-refs")
+                        workspace.Provider.ListRefs workspace.Repository (context "core-reads-refs")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refs = expectOperationValue "list refs" refsResult
@@ -2891,17 +2936,19 @@ Vitest.describe (
                     do! workspace.WriteFile "keep-local.txt" "keep this local edit\n"
 
                     let! dirtyStatusResult =
-                        workspace.Session.Core.GetStatus(context "core-reads-dirty-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "core-reads-dirty-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let dirtyStatus = expectOperationValue "dirty status" dirtyStatusResult
                     let! restoreResult =
-                        workspace.Session.Core.RestorePaths
+                        workspace.Provider.RestorePaths workspace.Repository
                             {
                                 Paths = [| repositoryPath "base.txt" |]
                                 ExpectedRepositoryVersion = dirtyStatus.RepositoryVersion
                             }
                             (context "core-reads-restore")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectOperationValue "restore selected path" restoreResult |> ignore
@@ -2912,7 +2959,8 @@ Vitest.describe (
                     Vitest.expect(preservedLocal).toEqual (Some "keep this local edit\n")
 
                     let! diffResult =
-                        workspace.Session.Core.GetDiffSummary(context "core-reads-diff")
+                        workspace.Provider.GetDiffSummary workspace.Repository (context "core-reads-diff")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let diff = expectOperationValue "object diff" diffResult
@@ -2941,9 +2989,6 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     let localPaths = Array.init 105 (fun number -> $"local/object-{number:D3}.txt")
 
@@ -2951,18 +2996,20 @@ Vitest.describe (
                         do! workspace.WriteFile path $"local object {number}\n"
 
                     let! localStatusResult =
-                        workspace.Session.Core.GetStatus(context "refresh-preview-local-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "refresh-preview-local-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let localStatus = expectOperationValue "local status" localStatusResult
                     let! localRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "create paginated local revision"
                                 Paths = localPaths |> Array.map repositoryPath
                                 ExpectedRepositoryVersion = localStatus.RepositoryVersion
                             }
                             (context "refresh-preview-local-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectOperationValue "paginated local revision" localRevisionResult |> ignore
@@ -2983,12 +3030,13 @@ Vitest.describe (
                     do! harness.AdvanceTarget workspace remoteMutations
 
                     let beforeRead =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index before refresh/preview."
 
                     let! refreshResult =
-                        synchronization.Refresh(context "refresh-preview-refresh")
+                        workspace.Provider.Synchronization.Refresh workspace.Repository (context "refresh-preview-refresh")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectOperationValue "paginated refresh" refreshResult
@@ -3006,7 +3054,8 @@ Vitest.describe (
                     Vitest.expect(refreshedPaths).toContain "local/object-104.txt"
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(context "refresh-preview-preview")
+                        workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (context "refresh-preview-preview")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let preview = expectOperationValue "paginated preview" previewResult
@@ -3020,7 +3069,7 @@ Vitest.describe (
                     Vitest.expect(preview.WouldCreateConflictSession).toBe true
 
                     let afterRead =
-                        match LakeFsWorkspaceIndex.load (stateDirectoryForBinding workspace.Binding) with
+                        match LakeFsWorkspaceIndex.load (stateDirectoryOf workspace) with
                         | LakeFsWorkspaceIndex.Loaded index -> index
                         | _ -> failwith "Expected an index after refresh/preview."
 
@@ -3056,7 +3105,7 @@ Vitest.describe (
                             { Path = "second.txt"; Content = Some "target second\n" }
                         |]
 
-                    let parsed = parseLocation workspace.Binding.Location
+                    let parsed = parseLocation (locationOf workspace)
                     let! targetBeforeResult =
                         LakeFsApi.getBranch
                             (connection ())
@@ -3071,35 +3120,36 @@ Vitest.describe (
                     do! workspace.WriteFile "second.txt" "workspace second\n"
 
                     let! saveStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-cycle-save-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-cycle-save-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let saveStatus = expectOperationValue "conflict save status" saveStatusResult
                     let! saveResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "create conflicting workspace revision"
                                 Paths = [| repositoryPath "base.txt"; repositoryPath "second.txt" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (context "conflict-cycle-save")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectOperationValue "conflicting workspace revision" saveResult |> ignore
 
                     let! updateStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-cycle-update-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-cycle-update-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateStatus = expectOperationValue "conflict update status" updateStatusResult
-                    let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS synchronization services.")
 
                     let! updateResult =
-                        synchronization.Update
+                        workspace.Provider.Synchronization.Update workspace.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (context "conflict-cycle-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let updateFailure =
@@ -3111,12 +3161,9 @@ Vitest.describe (
                     Vitest.expect(updateFailure.Category).toEqual FailureCategory.Conflict
                     Vitest.expect(updateFailure.Code).toBe "conflicts_detected"
 
-                    let conflicts =
-                        workspace.Session.ConflictResolution
-                        |> Option.defaultWith (fun () -> failwith "Expected lakeFS conflict-resolution services.")
-
                     let! sessionResult =
-                        conflicts.GetActiveSession(context "conflict-cycle-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (context "conflict-cycle-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let summary =
@@ -3138,12 +3185,13 @@ Vitest.describe (
                         |> Array.find (fun item -> RepositoryPath.value item.Path = "base.txt")
 
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-cycle-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-cycle-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectOperationValue "resolution status" resolutionStatusResult
                     let! firstResolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -3151,6 +3199,7 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (context "conflict-cycle-first-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let firstResolution = expectOperationValue "first conflict resolution" firstResolutionResult
@@ -3159,13 +3208,14 @@ Vitest.describe (
                     Vitest.expect(firstResolution.RemainingItems.Length).toBe 1
 
                     let! afterFirstStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-cycle-after-first-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-cycle-after-first-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let afterFirstStatus = expectOperationValue "after first resolution status" afterFirstStatusResult
                     let secondItem = firstResolution.RemainingItems[0]
                     let! staleResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = afterFirstStatus.RepositoryVersion
@@ -3173,6 +3223,7 @@ Vitest.describe (
                                 Resolution = PickCandidate "workspace"
                             }
                             (context "conflict-cycle-stale-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let staleFailure =
@@ -3186,7 +3237,8 @@ Vitest.describe (
                     Vitest.expect(staleFailure.RecoveryAction |> Option.map _.Code).toEqual (Some ConflictRecovery.RefreshConflictSession)
 
                     let! afterStaleSessionResult =
-                        conflicts.GetActiveSession(context "conflict-cycle-after-stale-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (context "conflict-cycle-after-stale-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let afterStaleSession =
@@ -3197,7 +3249,7 @@ Vitest.describe (
                     Vitest.expect(afterStaleSession.Items.Length).toBe 1
 
                     let! secondResolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = firstResolution.RefreshedHandle
                                 ExpectedRepositoryVersion = afterFirstStatus.RepositoryVersion
@@ -3205,24 +3257,27 @@ Vitest.describe (
                                 Resolution = SupplyResolvedContent "supplied second\n"
                             }
                             (context "conflict-cycle-supplied-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let secondResolution = expectOperationValue "supplied conflict resolution" secondResolutionResult
                     Vitest.expect(secondResolution.RemainingItems.Length).toBe 0
 
                     let! finalizeStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-cycle-finalize-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-cycle-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectOperationValue "conflict finalize status" finalizeStatusResult
                     let! finalizeResult =
-                        conflicts.Finalize
+                        workspace.Provider.ConflictResolution.Finalize workspace.Repository
                             {
                                 Handle = secondResolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = None
                             }
                             (context "conflict-cycle-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizedRevision = expectOperationValue "finalize conflict session" finalizeResult
@@ -3243,23 +3298,26 @@ Vitest.describe (
                     Vitest.expect(finalizedCommit.Message).toBe "Merge online changes"
 
                     let! closedResult =
-                        conflicts.GetActiveSession(context "conflict-cycle-closed-session")
+                        workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (context "conflict-cycle-closed-session")
+                        |> executed
                         |> Async.StartAsPromise
 
                     Vitest.expect(expectOperationValue "closed conflict session" closedResult).toEqual None
 
                     let! closedStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-cycle-closed-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-cycle-closed-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let closedStatus = expectOperationValue "closed conflict status" closedStatusResult
                     let! closedReplayResult =
-                        conflicts.Cancel
+                        workspace.Provider.ConflictResolution.Cancel workspace.Repository
                             {
                                 Handle = secondResolution.RefreshedHandle
                                 ExpectedRepositoryVersion = closedStatus.RepositoryVersion
                             }
                             (context "conflict-cycle-closed-replay")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let closedFailure =
@@ -3308,12 +3366,13 @@ Vitest.describe (
                 let harness = createLakeFsHarness ()
 
                 try
-                    let! (workspace, conflicts, summary) = createSingleFileConflict harness
+                    let! (workspace, summary) = createSingleFileConflict harness
                     let item = summary.Items[0]
                     do! workspace.WriteFile "base.txt" "workspace base changed first\n"
 
                     let! firstStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-staleness-first-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-staleness-first-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let firstStatus = expectOperationValue "conflict staleness first status" firstStatusResult
@@ -3323,14 +3382,15 @@ Vitest.describe (
                         do! workspace.WriteFile "base.txt" "workspace base changed out of band\n"
 
                         let! secondStatusResult =
-                            workspace.Session.Core.GetStatus(context "conflict-staleness-second-status")
+                            workspace.Provider.GetStatus workspace.Repository (context "conflict-staleness-second-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let secondStatus = expectOperationValue "conflict staleness second status" secondStatusResult
                         Vitest.expect(secondStatus.RepositoryVersion).not.toBe firstStatus.RepositoryVersion
 
                         let! resolutionResult =
-                            conflicts.Resolve
+                            workspace.Provider.ConflictResolution.Resolve workspace.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = firstStatus.RepositoryVersion
@@ -3338,6 +3398,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "workspace"
                                 }
                                 (context "conflict-staleness-stale-resolution")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let resolutionFailure =
@@ -3373,16 +3434,17 @@ Vitest.describe (
                 let mutable outsideDirectory = ""
 
                 try
-                    let! (workspace, conflicts, summary) = createSingleFileConflict harness
+                    let! (workspace, summary) = createSingleFileConflict harness
                     let item = summary.Items[0]
 
                     let! resolutionStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-staleness-resolution-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-staleness-resolution-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolutionStatus = expectOperationValue "conflict staleness resolution status" resolutionStatusResult
                     let! resolutionResult =
-                        conflicts.Resolve
+                        workspace.Provider.ConflictResolution.Resolve workspace.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
@@ -3390,23 +3452,25 @@ Vitest.describe (
                                 Resolution = PickCandidate "workspace"
                             }
                             (context "conflict-staleness-workspace-resolution")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectOperationValue "conflict staleness workspace resolution" resolutionResult
 
                     let! finalizeStatusResult =
-                        workspace.Session.Core.GetStatus(context "conflict-staleness-finalize-status")
+                        workspace.Provider.GetStatus workspace.Repository (context "conflict-staleness-finalize-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectOperationValue "conflict staleness finalize status" finalizeStatusResult
-                    candidatePath <- join [| workspace.Binding.RepositoryRoot; "base.txt" |]
-                    outsideDirectory <- workspace.Binding.RepositoryRoot + "-outside"
+                    candidatePath <- join [| folderOf workspace; "base.txt" |]
+                    outsideDirectory <- folderOf workspace + "-outside"
                     let outsideFile = join [| outsideDirectory; "base.txt" |]
                     let tracker = beginUploadRequestTracking ()
 
                     try
                         armFinalizePathMutation
-                            workspace.Binding.RepositoryRoot
+                            (folderOf workspace)
                             (fun () -> promise {
                                 RuntimeNodeFileSystem.mkdirSync outsideDirectory (RuntimeNodeFileSystem.MkdirOptions(recursive = true))
                                 RuntimeNodeFileSystem.writeFileSync
@@ -3425,13 +3489,14 @@ Vitest.describe (
                             })
 
                         let! finalizeResult =
-                            conflicts.Finalize
+                            workspace.Provider.ConflictResolution.Finalize workspace.Repository
                                 {
                                     Handle = resolution.RefreshedHandle
                                     ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                     Message = Some "finalize symlink conflict"
                                 }
                                 (context "conflict-staleness-symlink-finalize")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let finalizeFailure =

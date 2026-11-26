@@ -39,6 +39,7 @@
     <Compile Include="TextDiff\GitTextDiffService.fs" />
     <Compile Include="GitHistory.fs" />
     <Compile Include="GitWorkspaceSession.fs" />
+    <Compile Include="GitProvider.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />

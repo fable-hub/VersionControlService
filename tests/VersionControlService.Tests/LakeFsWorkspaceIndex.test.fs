@@ -7,6 +7,7 @@ open VersionControlService.Tests.NodePath
 open Vitest
 
 module LakeFsWorkspaceIndex = VersionControlService.LakeFs.LakeFsWorkspaceIndex
+module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFsStateStore = VersionControlService.LakeFs.LakeFsStateStore
 module RuntimeNodePath = VersionControlService.Runtime.Node.Path
@@ -49,6 +50,8 @@ let private providerOptions
     : LakeFsProviderOptions.LakeFsProviderOptions = {
     StateRoot = stateRoot
     PathCaseSensitivity = pathCaseSensitivity
+    Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+    Credentials = LakeFsCredentials.unconfigured
 }
 
 let private sampleIndex: LakeFsWorkspaceIndex.WorkspaceIndex = {
@@ -248,7 +251,7 @@ Vitest.describe (
                     Vitest.expect(saved.Generation).toBe 1
 
                     let resolved =
-                        match LakeFsStateStore.resolve options workspaceRoot (Some allocated.StateId) with
+                        match LakeFsStateStore.resolve options workspaceRoot allocated.StateId with
                         | Ok value -> value
                         | Error failure -> failwith $"State resolution failed: {failure.Code}"
 
@@ -259,7 +262,7 @@ Vitest.describe (
                         fsPromisesDynamic?mkdir (otherWorkspaceRoot)
                         |> unbox<JS.Promise<obj>>
 
-                    match LakeFsStateStore.resolve options otherWorkspaceRoot (Some allocated.StateId) with
+                    match LakeFsStateStore.resolve options otherWorkspaceRoot allocated.StateId with
                     | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_mismatch"
                     | Ok _ -> failwith "Expected provider state to remain owned by its allocating workspace."
 
@@ -267,23 +270,21 @@ Vitest.describe (
                     | LakeFsWorkspaceIndex.Loaded loaded -> Vitest.expect(loaded.Generation).toBe 1
                     | _ -> failwith "Expected the externally stored index to load."
 
-                    match LakeFsStateStore.resolve options workspaceRoot None with
-                    | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_ref_missing"
-                    | Ok _ -> failwith "Expected an absent state reference to be rejected."
-
-                    match LakeFsStateStore.resolve options workspaceRoot (Some "../escaped") with
+                    match LakeFsStateStore.resolve options workspaceRoot "../escaped" with
                     | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_ref_invalid"
                     | Ok _ -> failwith "Expected an escaping state reference to be rejected."
 
                     do! removeDirectoryAsync allocated.StateDirectory
 
-                    match LakeFsStateStore.resolve options workspaceRoot (Some allocated.StateId) with
+                    match LakeFsStateStore.resolve options workspaceRoot allocated.StateId with
                     | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_missing"
                     | Ok _ -> failwith "Expected deleted external state to remain missing."
 
                     let unsafeOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = join [| workspaceRoot; "provider-state" |]
                         PathCaseSensitivity = CaseInsensitive
+                        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                        Credentials = LakeFsCredentials.unconfigured
                     }
 
                     match LakeFsStateStore.create unsafeOptions workspaceRoot with
@@ -300,6 +301,8 @@ Vitest.describe (
                     let linkedOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = linkedStateRoot
                         PathCaseSensitivity = CaseInsensitive
+                        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                        Credentials = LakeFsCredentials.unconfigured
                     }
 
                     match LakeFsStateStore.create linkedOptions workspaceRoot with
@@ -310,6 +313,8 @@ Vitest.describe (
                     let childLinkOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
                         StateRoot = childLinkStateRoot
                         PathCaseSensitivity = CaseInsensitive
+                        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                        Credentials = LakeFsCredentials.unconfigured
                     }
 
                     let childLinkState =
@@ -327,7 +332,7 @@ Vitest.describe (
                         LakeFsStateStore.resolve
                             childLinkOptions
                             workspaceRoot
-                            (Some childLinkState.StateId)
+                            childLinkState.StateId
                     with
                     | Error failure -> Vitest.expect(failure.Code).toBe "provider_state_link_not_supported"
                     | Ok _ -> failwith "Expected a linked provider state child directory to be rejected."

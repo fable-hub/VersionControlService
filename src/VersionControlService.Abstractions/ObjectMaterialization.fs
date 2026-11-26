@@ -10,8 +10,8 @@ type ObjectState = {
     ObjectId: string option
 }
 
-/// Stable codes of the failures and recoveries that object materialization returns. A provider that supplies
-/// `ObjectMaterializationService` uses them, and a consumer decides by the code because the messages can change.
+/// Stable codes of the failures and recoveries that object materialization returns. A provider that has the
+/// functions of `IObjectMaterialization` uses them, and a consumer decides by the code because the messages can change.
 module ObjectMaterializationCodes =
 
     /// A path has local changes that the call would overwrite, for example an edited file. A call returns it
@@ -36,7 +36,14 @@ module ObjectMaterializationCodes =
     [<Literal>]
     let RetryDematerializationRecovery = "retry_dematerialization"
 
-/// Optional object-materialization service. A provider supplies it when its workspace holds large or
+/// The object materialization functions of a provider, one entry for each.
+type ObjectMaterializationFunctions = {
+    ListObjects: Entry<Repository -> OperationContext -> Async<OperationResult<ObjectState[]>>>
+    Materialize: Entry<Repository -> RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>>
+    Dematerialize: Entry<Repository -> RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>>
+}
+
+/// Object materialization. A provider has these functions when its workspace holds large or
 /// lazily fetched objects as references that a call replaces with the object's content, or the reverse.
 /// ListObjects reports the state of those objects. Materialize and Dematerialize take an array of paths, so
 /// one call serves a single file and a whole folder, and a provider that handles many paths in one operation
@@ -55,12 +62,15 @@ module ObjectMaterializationCodes =
 /// `ObjectMaterializationCodes.BatchDematerializationIncomplete` for Dematerialize. A partial success carries
 /// the recovery `ObjectMaterializationCodes.RetryMaterializationRecovery` or
 /// `ObjectMaterializationCodes.RetryDematerializationRecovery`.
-type ObjectMaterializationService = {
-    ListObjects: OperationContext -> Async<OperationResult<ObjectState[]>>
+type IObjectMaterialization =
+    abstract ListObjects: repository: Repository -> context: OperationContext -> Async<CallResult<ObjectState[]>>
+
     /// Replaces the references of the given paths with their content.
-    Materialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
+    abstract Materialize:
+        repository: Repository -> paths: RepositoryPath[] -> context: OperationContext -> Async<CallResult<unit>>
+
     /// Replaces the content of the given paths with their references. For each path that changes, it also
     /// removes the provider-local copy of the object. A provider does this only after checking that its remote
     /// has the object, and it keeps the copy when the local storage is shared with other workspaces.
-    Dematerialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
-}
+    abstract Dematerialize:
+        repository: Repository -> paths: RepositoryPath[] -> context: OperationContext -> Async<CallResult<unit>>

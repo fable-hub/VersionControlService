@@ -30,13 +30,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "select the bracket file only"
-                                Paths = [| mkPath "a[1].txt" |]
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "literal-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "select the bracket file only"
+                                    Paths = [| mkPath "a[1].txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "literal-revision")
+                        )
                     )
 
                 let outcome = expectPerformed "literal selected revision" revisionResult
@@ -48,13 +51,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 // Wildcard characters are literal file names, never patterns.
                 let! wildcardResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "wildcard is not a pathspec"
-                                Paths = [| mkPath "*.txt" |]
-                                ExpectedRepositoryVersion = afterStatus.RepositoryVersion
-                            }
-                            (ctx "wildcard-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "wildcard is not a pathspec"
+                                    Paths = [| mkPath "*.txt" |]
+                                    ExpectedRepositoryVersion = afterStatus.RepositoryVersion
+                                }
+                                (ctx "wildcard-revision")
+                        )
                     )
 
                 expectFailure "wildcard selected revision" wildcardResult |> ignore
@@ -73,13 +79,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "missing path must fail"
-                                Paths = [| mkPath "missing.txt" |]
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "failed-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "missing path must fail"
+                                    Paths = [| mkPath "missing.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "failed-revision")
+                        )
                     )
 
                 let failure = expectFailure "selected revision with a missing path" revisionResult
@@ -103,12 +112,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! restoreResult =
                     run (
-                        workspace.Session.Core.RestorePaths
-                            {
-                                Paths = [| mkPath "base.txt" |]
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "restore")
+                        executed (
+                            workspace.Provider.RestorePaths
+                                workspace.Repository
+                                {
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "restore")
+                        )
                     )
 
                 expectValue "restore selected path" restoreResult |> ignore
@@ -130,13 +142,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "nothing changed"
-                                Paths = [| mkPath "base.txt" |]
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "unchanged-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "nothing changed"
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "unchanged-revision")
+                        )
                     )
 
                 expectUnchanged "unchanged selected revision" revisionResult |> ignore
@@ -154,14 +169,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! createOnlyResult =
                     run (
-                        workspace.Session.Core.CreateRef
-                            {
-                                Name = "feature-create-only"
-                                BaseRef = None
-                                SwitchTo = false
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "create-only")
+                        executed (
+                            workspace.Provider.CreateRef
+                                workspace.Repository
+                                {
+                                    Name = "feature-create-only"
+                                    BaseRef = None
+                                    SwitchTo = false
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "create-only")
+                        )
                     )
 
                 expectValue "create-only ref" createOnlyResult |> ignore
@@ -174,14 +192,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! createSwitchResult =
                     run (
-                        workspace.Session.Core.CreateRef
-                            {
-                                Name = "feature-create-switch"
-                                BaseRef = None
-                                SwitchTo = true
-                                ExpectedRepositoryVersion = afterCreateOnly.RepositoryVersion
-                            }
-                            (ctx "create-switch")
+                        executed (
+                            workspace.Provider.CreateRef
+                                workspace.Repository
+                                {
+                                    Name = "feature-create-switch"
+                                    BaseRef = None
+                                    SwitchTo = true
+                                    ExpectedRepositoryVersion = afterCreateOnly.RepositoryVersion
+                                }
+                                (ctx "create-switch")
+                        )
                     )
 
                 expectValue "create-and-switch ref" createSwitchResult |> ignore
@@ -192,7 +213,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     .expect(afterSwitch.CurrentRef |> Option.map _.Name)
                     .toEqual (Some "feature-create-switch")
 
-                let! refsResult = run (workspace.Session.Core.ListRefs(ctx "list-refs"))
+                let! refsResult = run (executed (workspace.Provider.ListRefs workspace.Repository (ctx "list-refs")))
                 let refs = expectValue "list refs" refsResult
                 let refNames = refs |> Array.map _.Name
 
@@ -214,12 +235,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! riskyPreflight =
                     run (
-                        workspace.Session.Core.PreflightSwitchRef
-                            {
-                                TargetRef = riskyRef
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "risky-preflight")
+                        executed (
+                            workspace.Provider.PreflightSwitchRef
+                                workspace.Repository
+                                {
+                                    TargetRef = riskyRef
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "risky-preflight")
+                        )
                     )
 
                 let risky = expectValue "risky preflight" riskyPreflight
@@ -228,12 +252,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! safePreflight =
                     run (
-                        workspace.Session.Core.PreflightSwitchRef
-                            {
-                                TargetRef = safeRef
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "safe-preflight")
+                        executed (
+                            workspace.Provider.PreflightSwitchRef
+                                workspace.Repository
+                                {
+                                    TargetRef = safeRef
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "safe-preflight")
+                        )
                     )
 
                 let safe = expectValue "safe preflight" safePreflight
@@ -261,13 +288,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! emptySelection =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "no paths"
-                                Paths = [||]
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "empty-selection")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "no paths"
+                                    Paths = [||]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "empty-selection")
+                        )
                     )
 
                 let emptyFailure = expectFailure "empty selection" emptySelection
@@ -280,12 +310,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! switchResult =
                     run (
-                        workspace.Session.Core.SwitchRef
-                            {
-                                TargetRef = bogusRef
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "bogus-switch")
+                        executed (
+                            workspace.Provider.SwitchRef
+                                workspace.Repository
+                                {
+                                    TargetRef = bogusRef
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "bogus-switch")
+                        )
                     )
 
                 let switchFailure = expectFailure "switch to a bogus ref" switchResult
@@ -296,13 +329,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! staleResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "stale token"
-                                Paths = [| mkPath "stale-probe.txt" |]
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "stale-mutation")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "stale token"
+                                    Paths = [| mkPath "stale-probe.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "stale-mutation")
+                        )
                     )
 
                 let staleFailure = expectFailure "stale mutation" staleResult
@@ -327,12 +363,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! switchResult =
                     run (
-                        workspace.Session.Core.SwitchRef
-                            {
-                                TargetRef = unicodeRef
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "unicode-switch")
+                        executed (
+                            workspace.Provider.SwitchRef
+                                workspace.Repository
+                                {
+                                    TargetRef = unicodeRef
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "unicode-switch")
+                        )
                     )
 
                 if workspace.LocalFileSystemAliasesNormalization then
@@ -363,12 +402,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! caseSwitch =
                     run (
-                        workspace.Session.Core.SwitchRef
-                            {
-                                TargetRef = caseRef
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "case-switch")
+                        executed (
+                            workspace.Provider.SwitchRef
+                                workspace.Repository
+                                {
+                                    TargetRef = caseRef
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "case-switch")
+                        )
                     )
 
                 if workspace.LocalFileSystemAliasesCase then
@@ -386,12 +428,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                     let! invalidSwitch =
                         run (
-                            workspace.Session.Core.SwitchRef
-                                {
-                                    TargetRef = invalidRef
-                                    ExpectedRepositoryVersion = freshStatus.RepositoryVersion
-                                }
-                                (ctx "invalid-switch")
+                            executed (
+                                workspace.Provider.SwitchRef
+                                    workspace.Repository
+                                    {
+                                        TargetRef = invalidRef
+                                        ExpectedRepositoryVersion = freshStatus.RepositoryVersion
+                                    }
+                                    (ctx "invalid-switch")
+                            )
                         )
 
                     let failure = carriedFailure "windows-invalid switch" invalidSwitch

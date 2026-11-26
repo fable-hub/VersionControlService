@@ -6,8 +6,10 @@ open Fable.Core.JsInterop
 open VersionControlService.Abstractions
 open VersionControlService.Tests.NodePath
 open Vitest
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitProvider = VersionControlService.Git.GitProvider
 module GitService = VersionControlService.Git.GitService
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -223,6 +225,37 @@ let private toFileRemoteUrl (path: string) =
 let private isConflictedChange (change: FileChange) =
     change.Kind = ConflictedChange
 
+/// A provider and the repository it opened.
+type private GitSession = {
+    Provider: IVersionControl
+    Repository: Repository
+}
+
+let private gitOptions (hooks: GitWorkspaceSession.GitSessionHooks) : VersionControlService.Git.GitProviderOptions = {
+    VersionControlService.Git.GitProviderOptions.defaults with
+        Hooks = hooks
+}
+
+/// Opens the existing folder with a provider built from the options.
+let private openSession
+    (options: VersionControlService.Git.GitProviderOptions)
+    (connectionProfileId: string option)
+    (workPath: string)
+    = promise {
+    let provider = GitProvider.create options
+
+    let! result =
+        Async.StartAsPromise(
+            provider.Open { RepositoryRoot = workPath; ConnectionProfileId = connectionProfileId } (ctx "sync-open")
+            |> executed
+        )
+
+    return {
+        Provider = provider
+        Repository = expectValue "open" result
+    }
+}
+
 /// Isolated workspace with a local bare origin: (workspaceRoot, barePath, session).
 let private createSyncFixture (hooks: GitWorkspaceSession.GitSessionHooks) = promise {
     let! root = createTempDirectoryAsync ()
@@ -240,49 +273,16 @@ let private createSyncFixture (hooks: GitWorkspaceSession.GitSessionHooks) = pro
     let! _ = runGitIn workPath [| "remote"; "add"; "origin"; barePath |]
     let! _ = runGitIn workPath [| "push"; "-u"; "origin"; "main" |]
 
-    let binding: WorkspaceBinding = {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = gitProviderId
-        RepositoryRoot = workPath
-        ProviderStateRef = None
-        Location = {
-            ProviderId = gitProviderId
-            DisplayName = None
-            ProviderLocation = barePath
-            ConnectionProfileId = None
-        }
-        ConnectionProfileId = None
-    }
-
-    let session = GitWorkspaceSession.createSession hooks binding
+    let! session = openSession (gitOptions hooks) None workPath
     return root, workPath, barePath, session
-}
-
-let private syncBinding (workPath: string) (barePath: string) : WorkspaceBinding = {
-    SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-    ProviderId = gitProviderId
-    RepositoryRoot = workPath
-    ProviderStateRef = None
-    Location = {
-        ProviderId = gitProviderId
-        DisplayName = None
-        ProviderLocation = barePath
-        ConnectionProfileId = None
-    }
-    ConnectionProfileId = None
 }
 
 let private identitySession
     (hooks: GitWorkspaceSession.GitSessionHooks)
     (identity: GitCredentialStrategy.GitIdentityStrategy)
     (workPath: string)
-    (barePath: string)
     =
-    GitWorkspaceSession.createSessionWithCredentialsAndIdentity
-        hooks
-        GitCredentialStrategy.anonymous
-        identity
-        (syncBinding workPath barePath)
+    openSession { gitOptions hooks with RevisionIdentity = identity } None workPath
 
 /// Commits target-side mutations through a scratch clone, like another client.
 let private advanceTarget (root: string) (barePath: string) (mutations: (string * string) list) = promise {
@@ -358,11 +358,6 @@ let private createRebaseConflictFixture () = promise {
         return root, workPath, barePath, session
 }
 
-let private syncService (session: WorkspaceSession) =
-    match session.Synchronization with
-    | Some service -> service
-    | None -> failwith "Expected the Git synchronization service."
-
 /// A process runner that fakes `git --version` and delegates everything else.
 let private versionFakingRunner (fakeVersion: string) : GitWorkspaceSession.GitSessionHooks = {
     RunBytesProcess = None
@@ -382,13 +377,8 @@ let private versionFakingRunner (fakeVersion: string) : GitWorkspaceSession.GitS
     Barrier = None
 }
 
-let private conflictService (session: WorkspaceSession) =
-    match session.ConflictResolution with
-    | Some service -> service
-    | None -> failwith "Expected the Git conflict-resolution service."
-
-let private sessionStatus (session: WorkspaceSession) = promise {
-    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "sync-status"))
+let private sessionStatus (session: GitSession) = promise {
+    let! result = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "sync-status") |> executed)
     return expectValue "status" result
 }
 
@@ -440,13 +430,14 @@ let private createLfsConflictFixtureWithOptions
             let! workspaceStatus = sessionStatus session
             let! saveResult =
                 Async.StartAsPromise(
-                    session.Core.CreateRevision
+                    session.Provider.CreateRevision session.Repository
                         {
                             Message = "local LFS binary conflict"
                             Paths = [| mkPath path |]
                             ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                         }
                         (ctx "lfs-binary-conflict-save")
+                    |> executed
                 )
 
             expectValue "local LFS binary conflict revision" saveResult |> ignore
@@ -464,9 +455,10 @@ let private createLfsConflictFixtureWithOptions
             let! updateStatus = sessionStatus session
             let! updateResult =
                 Async.StartAsPromise(
-                    (syncService session).Update
+                    session.Provider.Synchronization.Update session.Repository
                         { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                         (ctx "lfs-binary-conflict-update")
+                    |> executed
                 )
 
             match updateResult with
@@ -519,8 +511,8 @@ let private pickLfsConflictWithIndexError (createLock: bool) (operationName: str
     let! root, workPath, path, _, _, _, session = createLfsConflictFixtureWithOptions hooks "tracked.xlsx" None [||]
 
     try
-        let conflicts = conflictService session
-        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx $"{operationName}-session"))
+        let conflicts = session.Provider.ConflictResolution
+        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx $"{operationName}-session") |> executed)
 
         let summary =
             match expectValue "LFS conflict session" summaryResult with
@@ -531,7 +523,7 @@ let private pickLfsConflictWithIndexError (createLock: bool) (operationName: str
 
         let! resolveResult =
             Async.StartAsPromise(
-                conflicts.Resolve
+                conflicts.Resolve session.Repository
                     {
                         Handle = summary.Handle
                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -539,6 +531,7 @@ let private pickLfsConflictWithIndexError (createLock: bool) (operationName: str
                         Resolution = PickCandidate "workspace"
                     }
                     (ctx $"{operationName}-pick")
+                |> executed
             )
 
         let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
@@ -584,13 +577,14 @@ let private createModifyDeleteConflictFixture
             let! workspaceStatus = sessionStatus session
             let! saveResult =
                 Async.StartAsPromise(
-                    session.Core.CreateRevision
+                    session.Provider.CreateRevision session.Repository
                         {
                             Message = "local modify-delete change"
                             Paths = [| mkPath path |]
                             ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                         }
                         (ctx "modify-delete-save")
+                    |> executed
                 )
 
             expectValue "local modify-delete revision" saveResult |> ignore
@@ -613,9 +607,10 @@ let private createModifyDeleteConflictFixture
             let! updateStatus = sessionStatus session
             let! updateResult =
                 Async.StartAsPromise(
-                    (syncService session).Update
+                    session.Provider.Synchronization.Update session.Repository
                         { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                         (ctx "modify-delete-update")
+                    |> executed
                 )
 
             match updateResult with
@@ -641,13 +636,14 @@ let private createMergeHeadConflictFixture () = promise {
     let! saveStatus = sessionStatus session
 
     let! saveResult =
-        session.Core.CreateRevision
+        session.Provider.CreateRevision session.Repository
             {
                 Message = "local merge conflict"
                 Paths = [| mkPath "base.txt" |]
                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
             }
             (ctx "merge-head-conflict-save")
+        |> executed
         |> Async.StartAsPromise
 
     expectValue "merge-head conflict local revision" saveResult |> ignore
@@ -666,13 +662,14 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
 
     let! saveResult =
         Async.StartAsPromise(
-            session.Core.CreateRevision
+            session.Provider.CreateRevision session.Repository
                 {
                     Message = "local conflicting change"
                     Paths = [| mkPath "base.txt" |]
                     ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                 }
                 (ctx "preview-conflict-save")
+            |> executed
         )
 
     expectValue "local conflict revision" saveResult |> ignore
@@ -680,9 +677,10 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
 
     let! updateResult =
         Async.StartAsPromise(
-            (syncService session).Update
+            session.Provider.Synchronization.Update session.Repository
                 { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                 (ctx "preview-conflict-update")
+            |> executed
         )
 
     match updateResult with
@@ -693,8 +691,8 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
         failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
     | Succeeded _ -> failwith "Expected the update to create a real unmerged conflict."
 
-    let conflicts = conflictService session
-    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "preview-conflict-session"))
+    let conflicts = session.Provider.ConflictResolution
+    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "preview-conflict-session") |> executed)
 
     let summary =
         match expectValue "preview conflict session" summaryResult with
@@ -723,13 +721,14 @@ let private createPathUnmergedConflictFixtureWithHooks
 
     let! saveResult =
         Async.StartAsPromise(
-            session.Core.CreateRevision
+            session.Provider.CreateRevision session.Repository
                 {
                     Message = "local nested conflicting change"
                     Paths = [| mkPath conflictPath |]
                     ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                 }
                 (ctx "nested-conflict-save")
+            |> executed
         )
 
     expectValue "local nested conflict revision" saveResult |> ignore
@@ -737,9 +736,10 @@ let private createPathUnmergedConflictFixtureWithHooks
 
     let! updateResult =
         Async.StartAsPromise(
-            (syncService session).Update
+            session.Provider.Synchronization.Update session.Repository
                 { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                 (ctx "nested-conflict-update")
+            |> executed
         )
 
     match updateResult with
@@ -750,7 +750,7 @@ let private createPathUnmergedConflictFixtureWithHooks
         failwith $"Expected nested conflicts_detected, received {failure.Category}/{failure.Code}."
     | Succeeded _ -> failwith "Expected the nested update to create a real unmerged conflict."
 
-    return root, workPath, session, conflictService session, conflictPath
+    return root, workPath, session, session.Provider.ConflictResolution, conflictPath
 }
 
 let private createNestedUnmergedConflictFixture () =
@@ -811,7 +811,7 @@ Vitest.describe (
             "returns the current edited marker text as the combined preview",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let! root, workPath, _, conflicts, _, _ = createUnmergedConflictFixture ()
+                let! root, workPath, session, conflicts, _, _ = createUnmergedConflictFixture ()
 
                 try
                     let editedMarkerText =
@@ -819,7 +819,7 @@ Vitest.describe (
 
                     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) editedMarkerText
                     let! refreshedResult =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "edited-conflict-preview"))
+                        Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "edited-conflict-preview") |> executed)
 
                     let refreshed =
                         match expectValue "edited conflict preview" refreshedResult with
@@ -840,7 +840,7 @@ Vitest.describe (
             "rejects the captured handle and workspace token after an unstaged marker edit",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let! root, workPath, _, conflicts, capturedSummary, capturedWorkspaceVersion =
+                let! root, workPath, session, conflicts, capturedSummary, capturedWorkspaceVersion =
                     createUnmergedConflictFixture ()
 
                 try
@@ -851,7 +851,7 @@ Vitest.describe (
 
                     let! staleResolve =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = capturedSummary.Handle
                                     ExpectedRepositoryVersion = capturedWorkspaceVersion
@@ -859,6 +859,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "out-of-band-stale-resolve")
+                            |> executed
                         )
 
                     let failure =
@@ -883,7 +884,7 @@ Vitest.describe (
 )
 
 let private verifyPorcelainV2Status
-    (session: WorkspaceSession)
+    (session: GitSession)
     (repoPath: string)
     (statusCommands: ResizeArray<string[]>)
     (capturedStatus: string option ref)
@@ -927,7 +928,7 @@ let private verifyPorcelainV2Status
         statusCommands.Clear()
 
         let! invalidRefResult =
-            session.Core.CreateRef
+            session.Provider.CreateRef session.Repository
                 {
                     Name = "invalid..branch"
                     BaseRef = None
@@ -935,6 +936,7 @@ let private verifyPorcelainV2Status
                     ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                 }
                 (ctx $"{name}-version-check")
+            |> executed
             |> Async.StartAsPromise
 
         let versionCheckFailure = expectProviderFailure "workspace version comparison" invalidRefResult
@@ -1053,7 +1055,7 @@ Vitest.describe (
 
                     let unbornPath = join [| root; "unborn" |]
                     let! _ = runGitIn root [| "init"; "-b"; "unborn"; unbornPath |]
-                    let unbornSession = GitWorkspaceSession.createSession hooks (syncBinding unbornPath unbornPath)
+                    let! unbornSession = openSession (gitOptions hooks) None unbornPath
                     let! unborn =
                         verifyPorcelainV2Status unbornSession unbornPath statusCommands capturedStatus "unborn"
 
@@ -1096,12 +1098,13 @@ Vitest.describe (
                                         processContext)
                     }
 
-                    let session = GitWorkspaceSession.createSession hooks (syncBinding workPath barePath)
+                    let! session = openSession (gitOptions hooks) None workPath
                     let! status = sessionStatus session
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "revision-identity-unchanged-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -1132,7 +1135,7 @@ Vitest.describe (
                 }
 
                 let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
-                let session = identitySession GitWorkspaceSession.GitSessionHooks.none identity workPath barePath
+                let! session = identitySession GitWorkspaceSession.GitSessionHooks.none identity workPath
 
                 try
                     do! advanceTarget root barePath [ "target-only.txt", "target content\n" ]
@@ -1140,21 +1143,23 @@ Vitest.describe (
 
                     let! saveStatus = sessionStatus session
                     let! saveResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: local merge side"
                                 Paths = [| mkPath "workspace-only.txt" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "revision-identity-merge-local")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "local merge side" saveResult |> ignore
                     let! updateStatus = sessionStatus session
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (ctx "revision-identity-merge-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "revision identity merge update" updateResult |> ignore
@@ -1182,7 +1187,7 @@ Vitest.describe (
                 }
 
                 let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
-                let session = identitySession GitWorkspaceSession.GitSessionHooks.none identity workPath barePath
+                let! session = identitySession GitWorkspaceSession.GitSessionHooks.none identity workPath
 
                 try
                     do! advanceTarget root barePath [ "base.txt", "target version\n" ]
@@ -1190,21 +1195,23 @@ Vitest.describe (
 
                     let! saveStatus = sessionStatus session
                     let! saveResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: local conflicting change"
                                 Paths = [| mkPath "base.txt" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "revision-identity-finalize-local")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "local conflicting change" saveResult |> ignore
                     let! updateStatus = sessionStatus session
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (ctx "revision-identity-finalize-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -1215,8 +1222,8 @@ Vitest.describe (
                         failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
                     | Succeeded _ -> failwith "Expected a conflict session."
 
-                    let conflicts = conflictService session
-                    let! activeResult = conflicts.GetActiveSession(ctx "revision-identity-finalize-session") |> Async.StartAsPromise
+                    let conflicts = session.Provider.ConflictResolution
+                    let! activeResult = conflicts.GetActiveSession session.Repository (ctx "revision-identity-finalize-session") |> executed |> Async.StartAsPromise
                     let summary =
                         match expectValue "revision identity finalize session" activeResult with
                         | Some value -> value
@@ -1224,7 +1231,7 @@ Vitest.describe (
 
                     let! resolveStatus = sessionStatus session
                     let! resolveResult =
-                        conflicts.Resolve
+                        conflicts.Resolve session.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = resolveStatus.RepositoryVersion
@@ -1232,18 +1239,20 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (ctx "revision-identity-finalize-resolve")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "revision identity finalize resolution" resolveResult
                     let! finalizeStatus = sessionStatus session
                     let! finalizeResult =
-                        conflicts.Finalize
+                        conflicts.Finalize session.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "test: revision identity finalize"
                             }
                             (ctx "revision-identity-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "revision identity finalize" finalizeResult |> ignore
@@ -1296,32 +1305,19 @@ Vitest.describe (
                                 }
                     }
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = workPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = "https://origin.local.test/origin.git"
-                            ConnectionProfileId = Some "missing-target-profile"
-                        }
-                        ConnectionProfileId = Some "missing-target-profile"
-                    }
-
-                    let credentialSession =
-                        GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+                    let! credentialSession =
+                        openSession { gitOptions hooks with Credentials = strategy } (Some "missing-target-profile") workPath
 
                     observed.Clear()
 
                     let! publishResult =
-                        (syncService credentialSession).Publish
+                        credentialSession.Provider.Synchronization.Publish credentialSession.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-without-remote")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "publish without configured remote" publishResult
@@ -1375,13 +1371,14 @@ Vitest.describe (
                     let! beforeRevisionStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: publish to configured upstream"
                                 Paths = [| mkPath "upstream-target.txt" |]
                                 ExpectedRepositoryVersion = beforeRevisionStatus.RepositoryVersion
                             }
                             (ctx "publish-upstream-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "configured upstream revision" revisionResult |> ignore
@@ -1390,12 +1387,13 @@ Vitest.describe (
                     observed.Clear()
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-to-configured-upstream")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "publish to configured upstream" publishResult |> ignore
@@ -1463,12 +1461,13 @@ Vitest.describe (
                     observed.Clear()
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-deleted-upstream")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "publish with deleted upstream" publishResult
@@ -1584,32 +1583,21 @@ Vitest.describe (
                                 }
                     }
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = workPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = originUrl
-                            ConnectionProfileId = Some "publish-profile"
-                        }
-                        ConnectionProfileId = Some "publish-profile"
-                    }
+                    let! session =
+                        openSession { gitOptions hooks with Credentials = strategy } (Some "publish-profile") workPath
 
-                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
                     let! status = sessionStatus session
                     observed.Clear()
                     credentialCalls.Clear()
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-upstream-credentials")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "publish with upstream credentials" publishResult |> ignore
@@ -1706,22 +1694,12 @@ Vitest.describe (
                                 }
                     }
 
-                    let baseBinding = syncBinding workPath barePath
-
-                    let binding = {
-                        baseBinding with
-                            Location = {
-                                baseBinding.Location with
-                                    ProviderLocation = workPath
-                                    ConnectionProfileId = Some "fetch-profile"
-                            }
-                            ConnectionProfileId = Some "fetch-profile"
-                    }
-
-                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
+                    let! session =
+                        openSession { gitOptions hooks with Credentials = strategy } (Some "fetch-profile") workPath
 
                     let! refreshResult =
-                        (syncService session).Refresh(ctx "refresh-fetch-credentials")
+                        session.Provider.Synchronization.Refresh session.Repository (ctx "refresh-fetch-credentials")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "refresh fetch credentials" refreshResult |> ignore
@@ -1832,26 +1810,21 @@ Vitest.describe (
                                 }
                     }
 
-                    let baseBinding = syncBinding workPath barePath
+                    let! session =
+                        openSession { gitOptions hooks with Credentials = strategy } (Some "split-profile") workPath
 
-                    let binding = {
-                        baseBinding with
-                            Location = { baseBinding.Location with ConnectionProfileId = Some "split-profile" }
-                            ConnectionProfileId = Some "split-profile"
-                    }
-
-                    let session = GitWorkspaceSession.createSessionWithCredentials hooks strategy binding
                     do! writeUtf8FileAsync (join [| workPath; "split-publish.txt" |]) "split publish\n"
                     let! status = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: split publish URLs"
                                 Paths = [| mkPath "split-publish.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "split-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "split publish revision" revisionResult |> ignore
@@ -1860,12 +1833,13 @@ Vitest.describe (
                     credentialCalls.Clear()
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-split-urls")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "split URL publish" publishResult |> ignore
@@ -1956,14 +1930,15 @@ Vitest.describe (
                                 }
                     }
 
-                    let session =
-                        GitWorkspaceSession.createSessionWithCredentials
-                            GitWorkspaceSession.GitSessionHooks.none
-                            strategy
-                            (syncBinding workPath barePath)
+                    let! session =
+                        openSession
+                            { gitOptions GitWorkspaceSession.GitSessionHooks.none with Credentials = strategy }
+                            None
+                            workPath
 
                     let! refreshResult =
-                        (syncService session).Refresh(ctx "refresh-insteadof")
+                        session.Provider.Synchronization.Refresh session.Repository (ctx "refresh-insteadof")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match refreshResult with
@@ -2031,10 +2006,10 @@ Vitest.describe (
                 let targetPath = join [| root; "rewritten-clone" |]
 
                 try
-                    let factory = GitWorkspaceSession.createFactoryWithCredentials hooks strategy
+                    let provider = GitProvider.create { gitOptions hooks with Credentials = strategy }
 
                     let! cloneResult =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = {
                                     ProviderId = gitProviderId
@@ -2047,6 +2022,7 @@ Vitest.describe (
                                 MaterializeAllObjects = false
                             }
                             (ctx "clone-rewritten")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "clone rewritten location" cloneResult
@@ -2096,7 +2072,7 @@ Vitest.describe (
                 let! root, _, session = createRenameRenameConflictFixture ()
 
                 try
-                    let! status = Async.StartAsPromise(session.Core.GetStatus(ctx "status-rename-unmerged"))
+                    let! status = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "status-rename-unmerged") |> executed)
                     let workspace = expectSucceeded "status with missing unmerged worktree file" status
                     Vitest
                         .expect(workspace.Changes |> Array.exists (fun change ->
@@ -2118,7 +2094,7 @@ Vitest.describe (
 
                 try
                     let! beforeDeletionStatus =
-                        Async.StartAsPromise(session.Core.GetStatus(ctx "status-before-unmerged-deletion"))
+                        Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "status-before-unmerged-deletion") |> executed)
 
                     let beforeDeletion =
                         expectSucceeded "status before deleting unmerged worktree file" beforeDeletionStatus
@@ -2126,14 +2102,14 @@ Vitest.describe (
                     let conflictFile = join [| workPath; "base.txt" |]
                     do! removePathAsync conflictFile
 
-                    let! deletedStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "status-deleted-unmerged"))
+                    let! deletedStatus = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "status-deleted-unmerged") |> executed)
                     let deletedWorkspace = expectSucceeded "status with deleted unmerged worktree file" deletedStatus
                     Vitest.expect(deletedWorkspace.Changes |> Array.filter isConflictedChange |> Array.length > 0).toBe true
                     Vitest.expect(deletedWorkspace.RepositoryVersion).not.toBe (beforeDeletion.RepositoryVersion)
 
                     let! staleResolve =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = capturedSummary.Handle
                                     ExpectedRepositoryVersion = beforeDeletion.RepositoryVersion
@@ -2141,6 +2117,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "missing-unmerged-stale-resolve")
+                            |> executed
                         )
 
                     let failure =
@@ -2158,7 +2135,7 @@ Vitest.describe (
                     do! ensureDirectoryAsync conflictFile
 
                     let! directoryStatus =
-                        Async.StartAsPromise(session.Core.GetStatus(ctx "status-directory-replaced-unmerged"))
+                        Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "status-directory-replaced-unmerged") |> executed)
 
                     let directoryWorkspace =
                         expectSucceeded "status with directory-replaced unmerged worktree file" directoryStatus
@@ -2171,12 +2148,13 @@ Vitest.describe (
 
                     let! cancelResult =
                         Async.StartAsPromise(
-                            conflicts.Cancel
+                            conflicts.Cancel session.Repository
                                 {
                                     Handle = capturedSummary.Handle
                                     ExpectedRepositoryVersion = directoryWorkspace.RepositoryVersion
                                 }
                                 (ctx "directory-replaced-unmerged-cancel")
+                            |> executed
                         )
 
                     expectSucceeded "cancel after directory-replaced unmerged worktree file" cancelResult |> ignore
@@ -2207,11 +2185,11 @@ Vitest.describe (
                 try
                     let conflictFile = join [| workPath; "base.txt" |]
                     do! writeUtf8FileAsync conflictFile "AB"
-                    let! firstStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "collision-evidence-first"))
+                    let! firstStatus = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "collision-evidence-first") |> executed)
                     let firstVersion = (expectValue "first collision evidence" firstStatus).RepositoryVersion
 
                     do! writeUtf8FileAsync conflictFile "B!"
-                    let! secondStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "collision-evidence-second"))
+                    let! secondStatus = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "collision-evidence-second") |> executed)
                     let secondVersion = (expectValue "second collision evidence" secondStatus).RepositoryVersion
 
                     Vitest.expect(secondVersion).not.toBe (firstVersion)
@@ -2226,11 +2204,11 @@ Vitest.describe (
             "returns manual-resolution previews for invalid UTF-8 conflict content",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let! root, workPath, _, conflicts, _, _ = createUnmergedConflictFixture ()
+                let! root, workPath, session, conflicts, _, _ = createUnmergedConflictFixture ()
 
                 try
                     do! writeBinaryFileAsync (join [| workPath; "base.txt" |]) [| 255; 254; 253 |]
-                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-conflict-preview"))
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "binary-conflict-preview") |> executed)
 
                     let summary =
                         match expectValue "binary conflict preview" result with
@@ -2283,7 +2261,7 @@ Vitest.describe (
                 try
                     injectBinaryStages <- true
                     let! summaryResult =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-stage-conflict-preview"))
+                        Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "binary-stage-conflict-preview") |> executed)
 
                     let summary =
                         match expectValue "binary stage conflict preview" summaryResult with
@@ -2294,11 +2272,11 @@ Vitest.describe (
                     Vitest.expect(previews |> Array.forall (function UnsupportedPreview _ -> true | _ -> false)).toBe (true)
                     Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
 
-                    let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "binary-stage-status"))
+                    let! statusResult = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "binary-stage-status") |> executed)
                     let workspaceVersion = (expectValue "binary stage status" statusResult).RepositoryVersion
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = workspaceVersion
@@ -2306,6 +2284,7 @@ Vitest.describe (
                                     Resolution = SupplyResolvedContent "manual text resolution\n"
                                 }
                                 (ctx "binary-stage-resolve")
+                            |> executed
                         )
 
                     let failure = expectFailure "binary stage text resolution" resolveResult
@@ -2333,13 +2312,14 @@ Vitest.describe (
                     let! workspaceStatus = sessionStatus session
                     let! saveResult =
                         Async.StartAsPromise(
-                            session.Core.CreateRevision
+                            session.Provider.CreateRevision session.Repository
                                 {
                                     Message = "local binary conflict"
                                     Paths = [| mkPath "base.txt" |]
                                     ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                                 }
                                 (ctx "binary-conflict-save")
+                            |> executed
                         )
 
                     expectValue "local binary conflict revision" saveResult |> ignore
@@ -2348,9 +2328,10 @@ Vitest.describe (
                     let! updateStatus = sessionStatus session
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (ctx "binary-conflict-update")
+                            |> executed
                         )
 
                     match updateResult with
@@ -2361,8 +2342,8 @@ Vitest.describe (
                         failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
                     | Succeeded _ -> failwith "Expected the binary changes to conflict."
 
-                    let conflicts = conflictService session
-                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-conflict-session"))
+                    let conflicts = session.Provider.ConflictResolution
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "binary-conflict-session") |> executed)
                     let summary =
                         match expectValue "binary conflict session" summaryResult with
                         | Some value -> value
@@ -2373,7 +2354,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2381,6 +2362,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "binary-conflict-pick-target")
+                            |> executed
                         )
 
                     let resolution = expectValue "binary conflict target pick" resolveResult
@@ -2410,7 +2392,7 @@ Vitest.describe (
                     let! root, _, path, baseBytes, workspaceBytes, targetBytes, session = createLfsConflictFixture ()
 
                     try
-                        let! summaryResult = Async.StartAsPromise((conflictService session).GetActiveSession(ctx "lfs-object-summary"))
+                        let! summaryResult = Async.StartAsPromise(session.Provider.ConflictResolution.GetActiveSession session.Repository (ctx "lfs-object-summary") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2457,8 +2439,8 @@ Vitest.describe (
                     let! root, workPath, path, _, workspaceBytes, _, session = createLfsConflictFixture ()
 
                     try
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-workspace-pick-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-workspace-pick-session") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2467,7 +2449,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2475,6 +2457,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "workspace"
                                     }
                                     (ctx "lfs-workspace-pick")
+                                |> executed
                             )
 
                         let outcome = expectSucceededOutcome "LFS workspace pick" resolveResult
@@ -2511,8 +2494,8 @@ Vitest.describe (
                     let! root, workPath, path, _, _, _, session = createLfsConflictFixture ()
 
                     try
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-target-missing-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-target-missing-session") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2545,7 +2528,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2553,6 +2536,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "target"
                                     }
                                     (ctx "lfs-target-pick-missing-object")
+                                |> executed
                             )
 
                         let outcome = expectSucceededOutcome "LFS target pick without cached object" resolveResult
@@ -2587,8 +2571,8 @@ Vitest.describe (
                     try
                         let! mergeHead = runGitIn workPath [| "rev-parse"; "MERGE_HEAD" |]
                         let! _ = runGitIn workPath [| "lfs"; "fetch"; "origin"; mergeHead.Trim() |]
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-target-local-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-target-local-session") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2597,7 +2581,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2605,6 +2589,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "target"
                                     }
                                     (ctx "lfs-target-local-pick")
+                                |> executed
                             )
 
                         let outcome = expectSucceededOutcome "LFS target pick with local object" resolveResult
@@ -2639,8 +2624,8 @@ Vitest.describe (
                         let nestedPath = join [| workPath; "sub/tracked.xlsx" |]
                         let! nestedPointer = runGitIn workPath [| "lfs"; "pointer"; $"--file={nestedPath}" |]
                         do! writeUtf8FileAsync nestedPath nestedPointer
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-root-anchored-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-root-anchored-session") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2649,7 +2634,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2657,6 +2642,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "workspace"
                                     }
                                     (ctx "lfs-root-anchored-pick")
+                                |> executed
                             )
 
                         expectSucceededOutcome "root LFS pick" resolveResult |> ignore
@@ -2705,8 +2691,8 @@ Vitest.describe (
                         createLfsConflictFixtureWithOptions hooks "tracked.xlsx" None [||]
 
                     try
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-checkout-failure-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-checkout-failure-session") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2715,7 +2701,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2723,6 +2709,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "workspace"
                                     }
                                     (ctx "lfs-checkout-failure-pick")
+                                |> executed
                             )
 
                         match resolveResult with
@@ -2804,8 +2791,8 @@ Vitest.describe (
                     let! root, workPath, path, _, _, _, session = createLfsConflictFixture ()
 
                     try
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-supply-content-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-supply-content-session") |> executed)
                         let summary =
                             match expectValue "LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2816,7 +2803,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2824,6 +2811,7 @@ Vitest.describe (
                                         Resolution = SupplyResolvedContent "manual replacement"
                                     }
                                     (ctx "lfs-supply-content")
+                                |> executed
                             )
 
                         let failure = expectProviderFailure "supplied content for LFS conflict" resolveResult
@@ -2862,13 +2850,14 @@ Vitest.describe (
                         let! saveStatus = sessionStatus session
                         let! saveResult =
                             Async.StartAsPromise(
-                                session.Core.CreateRevision
+                                session.Provider.CreateRevision session.Repository
                                     {
                                         Message = "local plain file edit"
                                         Paths = [| mkPath path |]
                                         ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                                     }
                                     (ctx "mixed-lfs-save")
+                                |> executed
                             )
 
                         expectValue "local plain file revision" saveResult |> ignore
@@ -2887,9 +2876,10 @@ Vitest.describe (
                         let! updateStatus = sessionStatus session
                         let! updateResult =
                             Async.StartAsPromise(
-                                (syncService session).Update
+                                session.Provider.Synchronization.Update session.Repository
                                     { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                     (ctx "mixed-lfs-update")
+                                |> executed
                             )
 
                         match updateResult with
@@ -2900,7 +2890,7 @@ Vitest.describe (
                             failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
                         | Succeeded _ -> failwith "Expected the plain-to-LFS changes to conflict."
 
-                        let! summaryResult = Async.StartAsPromise((conflictService session).GetActiveSession(ctx "mixed-lfs-session"))
+                        let! summaryResult = Async.StartAsPromise(session.Provider.ConflictResolution.GetActiveSession session.Repository (ctx "mixed-lfs-session") |> executed)
                         let summary =
                             match expectValue "mixed LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2937,8 +2927,8 @@ Vitest.describe (
                             [||]
 
                     try
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-special-path-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-special-path-session") |> executed)
                         let summary =
                             match expectValue "special path LFS conflict session" summaryResult with
                             | Some value -> value
@@ -2947,7 +2937,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -2955,6 +2945,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "workspace"
                                     }
                                     (ctx "lfs-special-path-pick")
+                                |> executed
                             )
 
                         expectSucceededOutcome "special path LFS pick" resolveResult |> ignore
@@ -2987,8 +2978,8 @@ Vitest.describe (
                                 [||]
 
                         try
-                            let conflicts = conflictService session
-                            let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-custom-storage-session"))
+                            let conflicts = session.Provider.ConflictResolution
+                            let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-custom-storage-session") |> executed)
                             let summary =
                                 match expectValue "custom storage LFS conflict session" summaryResult with
                                 | Some value -> value
@@ -3006,7 +2997,7 @@ Vitest.describe (
                             let! status = sessionStatus session
                             let! resolveResult =
                                 Async.StartAsPromise(
-                                    conflicts.Resolve
+                                    conflicts.Resolve session.Repository
                                         {
                                             Handle = summary.Handle
                                             ExpectedRepositoryVersion = status.RepositoryVersion
@@ -3014,6 +3005,7 @@ Vitest.describe (
                                             Resolution = PickCandidate "workspace"
                                         }
                                         (ctx "lfs-custom-storage-pick")
+                                    |> executed
                                 )
 
                             let outcome = expectSucceededOutcome "custom storage LFS pick" resolveResult
@@ -3051,8 +3043,8 @@ Vitest.describe (
                             true
 
                     try
-                        let conflicts = conflictService session
-                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "lfs-delete-session"))
+                        let conflicts = session.Provider.ConflictResolution
+                        let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "lfs-delete-session") |> executed)
                         let summary =
                             match expectValue "LFS modify/delete conflict session" summaryResult with
                             | Some value -> value
@@ -3067,7 +3059,7 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! resolveResult =
                             Async.StartAsPromise(
-                                conflicts.Resolve
+                                conflicts.Resolve session.Repository
                                     {
                                         Handle = summary.Handle
                                         ExpectedRepositoryVersion = status.RepositoryVersion
@@ -3075,6 +3067,7 @@ Vitest.describe (
                                         Resolution = PickCandidate "target"
                                     }
                                     (ctx "lfs-delete-pick")
+                                |> executed
                             )
 
                         let outcome = expectSucceededOutcome "LFS deleted-side pick" resolveResult
@@ -3108,12 +3101,13 @@ Vitest.describe (
                         let! status = sessionStatus session
                         let! restoreResult =
                             Async.StartAsPromise(
-                                session.Core.RestorePaths
+                                session.Provider.RestorePaths session.Repository
                                     {
                                         Paths = [| mkPath path |]
                                         ExpectedRepositoryVersion = status.RepositoryVersion
                                     }
                                     (ctx "restore-conflicted-lfs-path")
+                                |> executed
                             )
 
                         let failure = expectProviderFailure "RestorePaths for an LFS conflict" restoreResult
@@ -3146,8 +3140,8 @@ Vitest.describe (
                         false
 
                 try
-                    let conflicts = conflictService session
-                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "binary-delete-session"))
+                    let conflicts = session.Provider.ConflictResolution
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "binary-delete-session") |> executed)
                     let summary =
                         match expectValue "binary modify/delete conflict session" summaryResult with
                         | Some value -> value
@@ -3156,7 +3150,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = status.RepositoryVersion
@@ -3164,6 +3158,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "binary-delete-pick")
+                            |> executed
                         )
 
                     let outcome = expectSucceededOutcome "binary deleted-side pick" resolveResult
@@ -3180,13 +3175,14 @@ Vitest.describe (
                     let! finalizeStatus = sessionStatus session
                     let! finalizeResult =
                         Async.StartAsPromise(
-                            conflicts.Finalize
+                            conflicts.Finalize session.Repository
                                 {
                                     Handle = outcome.Value.RefreshedHandle
                                     ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                     Message = Some "test: delete binary conflict path"
                                 }
                                 (ctx "binary-delete-finalize")
+                            |> executed
                         )
 
                     expectValue "binary deleted-side finalize" finalizeResult |> ignore
@@ -3214,8 +3210,8 @@ Vitest.describe (
                         false
 
                 try
-                    let conflicts = conflictService session
-                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "workspace-delete-session"))
+                    let conflicts = session.Provider.ConflictResolution
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "workspace-delete-session") |> executed)
                     let summary =
                         match expectValue "workspace deleted text conflict" summaryResult with
                         | Some value -> value
@@ -3228,7 +3224,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = status.RepositoryVersion
@@ -3236,6 +3232,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "workspace"
                                 }
                                 (ctx "workspace-delete-pick")
+                            |> executed
                         )
 
                     let outcome = expectSucceededOutcome "workspace deleted-side pick" resolveResult
@@ -3268,8 +3265,8 @@ Vitest.describe (
                         false
 
                 try
-                    let conflicts = conflictService session
-                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "absent-delete-session"))
+                    let conflicts = session.Provider.ConflictResolution
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "absent-delete-session") |> executed)
                     let summary =
                         match expectValue "already absent modify/delete conflict" summaryResult with
                         | Some value -> value
@@ -3281,7 +3278,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = status.RepositoryVersion
@@ -3289,6 +3286,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "already-absent-delete-pick")
+                            |> executed
                         )
 
                     let outcome = expectSucceededOutcome "already absent deleted-side pick" resolveResult
@@ -3316,13 +3314,14 @@ Vitest.describe (
                     let! workspaceStatus = sessionStatus session
                     let! saveResult =
                         Async.StartAsPromise(
-                            session.Core.CreateRevision
+                            session.Provider.CreateRevision session.Repository
                                 {
                                     Message = "local add-add conflict"
                                     Paths = [| mkPath addedPath |]
                                     ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                                 }
                                 (ctx "add-add-conflict-save")
+                            |> executed
                         )
 
                     expectValue "local add-add conflict revision" saveResult |> ignore
@@ -3331,9 +3330,10 @@ Vitest.describe (
                     let! updateStatus = sessionStatus session
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (ctx "add-add-conflict-update")
+                            |> executed
                         )
 
                     match updateResult with
@@ -3344,8 +3344,8 @@ Vitest.describe (
                         failwith $"Expected conflicts_detected, received {failure.Category}/{failure.Code}."
                     | Succeeded _ -> failwith "Expected the add/add changes to conflict."
 
-                    let conflicts = conflictService session
-                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "add-add-conflict-session"))
+                    let conflicts = session.Provider.ConflictResolution
+                    let! summaryResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "add-add-conflict-session") |> executed)
                     let summary =
                         match expectValue "add/add conflict session" summaryResult with
                         | Some value -> value
@@ -3356,7 +3356,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = status.RepositoryVersion
@@ -3364,6 +3364,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "base"
                                 }
                                 (ctx "add-add-conflict-pick-base")
+                            |> executed
                         )
 
                     let failure = expectFailure "add/add base candidate pick" resolveResult
@@ -3410,13 +3411,13 @@ Vitest.describe (
                             })
                 }
 
-                let! root, workPath, _, conflicts, _ =
+                let! root, workPath, session, conflicts, _ =
                     createPathUnmergedConflictFixtureWithHooks hooks "document.pdf"
 
                 try
                     inspectReads <- true
                     let! result =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "unsupported-extension-conflict"))
+                        Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "unsupported-extension-conflict") |> executed)
                     inspectReads <- false
 
                     let summary =
@@ -3476,12 +3477,12 @@ Vitest.describe (
                     Barrier = None
                 }
 
-                let! root, _, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+                let! root, _, session, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
 
                 try
                     inspectReads <- true
                     let! result =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "oversized-stage-conflict"))
+                        Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "oversized-stage-conflict") |> executed)
                     inspectReads <- false
 
                     let summary =
@@ -3529,12 +3530,12 @@ Vitest.describe (
                     Barrier = None
                 }
 
-                let! root, _, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+                let! root, _, session, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
 
                 try
                     inspectReads <- true
                     let! result =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "frozen-stage-conflict"))
+                        Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "frozen-stage-conflict") |> executed)
                     inspectReads <- false
 
                     match expectValue "frozen stage conflict preview" result with
@@ -3584,12 +3585,12 @@ Vitest.describe (
                     Barrier = None
                 }
 
-                let! root, _, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+                let! root, _, session, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
 
                 try
                     inspectReads <- true
                     let! result =
-                        Async.StartAsPromise(conflicts.GetActiveSession(ctx "immutable-stage-preview"))
+                        Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "immutable-stage-preview") |> executed)
                     inspectReads <- false
                     expectValue "immutable stage preview" result |> ignore
 
@@ -3624,13 +3625,13 @@ Vitest.describe (
                             })
                 }
 
-                let! root, workPath, _, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
+                let! root, workPath, session, conflicts, _, _ = createUnmergedConflictFixtureWithHooks hooks
 
                 try
                     let largeMarkerText = "z".PadRight(8 * 1024 * 1024, 'z')
                     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
                     countPreviewChunks <- true
-                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "bounded-conflict-preview"))
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "bounded-conflict-preview") |> executed)
                     countPreviewChunks <- false
 
                     let summary =
@@ -3675,7 +3676,7 @@ Vitest.describe (
 
                 try
                     armFailure <- true
-                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "failed-unmerged-probe"))
+                    let! result = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "failed-unmerged-probe") |> executed)
                     let failure = expectFailure "status with failed unmerged probe" result
                     Vitest.expect(failure.Category).toEqual (Network)
                     Vitest.expect(failure.Code).toBe ("unmerged_probe_failed")
@@ -3709,7 +3710,7 @@ Vitest.describe (
                     observedChunks <- 0
                     let largeMarkerText = "x".PadRight(8 * 1024 * 1024, 'x')
                     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
-                    let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "large-unmerged-status"))
+                    let! statusResult = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "large-unmerged-status") |> executed)
                     expectValue "large unmerged status" statusResult |> ignore
                     Vitest.expect(observedChunks).toBeGreaterThan (1)
                     do! removeDirectoryAsync root
@@ -3745,7 +3746,7 @@ Vitest.describe (
                     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) largeMarkerText
                     armed <- true
                     let context = OperationContext.create "cancel-conflict-chunks" source.Cancellation ignore
-                    let! result = Async.StartAsPromise(session.Core.GetStatus context)
+                    let! result = Async.StartAsPromise(session.Provider.GetStatus session.Repository context |> executed)
                     let failure = expectFailure "canceled conflict handle read" result
                     Vitest.expect(failure.Category).toEqual (Canceled)
                     Vitest.expect(failure.Code).toBe ("operation_canceled")
@@ -3812,7 +3813,7 @@ Vitest.describe (
                     let secretText = "outside hash race secret must not influence a token\n"
                     do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
                     armRace <- true
-                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "junction-hash-race"))
+                    let! result = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "junction-hash-race") |> executed)
                     let failure = expectFailure "status during a junction hash race" result
                     Vitest.expect(failure.Category).toEqual (Validation)
                     Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
@@ -3851,7 +3852,7 @@ Vitest.describe (
                             })
                 }
 
-                let! root, workPath, _, conflicts, conflictPath = createNestedUnmergedConflictFixtureWithHooks hooks
+                let! root, workPath, session, conflicts, conflictPath = createNestedUnmergedConflictFixtureWithHooks hooks
 
                 try
                     linkedDirectory <- join [| workPath; "nested" |]
@@ -3860,7 +3861,7 @@ Vitest.describe (
                     let secretText = "outside preview race secret must not be exposed\n"
                     do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
                     armRace <- true
-                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "junction-preview-race"))
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "junction-preview-race") |> executed)
                     let failure = expectFailure "preview during a junction race" result
                     Vitest.expect(failure.Category).toEqual (Validation)
                     Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
@@ -3886,7 +3887,7 @@ Vitest.describe (
                     do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
                     do! removePathAsync linkedDirectory
                     do! createDirectoryLinkAsync outsideDirectory linkedDirectory
-                    let! result = Async.StartAsPromise(session.Core.GetStatus(ctx "linked-conflict-status"))
+                    let! result = Async.StartAsPromise(session.Provider.GetStatus session.Repository (ctx "linked-conflict-status") |> executed)
                     let failure = expectFailure "status through a parent junction" result
                     Vitest.expect(failure.Category).toEqual (Validation)
                     Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
@@ -3903,7 +3904,7 @@ Vitest.describe (
             "rejects a parent junction before combined preview can expose outside bytes",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                let! root, workPath, _, conflicts, conflictPath = createNestedUnmergedConflictFixture ()
+                let! root, workPath, session, conflicts, conflictPath = createNestedUnmergedConflictFixture ()
 
                 try
                     let outsideDirectory = join [| root; "outside-preview" |]
@@ -3912,7 +3913,7 @@ Vitest.describe (
                     do! writeUtf8FileAsync (join [| outsideDirectory; "conflict.txt" |]) secretText
                     do! removePathAsync linkedDirectory
                     do! createDirectoryLinkAsync outsideDirectory linkedDirectory
-                    let! result = Async.StartAsPromise(conflicts.GetActiveSession(ctx "linked-conflict-preview"))
+                    let! result = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "linked-conflict-preview") |> executed)
                     let failure = expectFailure "preview through a parent junction" result
                     Vitest.expect(failure.Category).toEqual (Validation)
                     Vitest.expect(failure.Code).toBe ("unsafe_workspace_path")
@@ -3947,7 +3948,7 @@ Vitest.describe (
                     let! _ = runGitIn unrelatedPath [| "push"; "--force"; "origin"; "main" |]
 
                     let! previewResult =
-                        Async.StartAsPromise((syncService session).PreviewUpdate(ctx "preview-unrelated-histories"))
+                        Async.StartAsPromise(session.Provider.Synchronization.PreviewUpdate session.Repository (ctx "preview-unrelated-histories") |> executed)
 
                     match previewResult with
                     | Failed failure ->
@@ -4026,13 +4027,14 @@ Vitest.describe (
 
                     let! saveResult =
                         Async.StartAsPromise(
-                            session.Core.CreateRevision
+                            session.Provider.CreateRevision session.Repository
                                 {
                                     Message = "local conflicting change"
                                     Paths = [| mkPath "base.txt" |]
                                     ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                                 }
                                 (ctx "conflict-save")
+                            |> executed
                         )
 
                     expectValue "local revision" saveResult |> ignore
@@ -4041,9 +4043,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (ctx "conflict-update")
+                            |> executed
                         )
 
                     let updateFailure =
@@ -4054,8 +4057,8 @@ Vitest.describe (
 
                     Vitest.expect(updateFailure.Code).toBe ("conflicts_detected")
 
-                    let conflicts = conflictService session
-                    let! sessionResult = Async.StartAsPromise(conflicts.GetActiveSession(ctx "conflict-session"))
+                    let conflicts = session.Provider.ConflictResolution
+                    let! sessionResult = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "conflict-session") |> executed)
 
                     let summary =
                         match expectValue "active session" sessionResult with
@@ -4074,7 +4077,7 @@ Vitest.describe (
 
                     let! staleResolve =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = "not-the-current-token"
@@ -4082,6 +4085,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "stale-resolve")
+                            |> executed
                         )
 
                     let staleFailure =
@@ -4104,7 +4108,7 @@ Vitest.describe (
 
                     let! resolveResult =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = resolveStatus.RepositoryVersion
@@ -4112,6 +4116,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "target"
                                 }
                                 (ctx "live-resolve")
+                            |> executed
                         )
 
                     let resolution = expectValue "live resolve" resolveResult
@@ -4122,7 +4127,7 @@ Vitest.describe (
 
                     let! replayResolve =
                         Async.StartAsPromise(
-                            conflicts.Resolve
+                            conflicts.Resolve session.Repository
                                 {
                                     Handle = summary.Handle
                                     ExpectedRepositoryVersion = replayStatus.RepositoryVersion
@@ -4130,6 +4135,7 @@ Vitest.describe (
                                     Resolution = PickCandidate "workspace"
                                 }
                                 (ctx "replay-resolve")
+                            |> executed
                         )
 
                     match replayResolve with
@@ -4143,13 +4149,14 @@ Vitest.describe (
 
                     let! racedFinalize =
                         Async.StartAsPromise(
-                            conflicts.Finalize
+                            conflicts.Finalize session.Repository
                                 {
                                     Handle = resolution.RefreshedHandle
                                     ExpectedRepositoryVersion = raceStatus.RepositoryVersion
                                     Message = Some "finalize during race"
                                 }
                                 (ctx "raced-finalize")
+                            |> executed
                         )
 
                     let raceFailure =
@@ -4162,7 +4169,7 @@ Vitest.describe (
                     Vitest.expect(raceFailure.RevisionEvidence.Length >= 2).toBe (true)
 
                     // Refresh supplies the live handle; the deliberate retry succeeds.
-                    let! refreshedSession = Async.StartAsPromise(conflicts.GetActiveSession(ctx "refresh-session"))
+                    let! refreshedSession = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "refresh-session") |> executed)
 
                     let liveSummary =
                         match expectValue "refreshed session" refreshedSession with
@@ -4173,13 +4180,14 @@ Vitest.describe (
 
                     let! retryFinalize =
                         Async.StartAsPromise(
-                            conflicts.Finalize
+                            conflicts.Finalize session.Repository
                                 {
                                     Handle = liveSummary.Handle
                                     ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                     Message = None
                                 }
                                 (ctx "retry-finalize")
+                            |> executed
                         )
 
                     let mergedRevision = expectValue "verified finalize" retryFinalize
@@ -4188,20 +4196,21 @@ Vitest.describe (
                     Vitest.expect(commitSubject.Trim()).toBe "Merge online changes"
 
                     // The session is closed: replaying finalize is rejected without mutation.
-                    let! closedSession = Async.StartAsPromise(conflicts.GetActiveSession(ctx "closed-session"))
+                    let! closedSession = Async.StartAsPromise(conflicts.GetActiveSession session.Repository (ctx "closed-session") |> executed)
                     Vitest.expect((expectValue "closed session" closedSession).IsNone).toBe (true)
 
                     let! finalStatus = sessionStatus session
 
                     let! replayFinalize =
                         Async.StartAsPromise(
-                            conflicts.Finalize
+                            conflicts.Finalize session.Repository
                                 {
                                     Handle = liveSummary.Handle
                                     ExpectedRepositoryVersion = finalStatus.RepositoryVersion
                                     Message = None
                                 }
                                 (ctx "replay-finalize")
+                            |> executed
                         )
 
                     match replayFinalize with
@@ -4252,7 +4261,7 @@ Vitest.describe (
                     cancelUpdateRef <- true
                     let! status = sessionStatus session
                     let! resolveResult =
-                        conflicts.Resolve
+                        conflicts.Resolve session.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = status.RepositoryVersion
@@ -4260,18 +4269,20 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (ctx "late-finalize-cancel-resolve")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let resolution = expectValue "late finalize cancellation resolve" resolveResult
                     let! finalizeStatus = sessionStatus session
                     let! finalizeResult =
-                        conflicts.Finalize
+                        conflicts.Finalize session.Repository
                             {
                                 Handle = resolution.RefreshedHandle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "late finalize cancellation"
                             }
                             (ctx "late-finalize-cancel")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let mergedRevision = expectValue "late finalize cancellation" finalizeResult
@@ -4284,7 +4295,7 @@ Vitest.describe (
                     Vitest.expect(parents.Trim().Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries).Length).toBe (3)
                     Vitest.expect(mergeHead).toEqual (None)
 
-                    let! activeResult = conflicts.GetActiveSession(ctx "late-finalize-cancel-closed") |> Async.StartAsPromise
+                    let! activeResult = conflicts.GetActiveSession session.Repository (ctx "late-finalize-cancel-closed") |> executed |> Async.StartAsPromise
                     Vitest.expect((expectValue "late finalize cancellation session" activeResult).IsNone).toBe (true)
 
                     do! removeDirectoryAsync root
@@ -4331,13 +4342,14 @@ Vitest.describe (
                     let! _ = runGitIn workPath [| "update-ref"; "refs/heads/main"; handCommitted.Trim(); headBefore.Trim() |]
                     let! finalizeStatus = sessionStatus session
                     let! finalizeResult =
-                        conflicts.Finalize
+                        conflicts.Finalize session.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "cleanup committed merge"
                             }
                             (ctx "already-committed-finalize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let finalized = expectValue "already committed finalize" finalizeResult
@@ -4350,7 +4362,7 @@ Vitest.describe (
                     Vitest.expect(Int32.Parse(mergeCountAfter.Trim())).toBe (Int32.Parse(mergeCountBefore.Trim()) + 1)
                     Vitest.expect(mergeHeadAfter).toEqual (None)
 
-                    let! activeResult = conflicts.GetActiveSession(ctx "already-committed-closed") |> Async.StartAsPromise
+                    let! activeResult = conflicts.GetActiveSession session.Repository (ctx "already-committed-closed") |> executed |> Async.StartAsPromise
                     Vitest.expect((expectValue "already committed session" activeResult).IsNone).toBe (true)
 
                     do! removeDirectoryAsync root
@@ -4393,12 +4405,13 @@ Vitest.describe (
                     cancelAbort <- true
                     let! status = sessionStatus session
                     let! cancelResult =
-                        conflicts.Cancel
+                        conflicts.Cancel session.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "late-cancel-abort")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "late cancel abort" cancelResult |> ignore
@@ -4406,7 +4419,7 @@ Vitest.describe (
                     let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
                     Vitest.expect(mergeHead).toEqual (None)
 
-                    let! activeResult = conflicts.GetActiveSession(ctx "late-cancel-abort-closed") |> Async.StartAsPromise
+                    let! activeResult = conflicts.GetActiveSession session.Repository (ctx "late-cancel-abort-closed") |> executed |> Async.StartAsPromise
                     Vitest.expect((expectValue "late cancel abort session" activeResult).IsNone).toBe (true)
 
                     do! removeDirectoryAsync root
@@ -4446,7 +4459,7 @@ Vitest.describe (
                     failAdd <- true
                     let! status = sessionStatus session
                     let! resolveResult =
-                        conflicts.Resolve
+                        conflicts.Resolve session.Repository
                             {
                                 Handle = summary.Handle
                                 ExpectedRepositoryVersion = status.RepositoryVersion
@@ -4454,6 +4467,7 @@ Vitest.describe (
                                 Resolution = PickCandidate "target"
                             }
                             (ctx "resolve-stage-failure")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "resolve stage failure" resolveResult
@@ -4533,9 +4547,10 @@ Vitest.describe (
                     let! beforeUpdate = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (ctx "foreign-merge-recovery")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "foreign merge recovery" updateResult
@@ -4582,8 +4597,8 @@ Vitest.describe (
                         Resolution = PickCandidate "target"
                     }
 
-                    let first = conflicts.Resolve request (ctx "concurrent-resolve-one") |> Async.StartAsPromise
-                    let second = conflicts.Resolve request (ctx "concurrent-resolve-two") |> Async.StartAsPromise
+                    let first = conflicts.Resolve session.Repository request (ctx "concurrent-resolve-one") |> executed |> Async.StartAsPromise
+                    let second = conflicts.Resolve session.Repository request (ctx "concurrent-resolve-two") |> executed |> Async.StartAsPromise
                     let! firstResult = first
                     let! secondResult = second
                     let results = [| firstResult; secondResult |]
@@ -4649,7 +4664,7 @@ Vitest.describe (
 
                     // Refresh.
                     do! advanceTarget root barePath [ "refresh-cancel.txt", "content\n" ]
-                    let! refreshResult = Async.StartAsPromise((syncService session).Refresh(cancelableContext "c-refresh"))
+                    let! refreshResult = Async.StartAsPromise(session.Provider.Synchronization.Refresh session.Repository (cancelableContext "c-refresh") |> executed)
                     expectCanceled "canceled refresh" refreshResult
 
                     // Update: the target change never reaches the workspace.
@@ -4657,9 +4672,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (cancelableContext "c-update")
+                            |> executed
                         )
 
                     expectCanceled "canceled update" updateResult
@@ -4672,13 +4688,14 @@ Vitest.describe (
 
                     let! saveResult =
                         Async.StartAsPromise(
-                            session.Core.CreateRevision
+                            session.Provider.CreateRevision session.Repository
                                 {
                                     Message = "revision awaiting canceled publish"
                                     Paths = [| mkPath "publish-cancel.txt" |]
                                     ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                                 }
                                 (ctx "c-save")
+                            |> executed
                         )
 
                     expectValue "revision before canceled publish" saveResult |> ignore
@@ -4688,12 +4705,13 @@ Vitest.describe (
 
                     let! publishResult =
                         Async.StartAsPromise(
-                            (syncService session).Publish
+                            session.Provider.Synchronization.Publish session.Repository
                                 {
                                     ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (cancelableContext "c-publish")
+                            |> executed
                         )
 
                     expectCanceled "canceled publish" publishResult
@@ -4704,11 +4722,11 @@ Vitest.describe (
                     let cloneSource = OperationCancellation.Source()
                     cloneSource.Cancel()
                     let clonePath = join [| root; "canceled-clone" |]
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create (gitOptions hooks)
 
                     let! cloneResult =
                         Async.StartAsPromise(
-                            factory.Clone
+                            provider.Clone
                                 {
                                     Location = {
                                         ProviderId = gitProviderId
@@ -4721,6 +4739,7 @@ Vitest.describe (
                                     MaterializeAllObjects = false
                                 }
                                 (OperationContext.create "c-clone" cloneSource.Cancellation ignore)
+                            |> executed
                         )
 
                     expectCanceled "canceled clone" cloneResult
@@ -4734,9 +4753,10 @@ Vitest.describe (
 
                     let! retryUpdate =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = retryUpdateStatus.RepositoryVersion }
                                 (ctx "retry-update")
+                            |> executed
                         )
 
                     expectValue "update after cancellations" retryUpdate |> ignore
@@ -4745,12 +4765,13 @@ Vitest.describe (
 
                     let! retryPublish =
                         Async.StartAsPromise(
-                            (syncService session).Publish
+                            session.Provider.Synchronization.Publish session.Repository
                                 {
                                     ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (ctx "retry-publish")
+                            |> executed
                         )
 
                     expectValue "publish after cancellations" retryPublish |> ignore
@@ -4795,11 +4816,11 @@ Vitest.describe (
                 let targetPath = join [| root; "partial-clone" |]
 
                 try
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create (gitOptions hooks)
 
                     let! cloneResult =
                         Async.StartAsPromise(
-                            factory.Clone
+                            provider.Clone
                                 {
                                     Location = {
                                         ProviderId = gitProviderId
@@ -4812,6 +4833,7 @@ Vitest.describe (
                                     MaterializeAllObjects = false
                                 }
                                 (ctx "clone-residue")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled clone residue" cloneResult
@@ -4863,11 +4885,11 @@ Vitest.describe (
 
                 try
                     do! ensureDirectoryAsync targetPath
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create (gitOptions hooks)
 
                     let! cloneResult =
                         Async.StartAsPromise(
-                            factory.Clone
+                            provider.Clone
                                 {
                                     Location = {
                                         ProviderId = gitProviderId
@@ -4880,6 +4902,7 @@ Vitest.describe (
                                     MaterializeAllObjects = false
                                 }
                                 (ctx "failed-clone-residue")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "failed clone residue" cloneResult
@@ -4950,9 +4973,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-update-lock")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled update with lock" updateResult
@@ -5034,9 +5058,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-update-merge")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled update merge residue" updateResult
@@ -5103,9 +5128,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-ff-merge")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled fast-forward" updateResult
@@ -5171,9 +5197,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-ff-tracked")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled tracked fast-forward" updateResult
@@ -5234,9 +5261,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "late-cancel-merge")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "late canceled merge" updateResult
@@ -5301,9 +5329,10 @@ Vitest.describe (
                     let! beforeUpdate = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (ctx "post-merge-inspection-failure")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "post-merge inspection failure" updateResult
@@ -5356,9 +5385,10 @@ Vitest.describe (
                     let! beforeUpdate = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (ctx "post-merge-inspection-timeout")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "post-merge inspection timeout" updateResult
@@ -5406,9 +5436,10 @@ Vitest.describe (
                     let updateContext = OperationContext.create "late-successful-merge" cancellation.Cancellation ignore
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             updateContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -5460,22 +5491,24 @@ Vitest.describe (
                     let! saveStatus = sessionStatus session
 
                     let! saveResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "local conflicting change after cancellation"
                                 Paths = [| mkPath "base.txt" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "conflict-after-cancellation-save")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "conflict after cancellation local revision" saveResult |> ignore
                     let! updateStatus = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (OperationContext.create "conflict-after-cancellation-update" cancellation.Cancellation ignore)
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome, failure =
@@ -5492,9 +5525,10 @@ Vitest.describe (
                     let! mergeHead = tryReadUtf8FileAsync (join [| workPath; mergeHeadPath.Trim() |])
                     Vitest.expect(mergeHead.IsSome).toBe (true)
 
-                    let conflicts = conflictService session
+                    let conflicts = session.Provider.ConflictResolution
                     let! activeResult =
-                        conflicts.GetActiveSession(OperationContext.detached "conflict-after-cancellation-session")
+                        conflicts.GetActiveSession session.Repository (OperationContext.detached "conflict-after-cancellation-session")
+                        |> executed
                         |> Async.StartAsPromise
                     let active = expectValue "conflict after cancellation session" activeResult
                     Vitest.expect(active.IsSome).toBe (true)
@@ -5534,7 +5568,8 @@ Vitest.describe (
                     let refreshContext = OperationContext.create "refresh-after-fetch" cancellation.Cancellation ignore
 
                     let! refreshResult =
-                        (syncService session).Refresh refreshContext
+                        session.Provider.Synchronization.Refresh session.Repository refreshContext
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "canceled refresh" refreshResult
@@ -5591,9 +5626,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-ff-staged")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled staged fast-forward" updateResult
@@ -5663,9 +5699,10 @@ Vitest.describe (
 
                     let! updateResult =
                         Async.StartAsPromise(
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-protected")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "canceled protected merge" updateResult
@@ -5708,7 +5745,7 @@ Vitest.describe (
 
                     do! writeUtf8FileAsync (join [| workPath; "base.txt" |]) "local dirty change\n"
 
-                    let! previewResult = Async.StartAsPromise((syncService session).PreviewUpdate(ctx "sync-preview"))
+                    let! previewResult = Async.StartAsPromise(session.Provider.Synchronization.PreviewUpdate session.Repository (ctx "sync-preview") |> executed)
                     let preview = expectValue "preview update" previewResult
 
                     let changed =
@@ -5729,8 +5766,8 @@ Vitest.describe (
 
                     // Dependency diagnostics reject Git 2.41: Git LFS 3.7 checks out files from
                     // the index only with Git 2.42 or newer.
-                    let oldFactory = GitWorkspaceSession.createFactory (versionFakingRunner "2.41.0")
-                    let! oldResult = Async.StartAsPromise(oldFactory.CheckDependencies(ctx "deps-241"))
+                    let oldProvider = GitProvider.create (gitOptions (versionFakingRunner "2.41.0"))
+                    let! oldResult = Async.StartAsPromise(oldProvider.CheckDependencies(ctx "deps-241") |> executed)
                     let oldDependencies = expectValue "dependencies for 2.41" oldResult
                     let oldGit = oldDependencies |> Array.find (fun entry -> entry.Component = "git")
 
@@ -5738,8 +5775,8 @@ Vitest.describe (
                     Vitest.expect(oldGit.Compatible).toBe (false)
                     Vitest.expect(oldGit.Remediation.IsSome).toBe (true)
 
-                    let newFactory = GitWorkspaceSession.createFactory (versionFakingRunner "2.42.0")
-                    let! newResult = Async.StartAsPromise(newFactory.CheckDependencies(ctx "deps-242"))
+                    let newProvider = GitProvider.create (gitOptions (versionFakingRunner "2.42.0"))
+                    let! newResult = Async.StartAsPromise(newProvider.CheckDependencies(ctx "deps-242") |> executed)
                     let newDependencies = expectValue "dependencies for 2.42" newResult
                     let newGit = newDependencies |> Array.find (fun entry -> entry.Component = "git")
 
@@ -5765,13 +5802,14 @@ Vitest.describe (
 
                     let! revisionResult =
                         Async.StartAsPromise(
-                            session.Core.CreateRevision
+                            session.Provider.CreateRevision session.Repository
                                 {
                                     Message = "save local conflict"
                                     Paths = [| mkPath "base.txt" |]
                                     ExpectedRepositoryVersion = beforeRevision.RepositoryVersion
                                 }
                                 (ctx "preview-local-conflict")
+                            |> executed
                         )
 
                     expectValue "create local conflicting revision" revisionResult |> ignore
@@ -5783,7 +5821,7 @@ Vitest.describe (
                         ]
 
                     let! previewResult =
-                        Async.StartAsPromise((syncService session).PreviewUpdate(ctx "preview-committed-conflict"))
+                        Async.StartAsPromise(session.Provider.Synchronization.PreviewUpdate session.Repository (ctx "preview-committed-conflict") |> executed)
 
                     let preview = expectValue "preview committed conflict" previewResult
                     let overlapping = preview.OverlappingPaths |> Array.map RepositoryPath.value
@@ -5875,7 +5913,8 @@ let private createUnhydratedLfsCloneOf
     | _ -> failwith "fixture clone without large objects failed"
 
     let! _ = runGitIn workPath [| "lfs"; "install"; "--local" |]
-    return root, workPath, GitWorkspaceSession.createSession hooks (syncBinding workPath barePath)
+    let! session = openSession (gitOptions hooks) None workPath
+    return root, workPath, session
 }
 
 /// An origin with one LFS file and a work clone that holds only its pointer.
@@ -5892,11 +5931,11 @@ let private setMaterializeLargeObjects (workPath: string) (enabled: bool) =
             (if enabled then "true" else "false")
         |]
 
-let private synchronizeWithoutPublishIn (session: WorkspaceSession) (context: OperationContext) = promise {
+let private synchronizeWithoutPublishIn (session: GitSession) (context: OperationContext) = promise {
     let! status = sessionStatus session
 
     return!
-        (syncService session).Synchronize
+        session.Provider.Synchronization.Synchronize session.Repository
             {
                 ExpectedRepositoryVersion = status.RepositoryVersion
                 ExpectedTargetRevision = None
@@ -5904,10 +5943,11 @@ let private synchronizeWithoutPublishIn (session: WorkspaceSession) (context: Op
                 PublishLocalRevisions = false
             }
             context
+        |> executed
         |> Async.StartAsPromise
 }
 
-let private synchronizeWithoutPublish (session: WorkspaceSession) (name: string) =
+let private synchronizeWithoutPublish (session: GitSession) (name: string) =
     synchronizeWithoutPublishIn session (ctx name)
 
 Vitest.describe (
@@ -6053,7 +6093,8 @@ Vitest.describe (
                                 source.Cancel())
 
                     let! updateResult =
-                        (syncService session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context
+                        session.Provider.Synchronization.Update session.Repository { ExpectedRepositoryVersion = status.RepositoryVersion } context
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6068,12 +6109,11 @@ Vitest.describe (
                     let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
                     Vitest.expect(lockExists).toBe false
 
-                    let materialization =
-                        session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                    let materialization = session.Provider.ObjectMaterialization
 
                     let! materializeResult =
-                        materialization.Materialize [| mkPath "large.bin" |] (ctx "lfs-materialize-after-cancel")
+                        materialization.Materialize session.Repository [| mkPath "large.bin" |] (ctx "lfs-materialize-after-cancel")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "materialize after the canceled download" materializeResult |> ignore
@@ -6118,7 +6158,8 @@ Vitest.describe (
                         OperationContext.create "lfs-cancel-during-checkout" source.Cancellation ignore
 
                     let! updateResult =
-                        (syncService session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context
+                        session.Provider.Synchronization.Update session.Repository { ExpectedRepositoryVersion = status.RepositoryVersion } context
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome = expectSucceededOutcome "update that is canceled during the checkout" updateResult
@@ -6176,9 +6217,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-update-with-lock")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6246,9 +6288,10 @@ Vitest.describe (
                         let! status = sessionStatus session
 
                         let! updateResult =
-                            (syncService session).Update
+                            session.Provider.Synchronization.Update session.Repository
                                 { ExpectedRepositoryVersion = status.RepositoryVersion }
                                 (ctx $"lfs-checkout-with-lock-{attempt}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         match updateResult with
@@ -6304,9 +6347,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-checkout-index-error-exit-0")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6366,9 +6410,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-failed-fetch-failed-checkout")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6454,9 +6499,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-up-to-date-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6517,9 +6563,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-update-hydration")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6612,10 +6659,10 @@ Vitest.describe (
                 }
 
                 try
-                    let factory = GitWorkspaceSession.createFactoryWithCredentials hooks credentials
+                    let provider = GitProvider.create { gitOptions hooks with Credentials = credentials }
 
                     let! cloneResult =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = {
                                     ProviderId = gitProviderId
@@ -6628,6 +6675,7 @@ Vitest.describe (
                                 MaterializeAllObjects = true
                             }
                             (ctx "lfs-clone-hydration")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match cloneResult with
@@ -6711,11 +6759,11 @@ Vitest.describe (
             fun () -> promise {
                 let! root = createLfsOrigin [ "a.bin", "payload one\n"; "b.bin", "payload two\n" ] [ "b.bin" ]
                 let clonePath = join [| root; "hydrated-clone" |]
-                let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                let provider = GitProvider.create (gitOptions GitWorkspaceSession.GitSessionHooks.none)
 
                 try
                     let! cloneResult =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = {
                                     ProviderId = gitProviderId
@@ -6728,6 +6776,7 @@ Vitest.describe (
                                 MaterializeAllObjects = true
                             }
                             (ctx "lfs-clone-lost-object")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match cloneResult with
@@ -6837,10 +6886,10 @@ Vitest.describe (
                 let clonePath = join [| root; "canceled-clone" |]
 
                 try
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create (gitOptions hooks)
 
                     let! cloneResult =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = {
                                     ProviderId = gitProviderId
@@ -6853,6 +6902,7 @@ Vitest.describe (
                                 MaterializeAllObjects = true
                             }
                             (OperationContext.create "lfs-clone-cancel-after-fetch" source.Cancellation ignore)
+                        |> executed
                         |> Async.StartAsPromise
 
                     match cloneResult with
@@ -6901,13 +6951,14 @@ Vitest.describe (
                     let! unrelatedStatus = sessionStatus session
 
                     let! unrelatedRevision =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: unrelated LFS history"
                                 Paths = [| mkPath "unrelated-large.bin" |]
                                 ExpectedRepositoryVersion = unrelatedStatus.RepositoryVersion
                             }
                             (ctx "unrelated-lfs-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "unrelated LFS revision" unrelatedRevision |> ignore
@@ -6928,13 +6979,14 @@ Vitest.describe (
                     let! saveStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: publish explicit LFS object"
                                 Paths = [| mkPath "publish-large.bin" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "lfs-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "LFS revision" revisionResult |> ignore
@@ -6970,12 +7022,13 @@ Vitest.describe (
                                     "process.env.GOMAXPROCS = '1'; process.env.GIT_LFS_FORCE_PROGRESS = '0';"
 
                                 return!
-                                    (syncService session).Publish
+                                    session.Provider.Synchronization.Publish session.Repository
                                         {
                                             ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                             ExpectedTargetRevision = None
                                         }
                                         publishContext
+                                    |> executed
                                     |> Async.StartAsPromise
                             finally
                                 emitJsStatement
@@ -7140,7 +7193,7 @@ Vitest.describe (
                 let! root, _, barePath, session = createSyncFixture hooks
 
                 try
-                    let! refreshResult = (syncService session).Refresh(ctx "progress-refresh") |> Async.StartAsPromise
+                    let! refreshResult = session.Provider.Synchronization.Refresh session.Repository (ctx "progress-refresh") |> executed |> Async.StartAsPromise
                     expectValue "refresh" refreshResult |> ignore
 
                     let fetchRequest =
@@ -7148,11 +7201,11 @@ Vitest.describe (
 
                     Vitest.expect(fetchRequest.Arguments |> Array.contains "--progress").toBe true
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create (gitOptions hooks)
                     let reports = ResizeArray<OperationProgress>()
 
                     let! cloneResult =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = {
                                     ProviderId = gitProviderId
@@ -7165,6 +7218,7 @@ Vitest.describe (
                                 MaterializeAllObjects = true
                             }
                             (OperationContext.create "progress-clone" OperationCancellation.none reports.Add)
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "clone" cloneResult |> ignore
@@ -7237,7 +7291,7 @@ Vitest.describe (
                 let! root, _, _, session = createSyncFixture hooks
 
                 try
-                    let! refreshResult = (syncService session).Refresh(ctx "progress-failed-fetch") |> Async.StartAsPromise
+                    let! refreshResult = session.Provider.Synchronization.Refresh session.Repository (ctx "progress-failed-fetch") |> executed |> Async.StartAsPromise
                     let failure = expectProviderFailure "refresh" refreshResult
 
                     Vitest.expect(failure.Message.Contains "fatal: injected fetch failure").toBe true
@@ -7342,18 +7396,20 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "feature revision"
                                 Paths = [| mkPath "feature.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "feature-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let revision = expectSucceeded "feature revision" revisionResult
                     let! refreshResult =
-                        (syncService session).Refresh(ctx "feature-refresh")
+                        session.Provider.Synchronization.Refresh session.Repository (ctx "feature-refresh")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectSucceeded "feature refresh" refreshResult
@@ -7363,7 +7419,7 @@ Vitest.describe (
 
                     let! afterRevision = sessionStatus session
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = afterRevision.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7371,6 +7427,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "feature-synchronize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match synchronizeResult with
@@ -7430,7 +7487,7 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7438,6 +7495,7 @@ Vitest.describe (
                                 PublishLocalRevisions = false
                             }
                             (ctx "synchronize-target-race")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome =
@@ -7455,7 +7513,8 @@ Vitest.describe (
                     Vitest.expect(second).toEqual (None)
 
                     let! refreshResult =
-                        (syncService session).Refresh(ctx "synchronize-target-race-refresh")
+                        session.Provider.Synchronization.Refresh session.Repository (ctx "synchronize-target-race-refresh")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectSucceeded "synchronize target race refresh" refreshResult
@@ -7480,9 +7539,10 @@ Vitest.describe (
                     do! writeUtf8FileAsync (join [| workPath; ".git"; "index.lock" |]) ""
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "update-held-index-lock")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "update with a held index lock" updateResult
@@ -7510,9 +7570,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "rejected-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "rejected update" updateResult
@@ -7575,9 +7636,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "rejected-update-status-failure")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "rejected update with unreadable status" updateResult
@@ -7604,7 +7666,7 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7612,6 +7674,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "cherry-pick-conflict-guard")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectOperationInProgress "cherry-pick conflict synchronize" synchronizeResult)
@@ -7635,9 +7698,10 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "cherry-pick-conflict-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectOperationInProgress "cherry-pick conflict update" updateResult)
@@ -7658,9 +7722,10 @@ Vitest.describe (
                 try
                     let! status = sessionStatus session
                     let! updateResult =
-                        (syncService session).Update
+                        session.Provider.Synchronization.Update session.Repository
                             { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "merge-head-conflict-update")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectActiveConflictSession "merge-head conflict update" updateResult)
@@ -7681,12 +7746,13 @@ Vitest.describe (
                 try
                     let! status = sessionStatus session
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "merge-head-conflict-publish")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectActiveConflictSession "merge-head conflict publish" publishResult)
@@ -7710,7 +7776,7 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7718,6 +7784,7 @@ Vitest.describe (
                                 PublishLocalRevisions = false
                             }
                             (ctx "unmerged-index-guard")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectOperationInProgress "unmerged index synchronize" synchronizeResult)
@@ -7739,7 +7806,7 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7747,6 +7814,7 @@ Vitest.describe (
                                 PublishLocalRevisions = false
                             }
                             (ctx "rebase-conflict-guard")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectOperationInProgress "rebase conflict synchronize" synchronizeResult)
@@ -7772,7 +7840,7 @@ Vitest.describe (
 
                     let! status = sessionStatus session
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7780,6 +7848,7 @@ Vitest.describe (
                                 PublishLocalRevisions = false
                             }
                             (ctx "sequencer-guard")
+                        |> executed
                         |> Async.StartAsPromise
 
                     ignore (expectOperationInProgress "sequencer synchronize" synchronizeResult)
@@ -7804,13 +7873,14 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "local revision before rejected publish"
                                 Paths = [| mkPath "local-only.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "rejected-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let localRevision = expectSucceeded "local revision before rejected publish" revisionResult
@@ -7823,7 +7893,7 @@ Vitest.describe (
 
                     let! beforeSynchronize = sessionStatus session
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7831,6 +7901,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "rejected-publish-synchronize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match synchronizeResult with
@@ -7860,7 +7931,7 @@ Vitest.describe (
                     do! removePathAsync hookPath
                     let! retryStatus = sessionStatus session
                     let! retryResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7868,6 +7939,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "retry-rejected-publish-synchronize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match retryResult with
@@ -7908,13 +7980,14 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "local revision for rejected publish"
                                 Paths = [| mkPath "local-only.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "local-ahead-rejected-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let localRevision = expectSucceeded "local-ahead rejected publish revision" revisionResult
@@ -7927,7 +8000,7 @@ Vitest.describe (
 
                     let! beforeSynchronize = sessionStatus session
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -7935,6 +8008,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "local-ahead-rejected-publish")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match synchronizeResult with
@@ -7971,13 +8045,14 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "local revision for locked publish"
                                 Paths = [| mkPath "locked-publish.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "locked-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "local revision for locked publish" revisionResult |> ignore
@@ -7985,12 +8060,13 @@ Vitest.describe (
 
                     let! beforePublish = sessionStatus session
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "locked-publish")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "locked publish" publishResult
@@ -8002,12 +8078,13 @@ Vitest.describe (
                     do! removePathAsync lockPath
                     let! retryStatus = sessionStatus session
                     let! retryResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "retry-locked-publish")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "retry locked publish" retryResult |> ignore
@@ -8053,13 +8130,14 @@ Vitest.describe (
                     let! status = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "local revision for batched publish rejection"
                                 Paths = [| mkPath "batched-publish.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "batched-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "local revision for batched publish rejection" revisionResult |> ignore
@@ -8067,12 +8145,13 @@ Vitest.describe (
                     let assertConcurrencyFailure contextId = promise {
                         let! beforePublish = sessionStatus session
                         let! publishResult =
-                            (syncService session).Publish
+                            session.Provider.Synchronization.Publish session.Repository
                                 {
                                     ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (ctx contextId)
+                            |> executed
                             |> Async.StartAsPromise
 
                         let failure = expectProviderFailure contextId publishResult
@@ -8130,35 +8209,37 @@ let private initializeAndBindWorkspace
     (operationPrefix: string)
     =
     promise {
-        let factory = GitWorkspaceSession.createFactory hooks
+        let provider = GitProvider.create (gitOptions hooks)
 
         let! initializeResult =
-            factory.Initialize
+            provider.Initialize
                 {
                     TargetPath = workPath
                     Location = None
                 }
                 (ctx $"{operationPrefix}-initialize")
+            |> executed
             |> Async.StartAsPromise
 
-        let initializedBinding = expectSucceeded "initialize Git workspace" initializeResult
+        let initialized = expectSucceeded "initialize Git workspace" initializeResult
 
         let! bindResult =
-            factory.Bind
+            provider.Bind
                 {
-                    RepositoryRoot = initializedBinding.RepositoryRoot
-                    Location = (syncBinding workPath barePath).Location
+                    RepositoryRoot = initialized.Descriptor.RepositoryRoot
+                    Location = {
+                        ProviderId = gitProviderId
+                        DisplayName = None
+                        ProviderLocation = barePath
+                        ConnectionProfileId = None
+                    }
                 }
                 (ctx $"{operationPrefix}-bind")
+            |> executed
             |> Async.StartAsPromise
 
-        let binding = expectSucceeded "bind Git workspace" bindResult
-
-        let! openResult =
-            factory.Open binding (ctx $"{operationPrefix}-open")
-            |> Async.StartAsPromise
-
-        return expectSucceeded "open bound Git workspace" openResult
+        let repository = expectSucceeded "bind Git workspace" bindResult
+        return { Provider = provider; Repository = repository }
     }
 
 Vitest.describe (
@@ -8176,20 +8257,21 @@ Vitest.describe (
                     let! revisionStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "feature revision"
                                 Paths = [| mkPath "feature.txt" |]
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-feature-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let revision = expectSucceeded "feature revision" revisionResult
                     let! beforeSynchronize = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -8197,6 +8279,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "publish-tracking-feature-first-sync")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let synchronized = expectSucceededOutcome "feature first synchronize" synchronizeResult
@@ -8211,7 +8294,7 @@ Vitest.describe (
                     let! beforeNextSynchronize = sessionStatus session
 
                     let! nextSynchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeNextSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -8219,6 +8302,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "publish-tracking-feature-second-sync")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "feature second synchronize" nextSynchronizeResult |> ignore
@@ -8252,7 +8336,7 @@ Vitest.describe (
                     let! beforeSynchronize = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -8260,6 +8344,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "publish-tracking-unborn-sync")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let synchronized = expectSucceededOutcome "unborn branch synchronize" synchronizeResult
@@ -8306,20 +8391,21 @@ Vitest.describe (
                     let! revisionStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "initial empty remote revision"
                                 Paths = [| mkPath "initial.txt" |]
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-empty-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "empty remote initial revision" revisionResult |> ignore
                     let! beforeSynchronize = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -8327,6 +8413,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "publish-tracking-empty-first-sync")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "empty remote first synchronize" synchronizeResult |> ignore
@@ -8337,7 +8424,7 @@ Vitest.describe (
                     let! beforeNextSynchronize = sessionStatus session
 
                     let! nextSynchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeNextSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -8345,6 +8432,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "publish-tracking-empty-second-sync")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "empty remote second synchronize" nextSynchronizeResult |> ignore
@@ -8370,13 +8458,14 @@ Vitest.describe (
                     let! revisionStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "feature revision before plain push"
                                 Paths = [| mkPath "feature.txt" |]
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-equal-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "equal remote feature revision" revisionResult |> ignore
@@ -8388,12 +8477,13 @@ Vitest.describe (
                     let! beforePublish = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-equal-remote")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let outcome = expectSucceededOutcome "publish equal remote without tracking" publishResult
@@ -8425,12 +8515,13 @@ Vitest.describe (
                     let! beforePublish = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-unfetched-target")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "publish with an unfetched remote advance" publishResult
@@ -8461,13 +8552,14 @@ Vitest.describe (
                     let! firstStatus = sessionStatus session
 
                     let! firstRevision =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "feature base revision"
                                 Paths = [| mkPath "feature.txt" |]
                                 ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-diverged-base")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "feature base revision" firstRevision |> ignore
@@ -8476,13 +8568,14 @@ Vitest.describe (
                     let! localStatus = sessionStatus session
 
                     let! localRevision =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "local feature revision"
                                 Paths = [| mkPath "local-only.txt" |]
                                 ExpectedRepositoryVersion = localStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-diverged-local")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "local feature revision" localRevision |> ignore
@@ -8490,12 +8583,13 @@ Vitest.describe (
                     let! beforePublish = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-diverged")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "publish diverged target" publishResult
@@ -8526,13 +8620,14 @@ Vitest.describe (
                     let! revisionStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "feature revision before remote advance"
                                 Paths = [| mkPath "feature.txt" |]
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-adopt-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "feature revision before remote advance" revisionResult |> ignore
@@ -8541,12 +8636,13 @@ Vitest.describe (
                     let! beforePublish = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-adopt")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "publish remote branch ahead" publishResult
@@ -8563,7 +8659,7 @@ Vitest.describe (
                     let! beforeSynchronize = sessionStatus session
 
                     let! synchronizeResult =
-                        (syncService session).Synchronize
+                        session.Provider.Synchronization.Synchronize session.Repository
                             {
                                 ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
@@ -8571,6 +8667,7 @@ Vitest.describe (
                                 PublishLocalRevisions = true
                             }
                             (ctx "publish-tracking-adopt-synchronize")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "synchronize adopted remote branch" synchronizeResult |> ignore
@@ -8592,7 +8689,8 @@ Vitest.describe (
 
                 try
                     let! refreshResult =
-                        (syncService session).Refresh(ctx "publish-tracking-stale-refresh")
+                        session.Provider.Synchronization.Refresh session.Repository (ctx "publish-tracking-stale-refresh")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectSucceeded "publish tracking stale refresh" refreshResult
@@ -8604,12 +8702,13 @@ Vitest.describe (
                     let! beforePublish = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = Some expectedTarget
                             }
                             (ctx "publish-tracking-stale-target")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "publish with stale expected target" publishResult
@@ -8671,25 +8770,27 @@ Vitest.describe (
                     let! revisionStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "feature revision for tracking failure"
                                 Paths = [| mkPath "feature.txt" |]
                                 ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-config-failure-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectSucceeded "feature revision for tracking failure" revisionResult |> ignore
                     let! beforePublish = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-config-failure")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match publishResult with
@@ -8827,12 +8928,11 @@ Vitest.describe (
                 try
                     let batches = ResizeArray<OperationOutput[]>()
 
-                    let materialization =
-                        session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                    let materialization = session.Provider.ObjectMaterialization
 
                     let! listResult =
-                        materialization.ListObjects(outputContext "output-listing" batches)
+                        materialization.ListObjects session.Repository (outputContext "output-listing" batches)
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "listing" listResult |> ignore
@@ -8868,13 +8968,14 @@ Vitest.describe (
                     let! saveStatus = sessionStatus session
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        session.Provider.CreateRevision session.Repository
                             {
                                 Message = "test: publish explicit LFS object"
                                 Paths = [| mkPath "publish-large.bin" |]
                                 ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "output-publish-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "LFS revision" revisionResult |> ignore
@@ -8882,12 +8983,13 @@ Vitest.describe (
                     let! publishStatus = sessionStatus session
 
                     let! publishResult =
-                        (syncService session).Publish
+                        session.Provider.Synchronization.Publish session.Repository
                             {
                                 ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (outputContext "output-publish" batches)
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectValue "publish" publishResult |> ignore

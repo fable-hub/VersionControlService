@@ -1,5 +1,5 @@
 /// Injected lakeFS credential resolution: a connection profile ID resolves to
-/// endpoint + access keys. Secrets never enter bindings, indexes, or requests.
+/// endpoint + access keys. Secrets never enter the provider state or requests.
 module VersionControlService.LakeFs.LakeFsCredentials
 
 open VersionControlService.LakeFs.LakeFsTypes

@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>VersionControlService.Abstractions</PackageId>
-    <Description>Provider-neutral version control contracts and workspace sessions.</Description>
+    <Description>Provider-neutral version control contracts: one interface that every provider serves.</Description>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Identifiers.fs" />
@@ -10,6 +10,8 @@
     <Compile Include="DiffFailureDetail.fs" />
     <Compile Include="Operations.fs" />
     <Compile Include="Workspace.fs" />
+    <Compile Include="Repository.fs" />
+    <Compile Include="CallResult.fs" />
     <Compile Include="Refs.fs" />
     <Compile Include="Synchronization.fs" />
     <Compile Include="Conflicts.fs" />
@@ -20,7 +22,9 @@
     <Compile Include="StorageMaintenance.fs" />
     <Compile Include="RepositoryBrowser.fs" />
     <Compile Include="History.fs" />
-    <Compile Include="Providers.fs" />
+    <Compile Include="ProviderFunctions.fs" />
+    <Compile Include="VersionControl.fs" />
+    <Compile Include="Subscribe.fs" />
     <Compile Include="ProviderResolution.fs" />
   </ItemGroup>
   <ItemGroup>

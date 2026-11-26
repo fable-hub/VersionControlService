@@ -225,19 +225,57 @@ type ReadLineRequest = {
 /// Request the pinned metadata for both sources in an opened diff.
 type SourceInfoRequest = { Handle: DiffHandle }
 
+/// The text diff functions of a provider, one entry for each.
+type TextDiffFunctions = {
+    Open: Entry<Repository -> OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>>
+    ReadPage: Entry<Repository -> ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>>
+    ReplayPage: Entry<Repository -> ReplayPageRequest -> OperationContext -> Async<OperationResult<DiffPage>>>
+    Expand: Entry<Repository -> ExpandRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPart[]>>>>
+    ReadLine: Entry<Repository -> ReadLineRequest -> OperationContext -> Async<OperationResult<Resumable<DiffLine>>>>
+    GetSourceInfo:
+        Entry<Repository -> SourceInfoRequest -> OperationContext -> Async<OperationResult<DiffSourceInfo * DiffSourceInfo>>>
+    Close: Entry<Repository -> DiffHandle -> OperationContext -> Async<OperationResult<unit>>>
+}
+
 /// Reads and expands paged diffs with resumable work.
 /// A handle belongs to the workspace and to the owner that the hosting provider derives from the calling
 /// operation (for example, the window that made the call). A call with a handle of another owner answers
 /// `TextDiffFailureCodes.SessionClosed` ("diff_session_closed"), and `Close` of another owner's handle changes nothing.
-type TextDiffService = {
-    Open: OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>
-    ReadPage: ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>
-    ReplayPage: ReplayPageRequest -> OperationContext -> Async<OperationResult<DiffPage>>
-    Expand: ExpandRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPart[]>>>
-    ReadLine: ReadLineRequest -> OperationContext -> Async<OperationResult<Resumable<DiffLine>>>
-    GetSourceInfo: SourceInfoRequest -> OperationContext -> Async<OperationResult<DiffSourceInfo * DiffSourceInfo>>
-    Close: DiffHandle -> OperationContext -> Async<OperationResult<unit>>
-}
+type ITextDiff =
+    abstract Open:
+        repository: Repository ->
+        request: OpenDiffRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<OpenDiffResult>>>
+
+    abstract ReadPage:
+        repository: Repository ->
+        request: ReadPageRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<DiffPage>>>
+
+    abstract ReplayPage:
+        repository: Repository -> request: ReplayPageRequest -> context: OperationContext -> Async<CallResult<DiffPage>>
+
+    abstract Expand:
+        repository: Repository ->
+        request: ExpandRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<DiffPart[]>>>
+
+    abstract ReadLine:
+        repository: Repository ->
+        request: ReadLineRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<DiffLine>>>
+
+    abstract GetSourceInfo:
+        repository: Repository ->
+        request: SourceInfoRequest ->
+        context: OperationContext ->
+            Async<CallResult<DiffSourceInfo * DiffSourceInfo>>
+
+    abstract Close: repository: Repository -> handle: DiffHandle -> context: OperationContext -> Async<CallResult<unit>>
 
 /// Stable failure codes returned by paged text diff operations.
 module TextDiffFailureCodes =

@@ -1,4 +1,4 @@
-/// The history service of the Git provider: pages of the commit log and the files of one commit.
+/// The history functions of the Git provider: pages of the commit log and the files of one commit.
 module internal VersionControlService.Git.GitHistory
 
 open System
@@ -174,7 +174,7 @@ let private readPage
                     })
     }
 
-let private listRevisions
+let listRevisions
     (run: GitRunner)
     (check: GitCheck)
     (request: ListRevisionsRequest)
@@ -216,7 +216,7 @@ let private nameStatusArguments (renames: string) (id: string) =
         id
     |]
 
-let private getRevisionChanges
+let getRevisionChanges
     (run: GitRunner)
     (check: GitCheck)
     (parseNameStatus: string -> DiffEntry[])
@@ -253,9 +253,3 @@ let private getRevisionChanges
                     return summarize withoutRenames second
                 | _ -> return summarize arguments first
     }
-
-/// The history service over a workspace. `parseNameStatus` reads `git log --name-status -z` output.
-let create (run: GitRunner) (check: GitCheck) (parseNameStatus: string -> DiffEntry[]) : HistoryService = {
-    ListRevisions = listRevisions run check
-    GetRevisionChanges = getRevisionChanges run check parseNameStatus
-}

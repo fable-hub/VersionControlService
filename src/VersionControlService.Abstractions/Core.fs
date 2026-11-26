@@ -71,18 +71,3 @@ type DiffEntry = {
 type DiffSummary = {
     Entries: DiffEntry[]
 }
-
-/// The required core every provider session supplies.
-type CoreVersionControl = {
-    GetStatus: OperationContext -> Async<OperationResult<RepositoryStatus>>
-    ListRefs: OperationContext -> Async<OperationResult<LogicalRef[]>>
-    CreateRef: CreateRefRequest -> OperationContext -> Async<OperationResult<LogicalRef>>
-    PreflightSwitchRef: SwitchRefRequest -> OperationContext -> Async<OperationResult<SwitchPreflight>>
-    SwitchRef: SwitchRefRequest -> OperationContext -> Async<OperationResult<RepositoryStatus>>
-    /// Creates a revision from exact selected paths and an expected workspace version.
-    CreateRevision: CreateRevisionRequest -> OperationContext -> Async<OperationResult<RevisionId>>
-    /// Restores the paths to their base revision. A path whose object is available locally stays
-    /// materialized.
-    RestorePaths: RestoreRequest -> OperationContext -> Async<OperationResult<unit>>
-    GetDiffSummary: OperationContext -> Async<OperationResult<DiffSummary>>
-}

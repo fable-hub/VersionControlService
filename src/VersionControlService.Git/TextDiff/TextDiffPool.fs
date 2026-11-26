@@ -41,6 +41,17 @@ module TextDiffPoolOptions =
         NowMilliseconds = fun () -> float DateTime.UtcNow.Ticks / 10000.0
     }
 
+/// The text diff calls of one owner. The pool answers them for the handles that owner opened.
+type TextDiffCalls = {
+    Open: OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>
+    ReadPage: ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>
+    ReplayPage: ReplayPageRequest -> OperationContext -> Async<OperationResult<DiffPage>>
+    Expand: ExpandRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPart[]>>>
+    ReadLine: ReadLineRequest -> OperationContext -> Async<OperationResult<Resumable<DiffLine>>>
+    GetSourceInfo: SourceInfoRequest -> OperationContext -> Async<OperationResult<DiffSourceInfo * DiffSourceInfo>>
+    Close: DiffHandle -> OperationContext -> Async<OperationResult<unit>>
+}
+
 type private WorkerPhase =
     | Starting
     | Ready
@@ -774,8 +785,8 @@ type TextDiffPool internal (options: TextDiffPoolOptions) =
             do! supervisor.Dispose()
     }
 
-    /// The diff service for one owner. Handles opened through it are unknown to every other owner.
-    member _.Service(owner: TextDiffOwner) : TextDiffService = {
+    /// The diff calls for one owner. Handles opened through them are unknown to every other owner.
+    member _.Service(owner: TextDiffOwner) : TextDiffCalls = {
         Open = fun request context -> openDiff owner request context |> Async.AwaitPromise
         ReadPage =
             fun request context ->

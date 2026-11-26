@@ -11,9 +11,8 @@ open VersionControlService.Git.TextDiff
 open VersionControlService.Git.TextDiff.TextDiffProtocol
 open VersionControlService.Git.TextDiff.TextDiffTransport
 open VersionControlService.TextDiff
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
-module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
-module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
 module NodePositionalFile = VersionControlService.Runtime.Node.PositionalFile
@@ -175,56 +174,7 @@ let private removeDirectory (directory: string) = promise {
     with _ -> ()
 }
 
-let private gitProviderId =
-    match ProviderId.tryCreate "git" with
-    | Ok providerId -> providerId
-    | Error message -> failwith message
-
-let private bindingFor (repository: string) : WorkspaceBinding =
-    let location: RepositoryLocation = {
-        ProviderId = gitProviderId
-        DisplayName = None
-        ProviderLocation = repository
-        ConnectionProfileId = None
-    }
-
-    {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = gitProviderId
-        RepositoryRoot = repository
-        ProviderStateRef = None
-        Location = location
-        ConnectionProfileId = None
-    }
-
 let private mediaDirectory (repository: string) = NodePath.join [| repository; ".git"; "lfs"; "objects" |]
-
-let private createSessionWithPoolGetter
-    (getPool: unit -> JS.Promise<TextDiffPool.TextDiffPool option>)
-    (repository: string)
-    =
-    GitWorkspaceSession.createSessionWithOptions
-        {
-            Hooks = GitWorkspaceSession.GitSessionHooks.none
-            TextDiff =
-                Some {
-                    Pool = getPool
-                    WindowOwnerOf = fun context ->
-                        if context.OperationId.Contains("window-b", StringComparison.Ordinal) then "window-b" else "window-a"
-                }
-        }
-        GitCredentialStrategy.anonymous
-        GitCredentialStrategy.anonymousIdentity
-        RevisionPolicyStrategy.automatic
-        (bindingFor repository)
-
-let private createSession (pool: TextDiffPool.TextDiffPool) (repository: string) =
-    createSessionWithPoolGetter (fun () -> Promise.lift (Some pool)) repository
-
-let private serviceFor (session: WorkspaceSession) =
-    match session.TextDiff with
-    | Some service -> service
-    | None -> failwith "The Git session has no text diff service."
 
 let private context name = OperationContext.detached name
 
@@ -247,11 +197,46 @@ let private operationValue operationName result =
         failwith $"{operationName} returned partial success: {failure.Code} {outcome.Value}"
     | Failed failure -> failwith $"{operationName} failed: {failure.Code} {failure.Message}"
 
-let private openUntilReady (service: TextDiffService) (initial: OpenDiffRequest) (operationName: string) =
-    TextDiffTestSupport.openUntilReady service initial (context operationName)
+let private openRepositoryWithPoolGetter
+    (getPool: unit -> JS.Promise<TextDiffPool.TextDiffPool option>)
+    (repository: string)
+    =
+    promise {
+        let provider =
+            GitProvider.create {
+                GitProviderOptions.defaults with
+                    TextDiff =
+                        Some {
+                            Pool = getPool
+                            WindowOwnerOf = fun context ->
+                                if context.OperationId.Contains("window-b", StringComparison.Ordinal) then "window-b" else "window-a"
+                        }
+            }
+
+        let! opened =
+            executed (provider.Open { RepositoryRoot = repository; ConnectionProfileId = None } (context "open-repository"))
+            |> Async.StartAsPromise
+
+        return provider, (operationValue "Open" opened)
+    }
+
+let private openRepository (pool: TextDiffPool.TextDiffPool) (repository: string) =
+    openRepositoryWithPoolGetter (fun () -> Promise.lift (Some pool)) repository
+
+let private openUntilReady
+    (provider: IVersionControl)
+    (repo: Repository)
+    (initial: OpenDiffRequest)
+    (operationName: string)
+    =
+    TextDiffTestSupport.openUntilReady
+        (fun request context -> executed (provider.TextDiff.Open repo request context))
+        initial
+        (context operationName)
 
 let private readPageReady
-    (service: TextDiffService)
+    (provider: IVersionControl)
+    (repo: Repository)
     (handle: DiffHandle)
     (initialCursor: string)
     (operationName: string)
@@ -262,7 +247,7 @@ let private readPageReady
 
         while value.IsNone do
             let! result =
-                service.ReadPage { Handle = handle; Cursor = cursor; Background = false } (context operationName)
+                executed (provider.TextDiff.ReadPage repo { Handle = handle; Cursor = cursor; Background = false } (context operationName))
                 |> Async.StartAsPromise
 
             let outcome = operationValue "ReadPage" result
@@ -274,20 +259,20 @@ let private readPageReady
         return value.Value
     }
 
-let private openedWithFirstPage service request operationName = promise {
-    let! opened = openUntilReady service request operationName
+let private openedWithFirstPage provider repo request operationName = promise {
+    let! opened = openUntilReady provider repo request operationName
 
     match opened with
     | OpenDiffResult.Opened(handle, previous, current, Resumable.Ready first, _) ->
         return handle, previous, current, first
     | OpenDiffResult.Opened(handle, previous, current, Resumable.Scanning(_, continuation, _), _) ->
-        let! first = readPageReady service handle continuation (operationName + "-first-page")
+        let! first = readPageReady provider repo handle continuation (operationName + "-first-page")
         return handle, previous, current, first
     | OpenDiffResult.NotDiffable blocker ->
         return raise (InvalidOperationException($"Expected an opened diff, got %A{blocker}."))
 }
 
-let private readAllPages service handle first operationName = promise {
+let private readAllPages provider repo handle first operationName = promise {
     let pages = ResizeArray<DiffPage>()
     pages.Add first
     let mutable next = first.NextCursor
@@ -295,7 +280,7 @@ let private readAllPages service handle first operationName = promise {
 
     while next.IsSome do
         let cursor = next.Value
-        let! page = readPageReady service handle cursor (operationName + "-" + string operationIndex)
+        let! page = readPageReady provider repo handle cursor (operationName + "-" + string operationIndex)
         pages.Add page
         next <- page.NextCursor
         operationIndex <- operationIndex + 1
@@ -304,7 +289,8 @@ let private readAllPages service handle first operationName = promise {
 }
 
 let private expandReady
-    (service: TextDiffService)
+    (provider: IVersionControl)
+    (repo: Repository)
     (handle: DiffHandle)
     (gapId: string)
     (fromStart: bool)
@@ -323,7 +309,7 @@ let private expandReady
                 Count = count
                 Continuation = continuation
             }
-            let! result = service.Expand request (context operationName) |> Async.StartAsPromise
+            let! result = executed (provider.TextDiff.Expand repo request (context operationName)) |> Async.StartAsPromise
 
             match operationValue "Expand" result with
             | Resumable.Ready expanded -> parts <- Some expanded
@@ -333,7 +319,8 @@ let private expandReady
     }
 
 let private readLineReady
-    (service: TextDiffService)
+    (provider: IVersionControl)
+    (repo: Repository)
     (handle: DiffHandle)
     (side: DiffSide)
     (line: int64)
@@ -354,7 +341,7 @@ let private readLineReady
                 MaxUtf16 = maxUtf16
                 Continuation = continuation
             }
-            let! result = service.ReadLine request (context operationName) |> Async.StartAsPromise
+            let! result = executed (provider.TextDiff.ReadLine repo request (context operationName)) |> Async.StartAsPromise
 
             match operationValue "ReadLine" result with
             | Resumable.Ready slice -> value <- Some slice
@@ -423,11 +410,11 @@ let private newRepository () = promise {
     return repository
 }
 
-let private closeSession (session: WorkspaceSession) (failure: exn option) = promise {
+let private closeRepository (provider: IVersionControl) (repo: Repository) (failure: exn option) = promise {
     let mutable closeFailure = None
 
     try
-        do! session.Close() |> Async.StartAsPromise
+        do! provider.Close repo |> Async.StartAsPromise
     with error ->
         closeFailure <- Some error
 
@@ -518,19 +505,19 @@ let private denseDiffText (changedLines: int) (equalLines: int) =
 let private memoryOnly (budgetBytes: int64) = DiffStoragePolicy.MemoryOnly budgetBytes
 
 /// Opens a diff and answers its handle, first page and storage.
-let private openForStorage (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
-    let! opened = openUntilReady service request operationName
+let private openForStorage (provider: IVersionControl) (repo: Repository) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! opened = openUntilReady provider repo request operationName
 
     match opened with
     | OpenDiffResult.Opened(handle, _, _, Resumable.Ready first, storage) -> return handle, first, storage
     | OpenDiffResult.Opened(handle, _, _, Resumable.Scanning(_, continuation, _), storage) ->
-        let! first = readPageReady service handle continuation (operationName + "-first-page")
+        let! first = readPageReady provider repo handle continuation (operationName + "-first-page")
         return handle, first, storage
     | OpenDiffResult.NotDiffable blocker -> return raise (InvalidOperationException($"Expected an opened diff, got %A{blocker}."))
 }
 
-let private readPageRaw (service: TextDiffService) (handle: DiffHandle) (cursor: string) (background: bool) (operationName: string) =
-    service.ReadPage { Handle = handle; Cursor = cursor; Background = background } (context operationName)
+let private readPageRaw (provider: IVersionControl) (repo: Repository) (handle: DiffHandle) (cursor: string) (background: bool) (operationName: string) =
+    executed (provider.TextDiff.ReadPage repo { Handle = handle; Cursor = cursor; Background = background } (context operationName))
     |> Async.StartAsPromise
 
 /// The cursor after a successful ReadPage answer.
@@ -571,14 +558,14 @@ let private freeSpacePool (freeFile: string) = promise {
 
 /// Opens a diff and reads user pages after the first one until a read fails or the diff ends. Answers the number of
 /// successful reads, the failure if any and whether the last page was read. Closes the handle.
-let private readUserPages (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
-    let! handle, first, _ = openForStorage service request (operationName + "-open")
+let private readUserPages (provider: IVersionControl) (repo: Repository) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! handle, first, _ = openForStorage provider repo request (operationName + "-open")
     let mutable cursor = first.NextCursor
     let mutable served = 0
     let mutable failure = None
 
     while failure.IsNone && cursor.IsSome do
-        let! result = readPageRaw service handle cursor.Value false $"{operationName}-read-{served}"
+        let! result = readPageRaw provider repo handle cursor.Value false $"{operationName}-read-{served}"
 
         match result with
         | Succeeded outcome ->
@@ -587,7 +574,7 @@ let private readUserPages (service: TextDiffService) (request: OpenDiffRequest) 
         | Failed failed -> failure <- Some failed
         | PartiallySucceeded _ -> failwith "ReadPage returned partial success."
 
-    let! closed = service.Close handle (context (operationName + "-close")) |> Async.StartAsPromise
+    let! closed = executed (provider.TextDiff.Close repo handle (context (operationName + "-close"))) |> Async.StartAsPromise
     ignore (operationValue "Close" closed)
     return served, failure, cursor.IsNone
 }
@@ -619,27 +606,26 @@ let private lfsObjectFile (repository: string) (oid: string) =
 let private pointerFor (oid: string) (size: int) =
     $"version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n"
 
-/// Runs the body with a service on the repository and closes the session afterwards.
-let private withSession (repository: string) (body: TextDiffService -> JS.Promise<unit>) = promise {
-    let session = createSession (currentFixture ()).Pool repository
-    let service = serviceFor session
+/// Runs the body with the provider and the opened repository and closes the repository afterwards.
+let private withSession (repository: string) (body: IVersionControl -> Repository -> JS.Promise<unit>) = promise {
+    let! provider, repo = openRepository (currentFixture ()).Pool repository
     let mutable failure = None
 
     try
-        do! body service
+        do! body provider repo
     with error ->
         failure <- Some error
 
-    do! closeSession session failure
+    do! closeRepository provider repo failure
 }
 
 /// Calls Open until the answer is not Scanning and keeps a failure as a value.
-let private openRaw (service: TextDiffService) (initial: OpenDiffRequest) (operationName: string) = promise {
+let private openRaw (provider: IVersionControl) (repo: Repository) (initial: OpenDiffRequest) (operationName: string) = promise {
     let mutable request = initial
     let mutable answer = None
 
     while answer.IsNone do
-        let! result = service.Open request (context operationName) |> Async.StartAsPromise
+        let! result = executed (provider.TextDiff.Open repo request (context operationName)) |> Async.StartAsPromise
 
         match result with
         | Succeeded { Value = Resumable.Scanning(_, continuation, _) } ->
@@ -650,16 +636,16 @@ let private openRaw (service: TextDiffService) (initial: OpenDiffRequest) (opera
 }
 
 /// Opens the diff, reads every page and closes it.
-let private revisionDiff (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
-    let! handle, previous, current, first = openedWithFirstPage service request operationName
-    let! pages = readAllPages service handle first (operationName + "-pages")
-    let! closed = service.Close handle (context (operationName + "-close")) |> Async.StartAsPromise
+let private revisionDiff (provider: IVersionControl) (repo: Repository) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! handle, previous, current, first = openedWithFirstPage provider repo request operationName
+    let! pages = readAllPages provider repo handle first (operationName + "-pages")
+    let! closed = executed (provider.TextDiff.Close repo handle (context (operationName + "-close"))) |> Async.StartAsPromise
     ignore (operationValue "Close" closed)
     return previous, current, pages
 }
 
-let private openBlocker (service: TextDiffService) (request: OpenDiffRequest) (operationName: string) = promise {
-    let! opened = openUntilReady service request operationName
+let private openBlocker (provider: IVersionControl) (repo: Repository) (request: OpenDiffRequest) (operationName: string) = promise {
+    let! opened = openUntilReady provider repo request operationName
 
     match opened with
     | OpenDiffResult.NotDiffable blocker -> return blocker
@@ -996,8 +982,7 @@ Vitest.describe (
                 for relativePath in relativePaths do
                     do! writePatternFile (NodePath.join [| repository; relativePath |]) fileSize "after-first-line" sharedLine
 
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
@@ -1005,15 +990,15 @@ Vitest.describe (
                     // Every diff is paged to its end before the next one opens.
                     for relativePath in relativePaths do
                         let! handle, _, _, first =
-                            openedWithFirstPage service (openRequest relativePath) ("scratch-" + relativePath)
+                            openedWithFirstPage provider repo (openRequest relativePath) ("scratch-" + relativePath)
                         Vitest.expect(pageHasChange first).toBe true
-                        let! pages = readAllPages service handle first ("scratch-page-" + relativePath)
+                        let! pages = readAllPages provider repo handle first ("scratch-page-" + relativePath)
                         Vitest.expect(pages.Length > 0).toBe true
                         Vitest.expect(pages[pages.Length - 1].NextCursor.IsNone).toBe true
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1028,18 +1013,17 @@ Vitest.describe (
                 do! writeText (NodePath.join [| repository; "changed.txt" |]) current
                 let! headOutput = runGit repository [| "rev-parse"; "HEAD" |]
                 let head = headOutput.Trim()
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, previousInfo, currentInfo, first =
-                        openedWithFirstPage service (openRequest "changed.txt") "modified-window-a"
+                        openedWithFirstPage provider repo (openRequest "changed.txt") "modified-window-a"
 
                     Vitest.expect(pageHasChange first).toBe true
                     Vitest.expect(first.OutputComplete).toBe false
 
-                    let! sourceResult = service.GetSourceInfo { Handle = handle } (context "source-info-window-a") |> Async.StartAsPromise
+                    let! sourceResult = executed (provider.TextDiff.GetSourceInfo repo { Handle = handle } (context "source-info-window-a")) |> Async.StartAsPromise
                     let sourcePrevious, sourceCurrent = operationValue "GetSourceInfo" sourceResult
                     Vitest.expect(RepositoryPath.value previousInfo.Path).toBe "changed.txt"
                     Vitest.expect(RepositoryPath.value currentInfo.Path).toBe "changed.txt"
@@ -1054,21 +1038,21 @@ Vitest.describe (
                     Vitest.expect(sourceCurrent.EncodingWasChosen).toBe false
                     Vitest.expect(sourceCurrent.HasBom).toBe false
 
-                    let! replayResult = service.ReplayPage { Handle = handle; PageId = first.PageId } (context "replay-window-a") |> Async.StartAsPromise
+                    let! replayResult = executed (provider.TextDiff.ReplayPage repo { Handle = handle; PageId = first.PageId } (context "replay-window-a")) |> Async.StartAsPromise
                     let replayed = operationValue "ReplayPage" replayResult
                     Vitest.expect(replayed).toEqual first
 
-                    let! pages = readAllPages service handle first "read-window-a"
+                    let! pages = readAllPages provider repo handle first "read-window-a"
                     Vitest.expect(pages.Length > 1).toBe true
                     Vitest.expect(pages[pages.Length - 1].OutputComplete).toBe true
                     Vitest.expect(pages |> Array.exists pageHasChange).toBe true
 
-                    let! closeResult = service.Close handle (context "close-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1090,13 +1074,12 @@ Vitest.describe (
 
                 do! commitText repository "small.txt" previous
                 do! writeText (NodePath.join [| repository; "small.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
-                    let! handle, _, _, first = openedWithFirstPage service (openRequest "small.txt") "small-edit-window-a"
-                    let! pages = readAllPages service handle first "small-edit-read-window-a"
+                    let! handle, _, _, first = openedWithFirstPage provider repo (openRequest "small.txt") "small-edit-window-a"
+                    let! pages = readAllPages provider repo handle first "small-edit-read-window-a"
 
                     let rows =
                         pages
@@ -1127,12 +1110,12 @@ Vitest.describe (
                             Vitest.expect(row.Kind).toEqual DiffRowKind.Context
                             Vitest.expect(currentLine.Slice.Text).toBe lines[index]
 
-                    let! closeResult = service.Close handle (context "small-edit-close-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "small-edit-close-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1149,14 +1132,13 @@ Vitest.describe (
                 let current = String.concat "\n" currentLines + "\n"
                 do! commitText repository "expanded.txt" previous
                 do! writeText (NodePath.join [| repository; "expanded.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, _, _, first =
-                        openedWithFirstPage service (openRequest "expanded.txt") "expand-gap-window-a"
-                    let! pages = readAllPages service handle first "expand-gap-pages-window-a"
+                        openedWithFirstPage provider repo (openRequest "expanded.txt") "expand-gap-window-a"
+                    let! pages = readAllPages provider repo handle first "expand-gap-pages-window-a"
                     let allParts = pages |> Array.collect (fun page -> page.Parts)
                     let gap =
                         hiddenGaps allParts
@@ -1165,17 +1147,17 @@ Vitest.describe (
                         |> Option.defaultWith (fun () -> failwith "The fixture has no large equal gap.")
                     let collected = ResizeArray<DiffLine>()
 
-                    let! fromStart = expandReady service handle gap.GapId true 5 "expand-gap-start-window-a"
+                    let! fromStart = expandReady provider repo handle gap.GapId true 5 "expand-gap-start-window-a"
                     collected.AddRange(expandedPreviousLines fromStart)
 
-                    let! retried = expandReady service handle gap.GapId true 5 "expand-gap-retry-window-a"
+                    let! retried = expandReady provider repo handle gap.GapId true 5 "expand-gap-retry-window-a"
                     Vitest.expect(retried).toEqual fromStart
 
                     let afterStart =
                         hiddenGaps fromStart
                         |> Array.tryHead
                         |> Option.defaultWith (fun () -> failwith "The first expansion did not leave a hidden gap.")
-                    let! fromEnd = expandReady service handle afterStart.GapId false 5 "expand-gap-end-window-a"
+                    let! fromEnd = expandReady provider repo handle afterStart.GapId false 5 "expand-gap-end-window-a"
                     collected.AddRange(expandedPreviousLines fromEnd)
 
                     let mutable remaining = hiddenGaps fromEnd |> Array.tryHead
@@ -1185,7 +1167,7 @@ Vitest.describe (
                         let currentGap = remaining.Value
                         let! expanded =
                             expandReady
-                                service
+                                provider repo
                                 handle
                                 currentGap.GapId
                                 true
@@ -1206,12 +1188,12 @@ Vitest.describe (
                     Vitest.expect(lineNumbers |> Array.distinct |> Array.length).toBe expected.Length
                     Vitest.expect(actual).toEqual expected
 
-                    let! closeResult = service.Close handle (context "close-expand-gap-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-expand-gap-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1223,13 +1205,12 @@ Vitest.describe (
                 let line = String.replicate 20_000 "x"
                 do! commitText repository "long-line.txt" "previous\n"
                 do! writeText (NodePath.join [| repository; "long-line.txt" |]) (line + "\n")
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, _, _, _ =
-                        openedWithFirstPage service (openRequest "long-line.txt") "read-line-window-a"
+                        openedWithFirstPage provider repo (openRequest "long-line.txt") "read-line-window-a"
                     let result = StringBuilder()
                     let mutable offset = 0L
                     let mutable sliceIndex = 0
@@ -1237,7 +1218,7 @@ Vitest.describe (
                     while offset < int64 line.Length do
                         let! value =
                             readLineReady
-                                service
+                                provider repo
                                 handle
                                 DiffSide.Current
                                 0L
@@ -1253,12 +1234,12 @@ Vitest.describe (
                     Vitest.expect(sliceIndex).toBe 3
                     Vitest.expect(result.ToString()).toBe line
 
-                    let! closeResult = service.Close handle (context "close-read-line-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-read-line-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1276,26 +1257,25 @@ Vitest.describe (
                 let current = String.concat "\n" currentLines + "\n"
                 do! commitText repository "line-counts.txt" previous
                 do! writeText (NodePath.join [| repository; "line-counts.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, previousAtOpen, currentAtOpen, first =
-                        openedWithFirstPage service (openRequest "line-counts.txt") "line-count-window-a"
+                        openedWithFirstPage provider repo (openRequest "line-counts.txt") "line-count-window-a"
                     let! beforeResult =
-                        service.GetSourceInfo { Handle = handle } (context "line-count-before-window-a")
+                        executed (provider.TextDiff.GetSourceInfo repo { Handle = handle } (context "line-count-before-window-a"))
                         |> Async.StartAsPromise
                     let beforePrevious, beforeCurrent = operationValue "GetSourceInfo" beforeResult
 
                     Vitest.expect(beforePrevious.LineCount).toEqual None
                     Vitest.expect(beforeCurrent.LineCount).toEqual None
 
-                    let! pages = readAllPages service handle first "line-count-pages-window-a"
+                    let! pages = readAllPages provider repo handle first "line-count-pages-window-a"
                     Vitest.expect(pages[pages.Length - 1].Progress.ScanComplete).toBe true
 
                     let! afterResult =
-                        service.GetSourceInfo { Handle = handle } (context "line-count-after-window-a")
+                        executed (provider.TextDiff.GetSourceInfo repo { Handle = handle } (context "line-count-after-window-a"))
                         |> Async.StartAsPromise
                     let afterPrevious, afterCurrent = operationValue "GetSourceInfo" afterResult
                     let expectedCount = Some(int64 lineCount)
@@ -1303,12 +1283,12 @@ Vitest.describe (
                     Vitest.expect(afterPrevious).toEqual { previousAtOpen with LineCount = expectedCount }
                     Vitest.expect(afterCurrent).toEqual { currentAtOpen with LineCount = expectedCount }
 
-                    let! closeResult = service.Close handle (context "close-line-count-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-line-count-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1319,23 +1299,22 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitText repository "base.txt" "base\n"
                 do! writeText (NodePath.join [| repository; "added.txt" |]) "added\n"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, previousInfo, currentInfo, first =
-                        openedWithFirstPage service (openRequest "added.txt") "added-window-a"
+                        openedWithFirstPage provider repo (openRequest "added.txt") "added-window-a"
 
                     Vitest.expect(previousInfo.IsAbsent).toBe true
                     Vitest.expect(currentInfo.IsAbsent).toBe false
                     Vitest.expect(pageHasChange first).toBe true
-                    let! closeResult = service.Close handle (context "close-added-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-added-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1346,23 +1325,22 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitText repository "deleted.txt" "deleted\n"
                 do! removeWorkingFile repository "deleted.txt"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, previousInfo, currentInfo, first =
-                        openedWithFirstPage service (openRequest "deleted.txt") "deleted-window-a"
+                        openedWithFirstPage provider repo (openRequest "deleted.txt") "deleted-window-a"
 
                     Vitest.expect(previousInfo.IsAbsent).toBe false
                     Vitest.expect(currentInfo.IsAbsent).toBe true
                     Vitest.expect(pageHasChange first).toBe true
-                    let! closeResult = service.Close handle (context "close-deleted-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-deleted-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1373,16 +1351,15 @@ Vitest.describe (
                 let! repository = newRepository ()
                 let pngHeader = [| 137; 80; 78; 71; 13; 10; 26; 10; 0; 0; 0; 13; 73; 72; 68; 82 |]
                 do! commitBytes repository "image.png" pngHeader
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! result = openUntilReady service (openRequest "image.png") "binary-window-a"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! result = openUntilReady provider repo (openRequest "image.png") "binary-window-a"
 
                 match result with
                 | OpenDiffResult.NotDiffable(DiffBlocker.Binary(_, evidence)) ->
                     Vitest.expect(evidence).toContain "PNG"
                 | other -> failwith $"Expected a binary blocker, got %A{other}."
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1394,16 +1371,15 @@ Vitest.describe (
                 let content = "%PDF-1.4\n" + String.concat "" [| for index in 0 .. 2999 -> $"plain line {index}\n" |]
                 do! commitText repository "document.pdf" content
                 do! writeText (NodePath.join [| repository; "document.pdf" |]) (content + "appended\n")
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! result = openUntilReady service (openRequest "document.pdf") "pdf-window-a"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! result = openUntilReady provider repo (openRequest "document.pdf") "pdf-window-a"
 
                 match result with
                 | OpenDiffResult.NotDiffable(DiffBlocker.Binary(_, evidence)) ->
                     Vitest.expect(evidence).toContain "PDF"
                 | other -> failwith $"Expected a binary blocker, got %A{other}."
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1420,13 +1396,12 @@ Vitest.describe (
                 let currentEncoded = Encoding.Unicode.GetBytes currentContent
                 let currentBytes = Array.concat [| [| 255uy; 254uy |]; currentEncoded |] |> Array.map int
                 do! writeBytes (NodePath.join [| repository; "utf16.txt" |]) currentBytes
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, _, currentInfo, first =
-                        openedWithFirstPage service (openRequest "utf16.txt") "utf16-window-a"
+                        openedWithFirstPage provider repo (openRequest "utf16.txt") "utf16-window-a"
 
                     Vitest.expect(currentInfo.Encoding).toEqual(Some "utf-16le")
                     Vitest.expect(currentInfo.EncodingWasChosen).toBe false
@@ -1434,12 +1409,12 @@ Vitest.describe (
                     Vitest.expect(currentInfo.ByteLength).toEqual(int64 currentBytes.Length)
                     Vitest.expect(pageHasChange first).toBe true
 
-                    let! closeResult = service.Close handle (context "close-utf16-window-a") |> Async.StartAsPromise
+                    let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-utf16-window-a")) |> Async.StartAsPromise
                     ignore (operationValue "Close" closeResult)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1450,16 +1425,15 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitBytes repository "umlauts.txt" [| 0x4B; 0xC3; 0xA4; 0x73; 0x65; 0x0A |]
                 do! writeBytes (NodePath.join [| repository; "umlauts.txt" |]) [| 0x4B; 0xC3; 0xA4; 0x73; 0x65; 0x21; 0x0A |]
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! opened = openedWithFirstPage service (openRequest "umlauts.txt") "umlauts-window-a"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! opened = openedWithFirstPage provider repo (openRequest "umlauts.txt") "umlauts-window-a"
                 let handle, _, currentInfo, firstPage = opened
                 Vitest.expect(currentInfo.Encoding).toEqual(Some "utf-8")
                 Vitest.expect(currentInfo.EncodingWasChosen).toBe false
                 Vitest.expect(pageHasChange firstPage).toBe true
-                let! closeResult = service.Close handle (context "close-umlauts-window-a") |> Async.StartAsPromise
+                let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-umlauts-window-a")) |> Async.StartAsPromise
                 ignore (operationValue "Close" closeResult)
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1470,15 +1444,14 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitBytes repository "legacy.txt" [| 0x63; 0x61; 0x66; 0xE9; 0x0A |]
                 do! writeBytes (NodePath.join [| repository; "legacy.txt" |]) [| 0x63; 0x61; 0x66; 0xE8; 0x0A |]
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! opened = openedWithFirstPage service (openRequest "legacy.txt") "legacy-window-a"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! opened = openedWithFirstPage provider repo (openRequest "legacy.txt") "legacy-window-a"
                 let handle, _, currentInfo, firstPage = opened
                 Vitest.expect(currentInfo.Encoding).toEqual(Some "windows-1252")
                 Vitest.expect(pageHasChange firstPage).toBe true
-                let! closeResult = service.Close handle (context "close-legacy-window-a") |> Async.StartAsPromise
+                let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-legacy-window-a")) |> Async.StartAsPromise
                 ignore (operationValue "Close" closeResult)
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1489,9 +1462,8 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitBytes repository "late.csv" (lateUmlautFile -1 -1)
                 do! writeBytes (NodePath.join [| repository; "late.csv" |]) (lateUmlautFile 100000 599980)
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! opened = openUntilReady service (openRequest "late.csv") "late-umlaut-open"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! opened = openUntilReady provider repo (openRequest "late.csv") "late-umlaut-open"
 
                 match opened with
                 | OpenDiffResult.NotDiffable(DiffBlocker.EncodingRequired(side, _, candidates)) ->
@@ -1499,7 +1471,7 @@ Vitest.describe (
                     Vitest.expect(candidates |> Array.map (fun candidate -> candidate.Encoding)).toEqual [| "utf-8"; "windows-1252" |]
                 | other -> failwith $"Expected EncodingRequired, got %A{other}."
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1512,8 +1484,8 @@ Vitest.describe (
                 do! writeBytes (NodePath.join [| repository; "token.csv" |]) (lateUmlautFile 100000 599980)
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! opened = openUntilReady service (openRequest "token.csv") "token-working-open"
+                    withSession repository (fun provider repo -> promise {
+                        let! opened = openUntilReady provider repo (openRequest "token.csv") "token-working-open"
 
                         let token =
                             match opened with
@@ -1523,7 +1495,7 @@ Vitest.describe (
                         do! commitBytes repository "token.csv" (lateUmlautFile 100000 599980)
                         let! head = revParse repository "HEAD"
                         let request = { revisionRequest "token.csv" head with Preparation = Some token }
-                        let! answer = openRaw service request "token-revision-open"
+                        let! answer = openRaw provider repo request "token-revision-open"
 
                         match answer with
                         | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.PreparationMismatch
@@ -1539,15 +1511,14 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitBytes repository "after.csv" (lateUmlautFile -1 -1)
                 do! writeBytes (NodePath.join [| repository; "after.csv" |]) (lateUmlautFile 450000 10)
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! handle, _, _, first = openedWithFirstPage service (openRequest "after.csv") "after-umlaut-window-a"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! handle, _, _, first = openedWithFirstPage provider repo (openRequest "after.csv") "after-umlaut-window-a"
                 let mutable cursor = first.NextCursor
                 let mutable failure = None
 
                 while failure.IsNone && cursor.IsSome do
                     let! result =
-                        service.ReadPage { Handle = handle; Cursor = cursor.Value; Background = false } (context "after-umlaut-page")
+                        executed (provider.TextDiff.ReadPage repo { Handle = handle; Cursor = cursor.Value; Background = false } (context "after-umlaut-page"))
                         |> Async.StartAsPromise
 
                     match result with
@@ -1563,7 +1534,7 @@ Vitest.describe (
                     Vitest.expect(error.DiffDetail.Value.Evidence.Contains "at byte 450000").toBe true
                 | None -> failwith "The session did not fail."
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1574,9 +1545,8 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitBytes repository "chosen.csv" (lateUmlautFile -1 -1)
                 do! writeBytes (NodePath.join [| repository; "chosen.csv" |]) (lateUmlautFile 100000 599980)
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
-                let! opened = openUntilReady service { openRequest "chosen.csv" with CurrentEncoding = Some "utf-8" } "chosen-utf8-open"
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
+                let! opened = openUntilReady provider repo { openRequest "chosen.csv" with CurrentEncoding = Some "utf-8" } "chosen-utf8-open"
 
                 match opened with
                 | OpenDiffResult.NotDiffable(DiffBlocker.Binary(side, evidence)) ->
@@ -1584,7 +1554,7 @@ Vitest.describe (
                     Vitest.expect(evidence.Contains "invalid utf-8").toBe true
                 | other -> failwith $"Expected a Binary blocker, got %A{other}."
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1599,10 +1569,9 @@ Vitest.describe (
                 do! runGitOk repository [| "add"; "--"; "large.txt" |]
                 do! runGitOk repository [| "commit"; "-q"; "-m"; "large text" |]
                 do! writePatternFile largePath largeSize "after-first-line" "unchanged-line-0123456789abcdef"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let started = performanceNow ()
-                let! opened = openedWithFirstPage service (openRequest "large.txt") "large-window-a"
+                let! opened = openedWithFirstPage provider repo (openRequest "large.txt") "large-window-a"
                 let elapsed = performanceNow () - started
                 let handle, _, _, first = opened
                 let! spoolSize = largestSpool (currentFixture ()).Supervisor.InstanceDirectory
@@ -1610,9 +1579,9 @@ Vitest.describe (
                 Vitest.expect(pageHasChange first).toBe true
                 Vitest.expect(spoolSize > 0L).toBe true
                 Vitest.expect(spoolSize < largeSize).toBe true
-                let! closeResult = service.Close handle (context "close-large-window-a") |> Async.StartAsPromise
+                let! closeResult = executed (provider.TextDiff.Close repo handle (context "close-large-window-a")) |> Async.StartAsPromise
                 ignore (operationValue "Close" closeResult)
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1625,13 +1594,12 @@ Vitest.describe (
                 let current = String.concat "" [| for index in 0 .. 4999 -> $"new-{index}\n" |]
                 do! commitText repository "changing.txt" previous
                 do! writeText (NodePath.join [| repository; "changing.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let! handle, _, _, first =
-                        openedWithFirstPage service (openRequest "changing.txt") "source-change-window-a"
+                        openedWithFirstPage provider repo (openRequest "changing.txt") "source-change-window-a"
 
                     let cursor =
                         first.NextCursor
@@ -1639,7 +1607,7 @@ Vitest.describe (
 
                     do! writeText (NodePath.join [| repository; "changing.txt" |]) (current + "changed-after-open\n")
                     let! result =
-                        service.ReadPage { Handle = handle; Cursor = cursor; Background = false } (context "source-change-read-window-a")
+                        executed (provider.TextDiff.ReadPage repo { Handle = handle; Cursor = cursor; Background = false } (context "source-change-read-window-a"))
                         |> Async.StartAsPromise
 
                     match result with
@@ -1649,7 +1617,7 @@ Vitest.describe (
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1661,28 +1629,27 @@ Vitest.describe (
                 let previous, current = denseDiffText 3000 1000
                 do! commitText repository "memory.txt" previous
                 do! writeText (NodePath.join [| repository; "memory.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let directory = (currentFixture ()).Supervisor.InstanceDirectory
                 let mutable failure = None
 
                 try
                     // A disk session writes its spool and stores into the worker folder, so the check below can fail.
-                    let! diskHandle, _, diskStorage = openForStorage service (openRequest "memory.txt") "memory-control-open"
+                    let! diskHandle, _, diskStorage = openForStorage provider repo (openRequest "memory.txt") "memory-control-open"
                     let! diskFiles = workerFiles directory
                     Vitest.expect(diskStorage).toEqual DiffStorage.OnDisk
                     Vitest.expect(diskFiles.Length > 0).toBe true
-                    let! controlClose = service.Close diskHandle (context "memory-control-close") |> Async.StartAsPromise
+                    let! controlClose = executed (provider.TextDiff.Close repo diskHandle (context "memory-control-close")) |> Async.StartAsPromise
                     ignore (operationValue "Close" controlClose)
 
                     let! before = workerFiles directory
                     let request = { openRequest "memory.txt" with Storage = memoryOnly 67108864L }
-                    let! handle, first, storage = openForStorage service request "memory-open"
+                    let! handle, first, storage = openForStorage provider repo request "memory-open"
                     Vitest.expect(storage).toEqual (DiffStorage.InMemory 67108864L)
                     let! afterOpen = workerFiles directory
                     Vitest.expect(filesAddedSince before afterOpen).toEqual Array.empty
 
-                    let! pages = readAllPages service handle first "memory-pages"
+                    let! pages = readAllPages provider repo handle first "memory-pages"
                     Vitest.expect(pages.Length > 1).toBe true
                     let! afterPages = workerFiles directory
                     Vitest.expect(filesAddedSince before afterPages).toEqual Array.empty
@@ -1692,17 +1659,17 @@ Vitest.describe (
                         |> Array.tryHead
                         |> Option.defaultWith (fun () -> failwith "The fixture has no equal gap.")
 
-                    let! expanded = expandReady service handle gap.GapId true 5 "memory-expand"
+                    let! expanded = expandReady provider repo handle gap.GapId true 5 "memory-expand"
                     Vitest.expect((expandedPreviousLines expanded).Length).toBe 5
                     let! afterExpansion = workerFiles directory
                     Vitest.expect(filesAddedSince before afterExpansion).toEqual Array.empty
 
-                    let! memoryClose = service.Close handle (context "memory-close") |> Async.StartAsPromise
+                    let! memoryClose = executed (provider.TextDiff.Close repo handle (context "memory-close")) |> Async.StartAsPromise
                     ignore (operationValue "Close" memoryClose)
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1714,19 +1681,18 @@ Vitest.describe (
                 let previous, current = denseDiffText 6000 0
                 do! commitText repository "budget.txt" previous
                 do! writeText (NodePath.join [| repository; "budget.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let request = { openRequest "budget.txt" with Storage = memoryOnly 1048576L }
-                    let! handle, first, _ = openForStorage service request "budget-open"
+                    let! handle, first, _ = openForStorage provider repo request "budget-open"
                     let mutable cursor = first.NextCursor
                     let mutable pagesRead = 1
                     let mutable refusal = None
 
                     while refusal.IsNone && cursor.IsSome && pagesRead < 100 do
-                        let! result = readPageRaw service handle cursor.Value false $"budget-read-{pagesRead}"
+                        let! result = readPageRaw provider repo handle cursor.Value false $"budget-read-{pagesRead}"
 
                         match result with
                         | Succeeded outcome ->
@@ -1740,12 +1706,12 @@ Vitest.describe (
                     | None -> failwith $"No page was refused within {pagesRead} pages."
 
                     Vitest.expect(pagesRead > 1).toBe true
-                    let! replayed = service.ReplayPage { Handle = handle; PageId = first.PageId } (context "budget-replay") |> Async.StartAsPromise
+                    let! replayed = executed (provider.TextDiff.ReplayPage repo { Handle = handle; PageId = first.PageId } (context "budget-replay")) |> Async.StartAsPromise
                     Vitest.expect(operationValue "ReplayPage" replayed).toEqual first
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1757,26 +1723,25 @@ Vitest.describe (
                 let previous, current = denseDiffText 6000 0
                 do! commitText repository "background.txt" previous
                 do! writeText (NodePath.join [| repository; "background.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
                     let request = { openRequest "background.txt" with Storage = memoryOnly 1048576L }
-                    let! handle, first, _ = openForStorage service request "background-open"
+                    let! handle, first, _ = openForStorage provider repo request "background-open"
                     let mutable cursor = first.NextCursor
                     let mutable pagesRead = 1
                     let mutable stopped = false
 
                     while not stopped && cursor.IsSome && pagesRead < 100 do
-                        let! background = readPageRaw service handle cursor.Value true $"background-read-{pagesRead}"
+                        let! background = readPageRaw provider repo handle cursor.Value true $"background-read-{pagesRead}"
 
                         match background with
                         | Succeeded outcome ->
                             cursor <- advanceCursor outcome
                             pagesRead <- pagesRead + 1
                         | Failed failed when failed.Code = TextDiffFailureCodes.MemoryBudgetReached ->
-                            let! user = readPageRaw service handle cursor.Value false $"background-user-read-{pagesRead}"
+                            let! user = readPageRaw provider repo handle cursor.Value false $"background-user-read-{pagesRead}"
 
                             match user with
                             | Succeeded _ -> stopped <- true
@@ -1787,7 +1752,7 @@ Vitest.describe (
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1799,10 +1764,9 @@ Vitest.describe (
                 let previous = String.replicate 45455 "0123456789\n"
                 do! commitText repository "huge.txt" previous
                 do! writeText (NodePath.join [| repository; "huge.txt" |]) "changed\n"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let request = { openRequest "huge.txt" with Storage = memoryOnly 1048576L }
-                let! opened = openUntilReady service request "huge-open"
+                let! opened = openUntilReady provider repo request "huge-open"
 
                 match opened with
                 | OpenDiffResult.NotDiffable(DiffBlocker.BlobTooLargeForMemory(side, blobBytes, limitBytes)) ->
@@ -1811,7 +1775,7 @@ Vitest.describe (
                     Vitest.expect(limitBytes).toEqual (448L * 1024L)
                 | other -> failwith $"Expected BlobTooLargeForMemory, got %A{other}."
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1822,14 +1786,13 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitText repository "low-space.txt" "before\n"
                 do! writeText (NodePath.join [| repository; "low-space.txt" |]) "after\n"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let oneExbibyte = 1152921504606846976L
                 let request = { openRequest "low-space.txt" with Storage = DiffStoragePolicy.PreferDisk(oneExbibyte, 67108864L) }
-                let! _, first, storage = openForStorage service request "low-space-open"
+                let! _, first, storage = openForStorage provider repo request "low-space-open"
                 Vitest.expect(storage).toEqual (DiffStorage.InMemory 67108864L)
                 Vitest.expect(pageHasChange first).toBe true
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -1849,13 +1812,12 @@ Vitest.describe (
 
                 setFree 1000000000000L
                 let! pool = freeSpacePool freeFile
-                let session = createSession pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository pool repository
                 let mutable failure = None
 
                 try
                     let request = { openRequest "space.txt" with Storage = DiffStoragePolicy.PreferDisk(minimumFree, 67108864L) }
-                    let! handle, first, storage = openForStorage service request "space-open"
+                    let! handle, first, storage = openForStorage provider repo request "space-open"
                     Vitest.expect(storage).toEqual DiffStorage.OnDisk
                     let cursor = first.NextCursor.Value
 
@@ -1863,18 +1825,18 @@ Vitest.describe (
                     // reading for a second, so the new value counts after a wait.
                     setFree (minimumFree + 1024L)
                     do! delay 1100
-                    let! refused = readPageRaw service handle cursor false "space-low"
+                    let! refused = readPageRaw provider repo handle cursor false "space-low"
 
                     match refused with
                     | Failed failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.TempSpaceLow
                     | other -> failwith $"Expected diff_temp_space_low, got %A{other}."
 
-                    let! replayed = service.ReplayPage { Handle = handle; PageId = first.PageId } (context "space-replay") |> Async.StartAsPromise
+                    let! replayed = executed (provider.TextDiff.ReplayPage repo { Handle = handle; PageId = first.PageId } (context "space-replay")) |> Async.StartAsPromise
                     Vitest.expect(operationValue "ReplayPage" replayed).toEqual first
 
                     setFree 1000000000000L
                     do! delay 1100
-                    let! second = readPageReady service handle cursor "space-recovered"
+                    let! second = readPageReady provider repo handle cursor "space-recovered"
                     let firstLines = previousLines first
                     let secondLines = previousLines second
                     Vitest.expect(secondLines.Length > 0).toBe true
@@ -1889,7 +1851,7 @@ Vitest.describe (
                 let mutable closeFailure = None
 
                 try
-                    do! closeSession session failure
+                    do! closeRepository provider repo failure
                 with error ->
                     closeFailure <- Some error
 
@@ -1909,8 +1871,7 @@ Vitest.describe (
                 let previous, current = denseDiffText 20000 0
                 do! commitText repository "blob-budget.txt" previous
                 do! writeText (NodePath.join [| repository; "blob-budget.txt" |]) current
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let mutable failure = None
 
                 try
@@ -1920,20 +1881,20 @@ Vitest.describe (
                     // counts. The budget of the second session has room for the blob, so its diff ends.
                     let budget = 2620000L
                     let tight = { openRequest "blob-budget.txt" with Storage = memoryOnly budget }
-                    let! servedTight, refusal, _ = readUserPages service tight "blob-tight"
+                    let! servedTight, refusal, _ = readUserPages provider repo tight "blob-tight"
 
                     match refusal with
                     | Some failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.MemoryBudgetReached
                     | None -> failwith $"No page was refused within {servedTight} pages."
 
                     let roomy = { tight with Storage = memoryOnly (budget + blobBytes) }
-                    let! _, roomyFailure, ended = readUserPages service roomy "blob-roomy"
+                    let! _, roomyFailure, ended = readUserPages provider repo roomy "blob-roomy"
                     Vitest.expect(roomyFailure.IsNone).toBe true
                     Vitest.expect(ended).toBe true
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -1944,24 +1905,29 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitText repository "close-all.txt" "before\n"
                 do! writeText (NodePath.join [| repository; "close-all.txt" |]) "after\n"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let! firstHandle, _, _, first =
-                    openedWithFirstPage service (openRequest "close-all.txt") "close-all-window-a-open"
+                    openedWithFirstPage provider repo (openRequest "close-all.txt") "close-all-window-a-open"
                 let! secondHandle, _, _, _ =
-                    openedWithFirstPage service (openRequest "close-all.txt") "close-all-window-b-open"
+                    openedWithFirstPage provider repo (openRequest "close-all.txt") "close-all-window-b-open"
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
 
                 let! firstRead =
-                    service.ReadPage
-                        { Handle = firstHandle; Cursor = first.NextCursor |> Option.defaultValue "closed"; Background = false }
-                        (context "close-all-window-a-read")
+                    executed (
+                        provider.TextDiff.ReadPage
+                            repo
+                            { Handle = firstHandle; Cursor = first.NextCursor |> Option.defaultValue "closed"; Background = false }
+                            (context "close-all-window-a-read")
+                    )
                     |> Async.StartAsPromise
                 let! secondRead =
-                    service.ReadPage
-                        { Handle = secondHandle; Cursor = "closed"; Background = false }
-                        (context "close-all-window-b-read")
+                    executed (
+                        provider.TextDiff.ReadPage
+                            repo
+                            { Handle = secondHandle; Cursor = "closed"; Background = false }
+                            (context "close-all-window-b-read")
+                    )
                     |> Async.StartAsPromise
                 assertClosedCode "first handle" firstRead
                 assertClosedCode "second handle" secondRead
@@ -1975,23 +1941,25 @@ Vitest.describe (
                 let! repository = newRepository ()
                 do! commitText repository "idempotent.txt" "before\n"
                 do! writeText (NodePath.join [| repository; "idempotent.txt" |]) "after\n"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let! handle, _, _, first =
-                    openedWithFirstPage service (openRequest "idempotent.txt") "idempotent-window-a"
+                    openedWithFirstPage provider repo (openRequest "idempotent.txt") "idempotent-window-a"
 
-                let! firstClose = service.Close handle (context "idempotent-close-one") |> Async.StartAsPromise
-                let! secondClose = service.Close handle (context "idempotent-close-two") |> Async.StartAsPromise
+                let! firstClose = executed (provider.TextDiff.Close repo handle (context "idempotent-close-one")) |> Async.StartAsPromise
+                let! secondClose = executed (provider.TextDiff.Close repo handle (context "idempotent-close-two")) |> Async.StartAsPromise
                 ignore (operationValue "first Close" firstClose)
                 ignore (operationValue "second Close" secondClose)
 
                 let! later =
-                    service.ReadPage
-                        { Handle = handle; Cursor = first.NextCursor |> Option.defaultValue "closed"; Background = false }
-                        (context "idempotent-read")
+                    executed (
+                        provider.TextDiff.ReadPage
+                            repo
+                            { Handle = handle; Cursor = first.NextCursor |> Option.defaultValue "closed"; Background = false }
+                            (context "idempotent-read")
+                    )
                     |> Async.StartAsPromise
                 assertClosedCode "read after Close" later
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -2010,25 +1978,24 @@ Vitest.describe (
                     calls.Value <- calls.Value + 1
                     Promise.lift (if calls.Value = 1 then None else Some (currentFixture ()).Pool)
 
-                let session = createSessionWithPoolGetter getPool repository
-                let service = serviceFor session
+                let! provider, repo = openRepositoryWithPoolGetter getPool repository
                 let mutable failure = None
 
                 try
-                    let! firstOpen = service.Open (openRequest "late-pool.txt") (context "late-pool-open-one") |> Async.StartAsPromise
+                    let! firstOpen = executed (provider.TextDiff.Open repo (openRequest "late-pool.txt") (context "late-pool-open-one")) |> Async.StartAsPromise
 
                     match firstOpen with
                     | Failed failed -> Vitest.expect(failed.Code).toBe TextDiffFailureCodes.WorkerFailed
                     | Succeeded _
                     | PartiallySucceeded _ -> failwith "The first Open succeeded without a pool."
 
-                    let! _, _, _, first = openedWithFirstPage service (openRequest "late-pool.txt") "late-pool-open-two"
+                    let! _, _, _, first = openedWithFirstPage provider repo (openRequest "late-pool.txt") "late-pool-open-two"
                     Vitest.expect(pageHasChange first).toBe true
                     Vitest.expect(calls.Value).toBe 2
                 with error ->
                     failure <- Some error
 
-                do! closeSession session failure
+                do! closeRepository provider repo failure
             }
         )
 
@@ -2043,10 +2010,9 @@ Vitest.describe (
                 do! runGitOk repository [| "add"; "--"; "termination.txt" |]
                 do! runGitOk repository [| "commit"; "-q"; "-m"; "termination source" |]
                 do! writePatternFile filePath size "after-first-line" "termination-line-0123456789abcdef"
-                let session = createSession (currentFixture ()).Pool repository
-                let service = serviceFor session
+                let! provider, repo = openRepository (currentFixture ()).Pool repository
                 let! handle, _, _, first =
-                    openedWithFirstPage service (openRequest "termination.txt") "terminate-window-a"
+                    openedWithFirstPage provider repo (openRequest "termination.txt") "terminate-window-a"
                 let cursor =
                     first.NextCursor
                     |> Option.defaultWith (fun () -> failwith "The termination fixture produced one complete page.")
@@ -2056,7 +2022,7 @@ Vitest.describe (
                 let eventStart = (currentFixture ()).Events.Count
                 let started = performanceNow ()
                 let reading =
-                    service.ReadPage { Handle = handle; Cursor = cursor; Background = false } (context "terminate-read-window-a")
+                    executed (provider.TextDiff.ReadPage repo { Handle = handle; Cursor = cursor; Background = false } (context "terminate-read-window-a"))
                     |> Async.StartAsPromise
 
                 do! delay 25
@@ -2075,7 +2041,7 @@ Vitest.describe (
                     waitFor "the terminated worker directory cleanup" 10000.0 (fun () ->
                         Promise.lift (hasWorkerDirectoryDeletedSince (currentFixture ()).Events eventStart))
 
-                do! session.Close() |> Async.StartAsPromise
+                do! provider.Close repo |> Async.StartAsPromise
             }
         )
 
@@ -2094,8 +2060,8 @@ Vitest.describe (
                 do! writeText (NodePath.join [| repository; "f.txt" |]) "working only\n"
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! previous, current, pages = revisionDiff service (revisionRequest "f.txt" commit2) "revision-a"
+                    withSession repository (fun provider repo -> promise {
+                        let! previous, current, pages = revisionDiff provider repo (revisionRequest "f.txt" commit2) "revision-a"
                         let changed = changedRows pages
                         let previousTexts = changed |> Array.choose (fun (_, p, _) -> p)
                         let currentTexts = changed |> Array.choose (fun (_, _, c) -> c)
@@ -2129,8 +2095,8 @@ Vitest.describe (
                 do! commitText repository "root.txt" "later\n"
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! previous, current, pages = revisionDiff service (revisionRequest "root.txt" root) "revision-b"
+                    withSession repository (fun provider repo -> promise {
+                        let! previous, current, pages = revisionDiff provider repo (revisionRequest "root.txt" root) "revision-b"
                         Vitest.expect(previous.IsAbsent).toBe true
                         Vitest.expect(previous.Revision).toEqual None
                         Vitest.expect(previous.ByteLength).toEqual 0L
@@ -2155,14 +2121,14 @@ Vitest.describe (
                 let! removed = revParse repository "HEAD"
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! previous, current, pages = revisionDiff service (revisionRequest "new.txt" added) "revision-c-added"
+                    withSession repository (fun provider repo -> promise {
+                        let! previous, current, pages = revisionDiff provider repo (revisionRequest "new.txt" added) "revision-c-added"
                         Vitest.expect(previous.IsAbsent).toBe true
                         Vitest.expect(current.IsAbsent).toBe false
                         Vitest.expect(revisionText current).toEqual (Some added)
                         Vitest.expect(changedRows pages |> Array.choose (fun (_, _, c) -> c)).toEqual [| "n1"; "n2" |]
 
-                        let! previous, current, pages = revisionDiff service (revisionRequest "new.txt" removed) "revision-c-removed"
+                        let! previous, current, pages = revisionDiff provider repo (revisionRequest "new.txt" removed) "revision-c-removed"
                         Vitest.expect(previous.IsAbsent).toBe false
                         Vitest.expect(current.IsAbsent).toBe true
                         Vitest.expect(revisionText previous).toEqual (Some added)
@@ -2191,8 +2157,8 @@ Vitest.describe (
                 Vitest.expect(firstParent <> secondParent).toBe true
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! previous, current, pages = revisionDiff service (revisionRequest "f.txt" merge) "revision-d"
+                    withSession repository (fun provider repo -> promise {
+                        let! previous, current, pages = revisionDiff provider repo (revisionRequest "f.txt" merge) "revision-d"
                         // Against the first parent f.txt changes base -> side. Against the second parent it would not change.
                         Vitest.expect(revisionText previous).toEqual (Some firstParent)
                         Vitest.expect(revisionText current).toEqual (Some merge)
@@ -2217,9 +2183,9 @@ Vitest.describe (
                 let! renamed = revParse repository "HEAD"
 
                 do!
-                    withSession repository (fun service -> promise {
+                    withSession repository (fun provider repo -> promise {
                         let request = { revisionRequest "new.txt" renamed with PreviousPath = Some(path "old.txt") }
-                        let! previous, current, pages = revisionDiff service request "revision-e"
+                        let! previous, current, pages = revisionDiff provider repo request "revision-e"
                         Vitest.expect(RepositoryPath.value previous.Path).toBe "old.txt"
                         Vitest.expect(RepositoryPath.value current.Path).toBe "new.txt"
                         Vitest.expect(revisionText previous).toEqual (Some parent)
@@ -2228,7 +2194,7 @@ Vitest.describe (
                         Vitest.expect(changed |> Array.choose (fun (_, _, c) -> c)).toEqual [| "2" |]
 
                         // Without the previous path the parent has no new.txt, so the whole file is added.
-                        let! withoutPrevious, _, pagesWithout = revisionDiff service (revisionRequest "new.txt" renamed) "revision-e-no-previous"
+                        let! withoutPrevious, _, pagesWithout = revisionDiff provider repo (revisionRequest "new.txt" renamed) "revision-e-no-previous"
                         Vitest.expect(withoutPrevious.IsAbsent).toBe true
                         Vitest.expect(changedRows pagesWithout |> Array.choose (fun (_, _, c) -> c)).toEqual [| "one"; "2"; "three" |]
                     })
@@ -2250,10 +2216,10 @@ Vitest.describe (
                 let! currentSide = revParse repository "HEAD"
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! blockedPrevious = openBlocker service (revisionRequest "pointer-previous.bin" previousSide) "revision-f-previous"
+                    withSession repository (fun provider repo -> promise {
+                        let! blockedPrevious = openBlocker provider repo (revisionRequest "pointer-previous.bin" previousSide) "revision-f-previous"
                         Vitest.expect(blockedPrevious).toEqual (DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some oid))
-                        let! blockedCurrent = openBlocker service (revisionRequest "pointer-current.bin" currentSide) "revision-f-current"
+                        let! blockedCurrent = openBlocker provider repo (revisionRequest "pointer-current.bin" currentSide) "revision-f-current"
                         Vitest.expect(blockedCurrent).toEqual (DiffBlocker.LocalContentUnavailable(DiffSide.Current, Some oid))
                     })
             }
@@ -2276,8 +2242,8 @@ Vitest.describe (
                 do! writeText (lfsObjectFile repository newOid) newContent
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! previous, current, pages = revisionDiff service (revisionRequest "data.bin" commit2) "revision-f-present"
+                    withSession repository (fun provider repo -> promise {
+                        let! previous, current, pages = revisionDiff provider repo (revisionRequest "data.bin" commit2) "revision-f-present"
                         let changed = changedRows pages
                         Vitest.expect(changed |> Array.choose (fun (_, p, _) -> p)).toEqual [| "lfs line two" |]
                         Vitest.expect(changed |> Array.choose (fun (_, _, c) -> c)).toEqual [| "lfs line 2 changed" |]
@@ -2301,14 +2267,14 @@ Vitest.describe (
                 let! fromBinary = revParse repository "HEAD"
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! current = openBlocker service (revisionRequest "b.dat" toBinary) "revision-g-current"
+                    withSession repository (fun provider repo -> promise {
+                        let! current = openBlocker provider repo (revisionRequest "b.dat" toBinary) "revision-g-current"
 
                         match current with
                         | DiffBlocker.Binary(side, _) -> Vitest.expect(side).toEqual DiffSide.Current
                         | other -> failwith $"Expected Binary on the current side, got %A{other}."
 
-                        let! previous = openBlocker service (revisionRequest "b.dat" fromBinary) "revision-g-previous"
+                        let! previous = openBlocker provider repo (revisionRequest "b.dat" fromBinary) "revision-g-previous"
 
                         match previous with
                         | DiffBlocker.Binary(side, _) -> Vitest.expect(side).toEqual DiffSide.Previous
@@ -2330,11 +2296,11 @@ Vitest.describe (
                 do! writeText workingPath (numberedLines "working" 1200)
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! handle, _, _, first = openedWithFirstPage service (revisionRequest "open.txt" commit2) "revision-h"
+                    withSession repository (fun provider repo -> promise {
+                        let! handle, _, _, first = openedWithFirstPage provider repo (revisionRequest "open.txt" commit2) "revision-h"
                         let cursor = first.NextCursor |> Option.defaultWith (fun () -> failwith "One complete page only.")
                         do! writeText workingPath (numberedLines "working" 1200 + "edited after open\n")
-                        let! afterEdit = readPageRaw service handle cursor false "revision-h-edited"
+                        let! afterEdit = readPageRaw provider repo handle cursor false "revision-h-edited"
 
                         match afterEdit with
                         | Succeeded outcome ->
@@ -2342,7 +2308,7 @@ Vitest.describe (
                             do! removeWorkingFile repository "open.txt"
 
                             while next.IsSome do
-                                let! result = readPageRaw service handle next.Value false "revision-h-deleted"
+                                let! result = readPageRaw provider repo handle next.Value false "revision-h-deleted"
 
                                 match result with
                                 | Succeeded outcome -> next <- advanceCursor outcome
@@ -2351,7 +2317,7 @@ Vitest.describe (
                         | Failed failure -> failwith $"ReadPage failed after the working file was edited: {failure.Code}"
                         | PartiallySucceeded _ -> failwith "ReadPage returned partial success."
 
-                        let! closed = service.Close handle (context "revision-h-close") |> Async.StartAsPromise
+                        let! closed = executed (provider.TextDiff.Close repo handle (context "revision-h-close")) |> Async.StartAsPromise
                         ignore (operationValue "Close" closed)
                     })
             }
@@ -2368,11 +2334,11 @@ Vitest.describe (
                 do! writeText workingPath (numberedLines "working" 1200)
 
                 do!
-                    withSession repository (fun service -> promise {
-                        let! handle, _, _, first = openedWithFirstPage service (openRequest "open.txt") "revision-h-control"
+                    withSession repository (fun provider repo -> promise {
+                        let! handle, _, _, first = openedWithFirstPage provider repo (openRequest "open.txt") "revision-h-control"
                         let cursor = first.NextCursor |> Option.defaultWith (fun () -> failwith "One complete page only.")
                         do! writeText workingPath (numberedLines "working" 1200 + "edited after open\n")
-                        let! result = readPageRaw service handle cursor false "revision-h-control-read"
+                        let! result = readPageRaw provider repo handle cursor false "revision-h-control-read"
 
                         match result with
                         | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.SourceChanged
@@ -2393,19 +2359,19 @@ Vitest.describe (
                 do! removeWorkingFile repository "mem.txt"
 
                 do!
-                    withSession repository (fun service -> promise {
+                    withSession repository (fun provider repo -> promise {
                         let request = { revisionRequest "mem.txt" commit2 with Storage = memoryOnly 67108864L }
-                        let! handle, first, storage = openForStorage service request "revision-i"
+                        let! handle, first, storage = openForStorage provider repo request "revision-i"
 
                         match storage with
                         | DiffStorage.InMemory _ -> ()
                         | other -> failwith $"Expected in-memory storage, got %A{other}."
 
-                        let! pages = readAllPages service handle first "revision-i-pages"
+                        let! pages = readAllPages provider repo handle first "revision-i-pages"
                         Vitest.expect(pages.Length > 1).toBe true
                         Vitest.expect(pages[pages.Length - 1].OutputComplete).toBe true
                         Vitest.expect(pages |> Array.exists pageHasChange).toBe true
-                        let! closed = service.Close handle (context "revision-i-close") |> Async.StartAsPromise
+                        let! closed = executed (provider.TextDiff.Close repo handle (context "revision-i-close")) |> Async.StartAsPromise
                         ignore (operationValue "Close" closed)
                     })
             }
@@ -2421,7 +2387,7 @@ Vitest.describe (
                 let! blob = revParse repository "HEAD:f.txt"
 
                 do!
-                    withSession repository (fun service -> promise {
+                    withSession repository (fun provider repo -> promise {
                         let candidates = [|
                             "missing object", String.replicate 40 "a"
                             "blob object", blob
@@ -2432,7 +2398,7 @@ Vitest.describe (
                         |]
 
                         for label, revision in candidates do
-                            let! answer = openRaw service (revisionRequest "f.txt" revision) ("revision-j-" + label)
+                            let! answer = openRaw provider repo (revisionRequest "f.txt" revision) ("revision-j-" + label)
 
                             match answer with
                             | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.ReadFailed

@@ -6,12 +6,15 @@ open Fable.Core.JsInterop
 open VersionControlService.Abstractions
 open VersionControlService.Tests.Contracts
 open VersionControlService.Tests.Contracts.ProviderHarness
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open VersionControlService.Tests.NodePath
 open Vitest
 
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module GitEngineTypes = VersionControlService.Git.GitEngineTypes
+module GitProvider = VersionControlService.Git.GitProvider
+module GitProviderOptions = VersionControlService.Git.GitProviderOptions
 module GitService = VersionControlService.Git.GitService
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
@@ -73,7 +76,7 @@ let private tryReadUtf8FileAsync (path: string) : JS.Promise<string option> = pr
         return None
 }
 
-/// Captures raw bytes as base64 so adoption tests can assert Git configuration
+/// Captures raw bytes as base64 so open tests can assert Git configuration
 /// is untouched, rather than merely textually equivalent.
 let private readFileBase64Async (path: string) : JS.Promise<string> = promise {
     let! bytes = fsPromisesDynamic?readFile (path) |> unbox<JS.Promise<obj>>
@@ -158,7 +161,7 @@ let private clearProcessEnvironment (_name: string) : unit = jsNative
 """)>]
 let private injectDelayedTaskkillSpawn () : (unit -> unit) = jsNative
 
-/// Direct git invocation for harness fixture work (never through the session).
+/// Direct git invocation for harness fixture work (never through the provider).
 let private runGitIn
     (cwd: string)
     (environment: (string * string)[])
@@ -214,6 +217,20 @@ let private gitProviderId =
     match ProviderId.tryCreate "git" with
     | Ok providerId -> providerId
     | Error message -> failwith message
+
+/// Opens the folder through the provider and returns the repository.
+let private openFolder
+    (provider: IVersionControl)
+    (root: string)
+    (profile: string option)
+    (name: string)
+    : JS.Promise<Repository> =
+    promise {
+        let! result =
+            run (executed (provider.Open { RepositoryRoot = root; ConnectionProfileId = profile } (ctx name)))
+
+        return expectValue name result
+    }
 
 type private WorkspaceBarriers = {
     BarePath: string
@@ -326,7 +343,7 @@ let createGitHarness () : ProviderTestHarness =
                 })
     }
 
-    let factory = GitWorkspaceSession.createFactory hooks
+    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
     let locationFor (barePath: string) (profile: string option) : RepositoryLocation = {
         ProviderId = gitProviderId
@@ -335,37 +352,22 @@ let createGitHarness () : ProviderTestHarness =
         ConnectionProfileId = profile
     }
 
-    let bindingFor (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = gitProviderId
-        RepositoryRoot = workspaceRoot
-        ProviderStateRef = None
-        Location = location
-        ConnectionProfileId = location.ConnectionProfileId
-    }
+    let openHarnessWorkspace (workspaceRoot: string) (profile: string option) (barePath: string) = promise {
+        let! repository = openFolder provider workspaceRoot profile "git-harness-open"
 
-    let openHarnessWorkspace (binding: WorkspaceBinding) (barePath: string) = promise {
-        let! openResult =
-            Async.StartAsPromise(factory.Open binding (OperationContext.detached "git-harness-open"))
-
-        let session =
-            match openResult with
-            | Succeeded outcome -> outcome.Value
-            | PartiallySucceeded _
-            | Failed _ -> failwith "The Git factory failed to open a session."
-
-        barriersByRoot[binding.RepositoryRoot] <- {
+        // The hooks see the root the repository reports, so the barriers are keyed by that root.
+        barriersByRoot[repository.Descriptor.RepositoryRoot] <- {
             BarePath = barePath
             RaceMutations = None
             SlowTransfer = false
         }
 
         return {
-            Session = session
-            Binding = binding
-            WriteFile = fun path content -> writeUtf8FileAsync (join [| binding.RepositoryRoot; path |]) content
-            ReadFile = fun path -> tryReadUtf8FileAsync (join [| binding.RepositoryRoot; path |])
-            RemoveFile = fun path -> removeFileAsync (join [| binding.RepositoryRoot; path |])
+            Provider = provider
+            Repository = repository
+            WriteFile = fun path content -> writeUtf8FileAsync (join [| workspaceRoot; path |]) content
+            ReadFile = fun path -> tryReadUtf8FileAsync (join [| workspaceRoot; path |])
+            RemoveFile = fun path -> removeFileAsync (join [| workspaceRoot; path |])
             // Windows and macOS default filesystems alias case, and only Windows enforces its
             // reserved names. Linux runners do neither, so the flags follow the platform.
             LocalFileSystemAliasesCase = localFileSystemAliasesCase ()
@@ -389,15 +391,15 @@ let createGitHarness () : ProviderTestHarness =
         let! _ = runGitIn workPath [||] [| "remote"; "add"; "origin"; barePath |] None
         let! _ = runGitIn workPath [||] [| "push"; "-u"; "origin"; "main" |] None
 
-        let binding = bindingFor workPath (locationFor barePath (Some "default-profile"))
-        return! openHarnessWorkspace binding barePath
+        return! openHarnessWorkspace workPath (Some "default-profile") barePath
     }
 
     {
         Name = "Git"
-        Factory = factory
+        Provider = provider
         ExpectedServices = [
             "synchronization"
+            "text-diff"
             "conflicts"
             "materialization"
             "storage-policy"
@@ -431,7 +433,7 @@ let createGitHarness () : ProviderTestHarness =
                 let! root = createTempDirectoryAsync ()
                 tempRoots.Add root
                 let linkedPath = join [| root; "linked" |]
-                let barePath = anchor.Binding.Location.ProviderLocation
+                let barePath = (locationOf anchor).ProviderLocation
 
                 let! _ =
                     runGitIn
@@ -447,29 +449,20 @@ let createGitHarness () : ProviderTestHarness =
                         None
                 do! configureUser linkedPath
 
-                let location = {
-                    anchor.Binding.Location with
-                        ConnectionProfileId = Some $"linked-profile-{nextId ()}"
-                }
-
-                let binding = bindingFor linkedPath location
-                return! openHarnessWorkspace binding barePath
+                return! openHarnessWorkspace linkedPath (Some $"linked-profile-{nextId ()}") barePath
             }
-        OpenSecondSession =
-            fun anchor -> promise {
-                let! openResult =
-                    Async.StartAsPromise(factory.Open anchor.Binding (OperationContext.detached "git-second-session"))
-
-                match openResult with
-                | Succeeded outcome -> return outcome.Value
-                | PartiallySucceeded _
-                | Failed _ -> return failwith "The Git factory failed to open a second session."
-            }
+        OpenSecondRepository =
+            fun anchor ->
+                openFolder
+                    provider
+                    anchor.Repository.Descriptor.RepositoryRoot
+                    (locationOf anchor).ConnectionProfileId
+                    "git-second-repository"
         AdvanceTarget =
-            fun workspace mutations -> advanceBare workspace.Binding.Location.ProviderLocation mutations
+            fun workspace mutations -> advanceBare (locationOf workspace).ProviderLocation mutations
         SeedRevisionOnNewRef =
             fun workspace refName files -> promise {
-                let workPath = workspace.Binding.RepositoryRoot
+                let workPath = workspace.Repository.Descriptor.RepositoryRoot
                 let! root = createTempDirectoryAsync ()
                 tempRoots.Add root
                 let indexPath = join [| root; "seed-index" |]
@@ -520,24 +513,24 @@ let createGitHarness () : ProviderTestHarness =
             }
         BreakPublish =
             fun workspace -> promise {
-                let barePath = workspace.Binding.Location.ProviderLocation
+                let barePath = (locationOf workspace).ProviderLocation
                 do! renameAsync barePath (barePath + ".offline")
                 return ()
             }
         RestorePublish =
             fun workspace -> promise {
-                let barePath = workspace.Binding.Location.ProviderLocation
+                let barePath = (locationOf workspace).ProviderLocation
                 do! renameAsync (barePath + ".offline") barePath
                 return ()
             }
         ArmDestinationRace =
             fun workspace mutations -> promise {
-                barriersByRoot[workspace.Binding.RepositoryRoot].RaceMutations <- Some mutations
+                barriersByRoot[workspace.Repository.Descriptor.RepositoryRoot].RaceMutations <- Some mutations
                 return ()
             }
         ArmSlowTransfer =
             fun workspace -> promise {
-                barriersByRoot[workspace.Binding.RepositoryRoot].SlowTransfer <- true
+                barriersByRoot[workspace.Repository.Descriptor.RepositoryRoot].SlowTransfer <- true
                 return ()
             }
         Cleanup =
@@ -658,7 +651,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
 
-                    let! trackedBranches = expectGitBranches workspace.Binding.RepositoryRoot
+                    let! trackedBranches = expectGitBranches workspace.Repository.Descriptor.RepositoryRoot
                     let trackedLocal = trackedBranches |> Array.find (fun branch -> branch.RefName = "main")
                     let trackedRemote = trackedBranches |> Array.find (fun branch -> branch.RefName = "origin/main")
 
@@ -669,12 +662,12 @@ Vitest.describe (
 
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "branch"; "--unset-upstream" |]
                             None
 
-                    let! untrackedBranches = expectGitBranches workspace.Binding.RepositoryRoot
+                    let! untrackedBranches = expectGitBranches workspace.Repository.Descriptor.RepositoryRoot
                     let untrackedLocal = untrackedBranches |> Array.find (fun branch -> branch.RefName = "main")
                     let untrackedRemote = untrackedBranches |> Array.find (fun branch -> branch.RefName = "origin/main")
 
@@ -685,12 +678,12 @@ Vitest.describe (
 
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "checkout"; "--detach" |]
                             None
 
-                    let! detachedBranches = expectGitBranches workspace.Binding.RepositoryRoot
+                    let! detachedBranches = expectGitBranches workspace.Repository.Descriptor.RepositoryRoot
                     let detachedLocal = detachedBranches |> Array.find (fun branch -> branch.RefName = "main")
                     let detachedRemote = detachedBranches |> Array.find (fun branch -> branch.RefName = "origin/main")
 
@@ -718,7 +711,8 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "configured-target-ref")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "configured-target-ref")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "configured target status" statusResult
@@ -748,7 +742,7 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "remote"; "rename"; "origin"; "backup" |]
                             None
@@ -762,11 +756,11 @@ Vitest.describe (
                         |]
 
                     let synchronization =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+                        workspace.Provider.Synchronization
 
                     let! refreshResult =
-                        synchronization.Refresh(OperationContext.detached "refresh-configured-remote")
+                        synchronization.Refresh workspace.Repository (OperationContext.detached "refresh-configured-remote")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectProviderValue "refresh configured upstream remote" refreshResult
@@ -806,16 +800,17 @@ Vitest.describe (
 
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "branch"; "--set-upstream-to=integration"; "main" |]
                             None
 
                     let! expectedTargetRevision =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "rev-parse"; "refs/heads/integration" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "rev-parse"; "refs/heads/integration" |] None
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "local-upstream-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "local-upstream-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "local upstream status" statusResult
@@ -834,11 +829,11 @@ Vitest.describe (
                     Vitest.expect(synchronization.Relationship).toEqual TargetAhead
 
                     let refresh =
-                        workspace.Session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+                        workspace.Provider.Synchronization
 
                     let! refreshResult =
-                        refresh.Refresh(OperationContext.detached "refresh-local-upstream")
+                        refresh.Refresh workspace.Repository (OperationContext.detached "refresh-local-upstream")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let refreshed = expectProviderValue "refresh local upstream" refreshResult
@@ -859,10 +854,11 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "branch"; "--unset-upstream" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "branch"; "--unset-upstream" |] None
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "missing-target-ref")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "missing-target-ref")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "missing target status" statusResult
@@ -890,10 +886,11 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "checkout"; "--detach" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "checkout"; "--detach" |] None
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "detached-target-ref")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "detached-target-ref")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "detached target status" statusResult
@@ -935,40 +932,39 @@ Vitest.describe (
                             }
                     }
 
-                    let factory =
-                        GitWorkspaceSession.createFactoryWithCredentialsAndIdentity
-                            GitWorkspaceSession.GitSessionHooks.none
-                            GitCredentialStrategy.anonymous
-                            identity
+                    let provider = GitProvider.create { GitProviderOptions.defaults with RevisionIdentity = identity }
 
-                    let! sessionResult =
-                        factory.Open workspace.Binding (OperationContext.detached "revision-identity-open")
-                        |> Async.StartAsPromise
-
-                    let session = expectProviderValue "revision identity open" sessionResult
+                    let! repository =
+                        openFolder
+                            provider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "revision-identity-open"
 
                     do! workspace.WriteFile "revision-identity.txt" "identity content\n"
                     let! status =
-                        session.Core.GetStatus(OperationContext.detached "revision-identity-status")
+                        provider.GetStatus repository (OperationContext.detached "revision-identity-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "revision identity status" status
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: revision identity"
                                 Paths = [| mkRepositoryPath "revision-identity.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "revision-identity-create")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "revision identity create" revisionResult |> ignore
 
                     let! commitIdentity =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
                             None
@@ -999,55 +995,55 @@ Vitest.describe (
                             }
                     }
 
-                    let createRevision (binding: WorkspaceBinding) (name: string) = promise {
-                        let session =
-                            GitWorkspaceSession.createSessionWithCredentialsAndIdentity
-                                GitWorkspaceSession.GitSessionHooks.none
-                                GitCredentialStrategy.anonymous
-                                identity
-                                binding
+                    let provider = GitProvider.create { GitProviderOptions.defaults with RevisionIdentity = identity }
 
+                    let createRevisionIn (repository: Repository) (name: string) = promise {
                         do! workspace.WriteFile $"{name}.txt" $"{name} content\n"
 
                         let! status =
-                            session.Core.GetStatus(OperationContext.detached $"{name}-status")
+                            provider.GetStatus repository (OperationContext.detached $"{name}-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue $"{name} status" status
 
                         let! revisionResult =
-                            session.Core.CreateRevision
+                            provider.CreateRevision repository
                                 {
                                     Message = $"test: {name}"
                                     Paths = [| mkRepositoryPath $"{name}.txt" |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached $"{name}-create")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"{name} create" revisionResult |> ignore
                     }
 
-                    let workspaceRoot = workspace.Binding.RepositoryRoot
+                    let createRevision (profile: string option) (name: string) = promise {
+                        let! repository =
+                            openFolder provider workspace.Repository.Descriptor.RepositoryRoot profile $"{name}-open"
+
+                        do! createRevisionIn repository name
+                    }
+
+                    let workspaceRoot = workspace.Repository.Descriptor.RepositoryRoot
                     let setOriginUrl (url: string) = runGitIn workspaceRoot [||] [| "remote"; "set-url"; "origin"; url |] None
 
                     // The harness clone publishes to a local bare repository, which has no host.
-                    do! createRevision workspace.Binding "identity-local"
+                    let defaultProfile = (locationOf workspace).ConnectionProfileId
+                    do! createRevision defaultProfile "identity-local"
 
                     // The configured publish remote decides the host, the same way publish
-                    // credentials do, even though the binding still points at the local path.
+                    // credentials do.
                     let! _ = setOriginUrl "https://Hub.Example.org/group/project.git"
 
-                    let profileBinding = {
-                        workspace.Binding with
-                            ConnectionProfileId = Some "profile-a"
-                    }
-
-                    do! createRevision profileBinding "identity-remote"
+                    do! createRevision (Some "profile-a") "identity-remote"
 
                     // scp-style SSH remotes name their host too.
                     let! _ = setOriginUrl "git@scp.example.org:group/project.git"
-                    do! createRevision workspace.Binding "identity-scp"
+                    do! createRevision defaultProfile "identity-scp"
 
                     // A push URL wins over the fetch URL, because that is where git push goes.
                     let! _ = setOriginUrl "https://Hub.Example.org/group/project.git"
@@ -1059,7 +1055,7 @@ Vitest.describe (
                             [| "remote"; "set-url"; "--push"; "origin"; "https://push.example.org/group/project.git" |]
                             None
 
-                    do! createRevision workspace.Binding "identity-pushurl"
+                    do! createRevision defaultProfile "identity-pushurl"
 
                     // Two distinct push URLs would publish to two hosts, which one identity
                     // cannot serve, so the target counts as invalid and there is no host.
@@ -1070,7 +1066,7 @@ Vitest.describe (
                             [| "config"; "--add"; "remote.origin.pushurl"; "https://second.example.org/group/project.git" |]
                             None
 
-                    do! createRevision workspace.Binding "identity-two-pushurls"
+                    do! createRevision defaultProfile "identity-two-pushurls"
                     let! _ = runGitIn workspaceRoot [||] [| "config"; "--unset-all"; "remote.origin.pushurl" |] None
 
                     // insteadOf rewriting changes where git actually pushes, so the host
@@ -1084,27 +1080,22 @@ Vitest.describe (
                             [| "config"; "url.https://rewritten.example.org/.insteadOf"; "git@scp.example.org:" |]
                             None
 
-                    do! createRevision workspace.Binding "identity-insteadof"
+                    do! createRevision defaultProfile "identity-insteadof"
                     let! _ = runGitIn workspaceRoot [||] [| "config"; "--remove-section"; "url.https://rewritten.example.org/" |] None
 
                     // An upstream that names no remote is an invalid target: no host at all,
                     // rather than a host the revision will never be published to.
                     let! _ = runGitIn workspaceRoot [||] [| "config"; "branch.main.remote"; "." |] None
-                    do! createRevision workspace.Binding "identity-invalid-upstream"
+                    do! createRevision defaultProfile "identity-invalid-upstream"
                     let! _ = runGitIn workspaceRoot [||] [| "config"; "branch.main.remote"; "origin" |] None
 
-                    // Without any publish remote the bound location is what remains.
+                    // Without any publish remote the location read at open is what remains. The
+                    // repository is opened while origin still names the fallback host.
+                    let! _ = setOriginUrl "https://fallback.example.org/group/project.git"
+                    let! fallbackRepository = openFolder provider workspaceRoot defaultProfile "identity-fallback-open"
                     let! _ = runGitIn workspaceRoot [||] [| "remote"; "remove"; "origin" |] None
 
-                    let fallbackBinding = {
-                        workspace.Binding with
-                            Location = {
-                                workspace.Binding.Location with
-                                    ProviderLocation = "https://fallback.example.org/group/project.git"
-                            }
-                    }
-
-                    do! createRevision fallbackBinding "identity-fallback"
+                    do! createRevisionIn fallbackRepository "identity-fallback"
 
                     Vitest.expect(requests.Count).toBe 8
 
@@ -1112,7 +1103,7 @@ Vitest.describe (
                         Vitest.expect(request.RepositoryRoot).toBe workspaceRoot
 
                     Vitest.expect(requests.[0].TargetHost).toEqual None
-                    Vitest.expect(requests.[0].ConnectionProfileId).toEqual workspace.Binding.ConnectionProfileId
+                    Vitest.expect(requests.[0].ConnectionProfileId).toEqual defaultProfile
                     Vitest.expect(requests.[1].TargetHost).toEqual (Some "hub.example.org")
                     Vitest.expect(requests.[1].ConnectionProfileId).toEqual (Some "profile-a")
                     Vitest.expect(requests.[2].TargetHost).toEqual (Some "scp.example.org")
@@ -1141,35 +1132,39 @@ Vitest.describe (
                         ResolveIdentity = fun _request -> async { return None }
                     }
 
-                    let session =
-                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
-                            GitWorkspaceSession.GitSessionHooks.none
-                            GitCredentialStrategy.anonymous
-                            identity
-                            workspace.Binding
+                    let provider = GitProvider.create { GitProviderOptions.defaults with RevisionIdentity = identity }
+
+                    let! repository =
+                        openFolder
+                            provider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "configured-identity-open"
 
                     do! workspace.WriteFile "configured-identity.txt" "configured identity\n"
                     let! status =
-                        session.Core.GetStatus(OperationContext.detached "configured-identity-status")
+                        provider.GetStatus repository (OperationContext.detached "configured-identity-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "configured identity status" status
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: configured identity"
                                 Paths = [| mkRepositoryPath "configured-identity.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "configured-identity-create")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "configured identity create" revisionResult |> ignore
 
                     let! commitIdentity =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "log"; "-1"; "--format=%an;%ae;%cn;%ce" |]
                             None
@@ -1199,28 +1194,32 @@ Vitest.describe (
                         ResolveIdentity = fun _request -> async { return Some currentIdentity }
                     }
 
-                    let session =
-                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
-                            GitWorkspaceSession.GitSessionHooks.none
-                            GitCredentialStrategy.anonymous
-                            identity
-                            workspace.Binding
+                    let provider = GitProvider.create { GitProviderOptions.defaults with RevisionIdentity = identity }
+
+                    let! repository =
+                        openFolder
+                            provider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "incomplete-identity-open"
 
                     let reject path content contextName = promise {
                         do! workspace.WriteFile path content
                         let! statusResult =
-                            session.Core.GetStatus(OperationContext.detached $"{contextName}-status")
+                            provider.GetStatus repository (OperationContext.detached $"{contextName}-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue $"{contextName} status" statusResult
                         let! revisionResult =
-                            session.Core.CreateRevision
+                            provider.CreateRevision repository
                                 {
                                     Message = "test: incomplete revision identity"
                                     Paths = [| mkRepositoryPath path |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached contextName)
+                            |> executed
                             |> Async.StartAsPromise
 
                         return expectProviderFailure contextName revisionResult
@@ -1244,7 +1243,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "revision identity resolves once per operation instead of at session open",
+            "revision identity resolves once per operation instead of at repository open",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let harness = createGitHarness ()
@@ -1260,29 +1259,33 @@ Vitest.describe (
                         ResolveIdentity = fun _request -> async { return Some currentIdentity }
                     }
 
-                    let session =
-                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
-                            GitWorkspaceSession.GitSessionHooks.none
-                            GitCredentialStrategy.anonymous
-                            identity
-                            workspace.Binding
+                    let provider = GitProvider.create { GitProviderOptions.defaults with RevisionIdentity = identity }
+
+                    let! repository =
+                        openFolder
+                            provider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "per-operation-identity-open"
 
                     let create path content message contextName = promise {
                         do! workspace.WriteFile path content
                         let! status =
-                            session.Core.GetStatus(OperationContext.detached $"{contextName}-status")
+                            provider.GetStatus repository (OperationContext.detached $"{contextName}-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue $"{contextName} status" status
 
                         let! result =
-                            session.Core.CreateRevision
+                            provider.CreateRevision repository
                                 {
                                     Message = message
                                     Paths = [| mkRepositoryPath path |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached contextName)
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"{contextName} create" result |> ignore
@@ -1294,7 +1297,7 @@ Vitest.describe (
 
                     let! commitIdentities =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "log"; "-2"; "--format=%an;%ae;%cn;%ce" |]
                             None
@@ -1321,8 +1324,8 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let emptyGlobal = join [| workspace.Binding.RepositoryRoot; "empty-global.gitconfig" |]
-                    let emptySystem = join [| workspace.Binding.RepositoryRoot; "empty-system.gitconfig" |]
+                    let emptyGlobal = join [| workspace.Repository.Descriptor.RepositoryRoot; "empty-global.gitconfig" |]
+                    let emptySystem = join [| workspace.Repository.Descriptor.RepositoryRoot; "empty-system.gitconfig" |]
                     do! writeUtf8FileAsync emptyGlobal ""
                     do! writeUtf8FileAsync emptySystem ""
 
@@ -1337,35 +1340,44 @@ Vitest.describe (
                                         processContext)
                     }
 
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot environment [| "config"; "--local"; "--unset-all"; "user.name" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot environment [| "config"; "--local"; "--unset-all"; "user.email" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot environment [| "config"; "--local"; "--unset-all"; "user.name" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot environment [| "config"; "--local"; "--unset-all"; "user.email" |] None
                     let identity: GitCredentialStrategy.GitIdentityStrategy = {
                         ResolveIdentity = fun _request -> async { return None }
                     }
 
-                    let session =
-                        GitWorkspaceSession.createSessionWithCredentialsAndIdentity
-                            hooks
-                            GitCredentialStrategy.anonymous
-                            identity
-                            workspace.Binding
+                    let provider =
+                        GitProvider.create {
+                            GitProviderOptions.defaults with
+                                Hooks = hooks
+                                RevisionIdentity = identity
+                        }
 
-                    let! headBefore = runGitIn workspace.Binding.RepositoryRoot environment [| "rev-parse"; "HEAD" |] None
+                    let! repository =
+                        openFolder
+                            provider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "missing-identity-open"
+
+                    let! headBefore = runGitIn workspace.Repository.Descriptor.RepositoryRoot environment [| "rev-parse"; "HEAD" |] None
                     do! workspace.WriteFile "missing-identity.txt" "missing identity\n"
                     let! status =
-                        session.Core.GetStatus(OperationContext.detached "missing-identity-status")
+                        provider.GetStatus repository (OperationContext.detached "missing-identity-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "missing identity status" status
 
                     let! revisionResult =
-                        session.Core.CreateRevision
+                        provider.CreateRevision repository
                             {
                                 Message = "test: missing identity"
                                 Paths = [| mkRepositoryPath "missing-identity.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "missing-identity-create")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "missing revision identity" revisionResult
@@ -1374,7 +1386,7 @@ Vitest.describe (
                     Vitest.expect(failure.RecoveryAction.IsSome).toBe true
                     Vitest.expect(failure.StateChanged).toBe false
 
-                    let! headAfter = runGitIn workspace.Binding.RepositoryRoot environment [| "rev-parse"; "HEAD" |] None
+                    let! headAfter = runGitIn workspace.Repository.Descriptor.RepositoryRoot environment [| "rev-parse"; "HEAD" |] None
                     Vitest.expect(headAfter.Trim()).toBe (headBefore.Trim())
                     do! harness.Cleanup()
                 with error ->
@@ -1414,25 +1426,12 @@ Vitest.describe (
                     let! _ = runGitIn repoPath [||] [| "checkout"; "main" |] None
                     do! writeUtf8FileAsync (join [| repoPath; "base.txt" |]) "local edit\n"
 
-                    let binding: WorkspaceBinding = {
-                        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-                        ProviderId = gitProviderId
-                        RepositoryRoot = repoPath
-                        ProviderStateRef = None
-                        Location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = repoPath
-                            ConnectionProfileId = None
-                        }
-                        ConnectionProfileId = None
-                    }
-
-                    let session =
-                        GitWorkspaceSession.createSession GitWorkspaceSession.GitSessionHooks.none binding
+                    let provider = GitProvider.create GitProviderOptions.defaults
+                    let! repository = openFolder provider repoPath None "aborting-open"
 
                     let! statusResult =
-                        session.Core.GetStatus(OperationContext.detached "aborting-status")
+                        provider.GetStatus repository (OperationContext.detached "aborting-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "aborting status" statusResult
@@ -1443,7 +1442,7 @@ Vitest.describe (
                         | Error message -> failwith message
 
                     let! createResult =
-                        session.Core.CreateRef
+                        provider.CreateRef repository
                             {
                                 Name = "from-other"
                                 BaseRef = Some otherRef
@@ -1451,6 +1450,7 @@ Vitest.describe (
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "aborting-create")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "aborted checkout" createResult
@@ -1479,13 +1479,14 @@ Vitest.describe (
 
                     for invalidName in [| ""; "-force"; ".foo"; "foo/.bar"; "foo//bar"; "name\000suffix" |] do
                         let! statusResult =
-                            workspace.Session.Core.GetStatus(OperationContext.detached "invalid-ref-status")
+                            workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "invalid-ref-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue "invalid ref status" statusResult
 
                         let! createResult =
-                            workspace.Session.Core.CreateRef
+                            workspace.Provider.CreateRef workspace.Repository
                                 {
                                     Name = invalidName
                                     BaseRef = None
@@ -1493,6 +1494,7 @@ Vitest.describe (
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached "invalid-ref-create")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let failure = expectProviderFailure $"create invalid ref '{invalidName}'" createResult
@@ -1523,10 +1525,10 @@ Vitest.describe (
                                 })
                 }
 
-                let factory = GitWorkspaceSession.createFactory hooks
+                let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
                 let! result =
-                    factory.VerifyLocation
+                    provider.VerifyLocation
                         {
                             Location = {
                                 ProviderId = gitProviderId
@@ -1537,6 +1539,7 @@ Vitest.describe (
                             Intents = [| ReadIntent |]
                         }
                         (OperationContext.detached "literal-remote-rejection")
+                    |> executed
                     |> Async.StartAsPromise
 
                 let failure = expectProviderFailure "option-like remote rejection" result
@@ -1567,7 +1570,7 @@ Vitest.describe (
                                     })
                     }
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
                     let location = {
                         ProviderId = gitProviderId
                         DisplayName = None
@@ -1577,19 +1580,20 @@ Vitest.describe (
 
                     let! verifyResult =
                         Async.StartAsPromise(
-                            factory.VerifyLocation
+                            provider.VerifyLocation
                                 {
                                     Location = location
                                     Intents = [| ReadIntent |]
                                 }
                                 (OperationContext.detached "validate-provider-location")
+                            |> executed
                         )
 
                     let verifyFailure = expectProviderFailure "validated VerifyLocation" verifyResult
 
                     let! cloneResult =
                         Async.StartAsPromise(
-                            factory.Clone
+                            provider.Clone
                                 {
                                     Location = location
                                     TargetPath = "C:/provider-location-clone-target"
@@ -1597,18 +1601,20 @@ Vitest.describe (
                                     MaterializeAllObjects = false
                                 }
                                 (OperationContext.detached "validate-provider-location-clone")
+                            |> executed
                         )
 
                     let cloneFailure = expectProviderFailure "validated Clone" cloneResult
 
                     let! bindResult =
                         Async.StartAsPromise(
-                            factory.Bind
+                            provider.Bind
                                 {
                                     RepositoryRoot = "C:/provider-location-bind-workspace"
                                     Location = location
                                 }
                                 (OperationContext.detached "validate-provider-location-bind")
+                            |> executed
                         )
 
                     let bindFailure = expectProviderFailure "validated Bind" bindResult
@@ -1646,16 +1652,17 @@ Vitest.describe (
                         ConnectionProfileId = None
                     }
 
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let provider = GitProvider.create GitProviderOptions.defaults
 
                     let! bindResult =
                         Async.StartAsPromise(
-                            factory.Bind
+                            provider.Bind
                                 {
                                     RepositoryRoot = workspacePath
                                     Location = location
                                 }
                                 (OperationContext.detached "bind-exact-remote-name")
+                            |> executed
                         )
 
                     expectProviderValue "bind with myorigin" bindResult |> ignore
@@ -1693,51 +1700,50 @@ Vitest.describe (
                         ConnectionProfileId = None
                     }
 
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let provider = GitProvider.create GitProviderOptions.defaults
 
                     let! initializedResult =
                         Async.StartAsPromise(
-                            factory.Initialize
+                            provider.Initialize
                                 {
                                     TargetPath = initializedPath
                                     Location = Some remoteLocation
                                 }
                                 (OperationContext.detached "initialize-with-location")
+                            |> executed
                         )
 
-                    let initializedBinding = expectProviderValue "initialize with remote location" initializedResult
+                    let initializedRepository = expectProviderValue "initialize with remote location" initializedResult
                     let! configuredRemotes = runGitIn initializedPath [||] [| "remote" |] None
                     let! configuredOrigin =
                         runGitIn initializedPath [||] [| "config"; "--get"; "remote.origin.url" |] None
 
-                    Vitest.expect(initializedBinding.Location).toEqual (remoteLocation)
+                    Vitest.expect(initializedRepository.Descriptor.Location).toEqual (Some remoteLocation)
                     Vitest.expect(configuredRemotes.Trim()).toBe ("origin")
                     Vitest.expect(configuredOrigin.Trim()).toBe (remoteLocation.ProviderLocation)
 
                     let! localOnlyResult =
                         Async.StartAsPromise(
-                            factory.Initialize
+                            provider.Initialize
                                 {
                                     TargetPath = localOnlyPath
                                     Location = None
                                 }
                                 (OperationContext.detached "initialize-without-location")
+                            |> executed
                         )
 
-                    let localOnlyBinding = expectProviderValue "initialize without remote location" localOnlyResult
+                    let localOnlyRepository = expectProviderValue "initialize without remote location" localOnlyResult
                     let! configuredRemotes =
                         runGitIn localOnlyPath [||] [| "remote" |] None
 
                     Vitest.expect(configuredRemotes.Trim()).toBe ""
 
-                    let! openedResult =
-                        Async.StartAsPromise(
-                            factory.Open localOnlyBinding (OperationContext.detached "open-local-only-initialize")
-                        )
-
-                    let session = expectProviderValue "open local-only initialized workspace" openedResult
                     let! statusResult =
-                        Async.StartAsPromise(session.Core.GetStatus(OperationContext.detached "local-only-status"))
+                        Async.StartAsPromise(
+                            provider.GetStatus localOnlyRepository (OperationContext.detached "local-only-status")
+                            |> executed
+                        )
 
                     let status = expectProviderValue "local-only initialized status" statusResult
                     let synchronization =
@@ -1755,35 +1761,27 @@ Vitest.describe (
 
                     let! localLocationResult =
                         Async.StartAsPromise(
-                            factory.Initialize
+                            provider.Initialize
                                 {
                                     TargetPath = localLocationPath
                                     Location = Some localLocation
                                 }
                                 (OperationContext.detached "initialize-with-local-location")
+                            |> executed
                         )
 
-                    let localLocationBinding =
+                    let localLocationRepository =
                         expectProviderValue "initialize with local self location" localLocationResult
 
                     let! localLocationRemotes = runGitIn localLocationPath [||] [| "remote" |] None
                     Vitest.expect(localLocationRemotes.Trim()).toBe ""
 
-                    let! localLocationOpenResult =
-                        Async.StartAsPromise(
-                            factory.Open
-                                localLocationBinding
-                                (OperationContext.detached "open-local-location-initialize")
-                        )
-
-                    let localLocationSession =
-                        expectProviderValue "open local self initialized workspace" localLocationOpenResult
-
                     let! localLocationStatusResult =
                         Async.StartAsPromise(
-                            localLocationSession.Core.GetStatus(
-                                OperationContext.detached "local-location-initialize-status"
-                            )
+                            provider.GetStatus
+                                localLocationRepository
+                                (OperationContext.detached "local-location-initialize-status")
+                            |> executed
                         )
 
                     let localLocationStatus =
@@ -1825,11 +1823,11 @@ Vitest.describe (
                                         NodeProcess.run request processContext)
                     }
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
                     let! result =
                         Async.StartAsPromise(
-                            factory.Initialize
+                            provider.Initialize
                                 {
                                     TargetPath = targetPath
                                     Location =
@@ -1841,6 +1839,7 @@ Vitest.describe (
                                         }
                                 }
                                 (OperationContext.detached "initialize-remote-add-failure")
+                            |> executed
                         )
 
                     let failure = expectProviderFailure "initialize remote add failure" result
@@ -1864,8 +1863,7 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let browser =
-                        workspace.Session.RepositoryBrowser
-                        |> Option.defaultWith (fun () -> failwith "Expected Git repository browser service.")
+                        workspace.Provider.RepositoryBrowser
 
                     let cases = [|
                         "https://github.com/example/version-control-service.git",
@@ -1884,13 +1882,14 @@ Vitest.describe (
                     for remoteUrl, expectedUrl in cases do
                         let! _ =
                             runGitIn
-                                workspace.Binding.RepositoryRoot
+                                workspace.Repository.Descriptor.RepositoryRoot
                                 [||]
                                 [| "remote"; "set-url"; "origin"; remoteUrl |]
                                 None
 
                         let! result =
-                            browser.GetRepositoryWebUrl(OperationContext.detached "repository-browser-url")
+                            browser.GetRepositoryWebUrl workspace.Repository (OperationContext.detached "repository-browser-url")
+                            |> executed
                             |> Async.StartAsPromise
 
                         Vitest.expect(expectProviderValue "repository browser URL" result).toEqual (Some expectedUrl)
@@ -1910,7 +1909,7 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let repoPath = workspace.Binding.RepositoryRoot
+                    let repoPath = workspace.Repository.Descriptor.RepositoryRoot
                     let childPath = join [| dirname repoPath; "child-repository" |]
 
                     let! _ = runGitIn (dirname repoPath) [||] [| "init"; "-b"; "main"; childPath |] None
@@ -1935,19 +1934,21 @@ Vitest.describe (
 
                     let! _ = runGitIn repoPath [||] [| "commit"; "-m"; "test: add submodule" |] None
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "submodule-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "submodule-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "submodule status" statusResult
 
                     let! innerResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: submodule-internal selection"
                                 Paths = [| RepositoryPath.tryCreate "sub/inner.txt" |> Result.defaultWith failwith |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "submodule-internal-selection")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let innerFailure = expectProviderFailure "submodule-internal selection" innerResult
@@ -1961,19 +1962,21 @@ Vitest.describe (
                     let! _ = runGitIn checkedOutChild [||] [| "commit"; "-m"; "test: advance submodule" |] None
                     let! headBefore = runGitIn repoPath [||] [| "rev-parse"; "HEAD" |] None
                     let! freshStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "gitlink-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "gitlink-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let freshStatus = expectProviderValue "gitlink status" freshStatusResult
 
                     let! gitlinkResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: gitlink selection"
                                 Paths = [| RepositoryPath.tryCreate "sub" |> Result.defaultWith failwith |]
                                 ExpectedRepositoryVersion = freshStatus.RepositoryVersion
                             }
                             (OperationContext.detached "gitlink-selection")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let gitlinkFailure = expectProviderFailure "gitlink selection" gitlinkResult
@@ -2001,8 +2004,7 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
 
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let literalPaths = [|
                         "space name.bin", "spaceXname.bin", "nested/space name.bin"
@@ -2025,10 +2027,11 @@ Vitest.describe (
 
                     for literalPath, _, _ in literalPaths do
                         let! result =
-                            storagePolicy.SetPathPolicy
+                            storagePolicy.SetPathPolicy workspace.Repository
                                 (repositoryPath literalPath)
                                 true
                                 (OperationContext.detached $"track-{literalPath}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"track literal path {literalPath}" result |> ignore
@@ -2036,7 +2039,7 @@ Vitest.describe (
                     for literalPath, decoyPath, nestedDecoyPath in literalPaths do
                         let! attributes =
                             runGitIn
-                                workspace.Binding.RepositoryRoot
+                                workspace.Repository.Descriptor.RepositoryRoot
                                 [||]
                                 [| "check-attr"; "-z"; "filter"; "--"; literalPath; decoyPath; nestedDecoyPath |]
                                 None
@@ -2046,7 +2049,7 @@ Vitest.describe (
                         Vitest.expect(attributes.Contains($"{nestedDecoyPath}\000filter\000unspecified\000")).toBe true
 
                     let! attributeFile =
-                        tryReadUtf8FileAsync (join [| workspace.Binding.RepositoryRoot; ".gitattributes" |])
+                        tryReadUtf8FileAsync (join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |])
 
                     let attributeFile = attributeFile |> Option.defaultValue ""
                     Vitest.expect(attributeFile.Contains("\"/space name.bin\" filter=lfs")).toBe true
@@ -2060,10 +2063,11 @@ Vitest.describe (
 
                     for literalPath, _, _ in literalPaths do
                         let! result =
-                            storagePolicy.SetPathPolicy
+                            storagePolicy.SetPathPolicy workspace.Repository
                                 (repositoryPath literalPath)
                                 false
                                 (OperationContext.detached $"untrack-{literalPath}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"untrack literal path {literalPath}" result |> ignore
@@ -2071,7 +2075,7 @@ Vitest.describe (
                     for literalPath, _, nestedDecoyPath in literalPaths do
                         let! attributes =
                             runGitIn
-                                workspace.Binding.RepositoryRoot
+                                workspace.Repository.Descriptor.RepositoryRoot
                                 [||]
                                 [| "check-attr"; "-z"; "filter"; "--"; literalPath; nestedDecoyPath |]
                                 None
@@ -2094,30 +2098,31 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let attributesPath = join [| workspace.Binding.RepositoryRoot; ".gitattributes" |]
+                    let attributesPath = join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |]
                     let outsideContent = "outside.bin filter=lfs diff=lfs merge=lfs -text\n"
                     do! writeUtf8FileAsync attributesPath outsideContent
                     let! outsideBefore = readFileBase64Async attributesPath
-                    let linkedRepo = workspace.Binding.RepositoryRoot + "-junction"
-                    do! createDirectoryJunctionAsync workspace.Binding.RepositoryRoot linkedRepo
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let linkedRepo = workspace.Repository.Descriptor.RepositoryRoot + "-junction"
+                    do! createDirectoryJunctionAsync workspace.Repository.Descriptor.RepositoryRoot linkedRepo
+                    let provider = GitProvider.create GitProviderOptions.defaults
 
-                    let! openResult =
-                        factory.Open
-                            { workspace.Binding with RepositoryRoot = linkedRepo }
-                            (OperationContext.detached "open-junction-workspace")
+                    // Open takes the root from Git, which resolves the junction. Bind keeps the root as given.
+                    let! bindResult =
+                        provider.Bind
+                            { RepositoryRoot = linkedRepo; Location = locationOf workspace }
+                            (OperationContext.detached "bind-junction-workspace")
+                        |> executed
                         |> Async.StartAsPromise
 
-                    let linkedSession = expectProviderValue "open junction workspace" openResult
-                    let linkedStoragePolicy =
-                        linkedSession.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                    let linkedRepository = expectProviderValue "bind junction workspace" bindResult
 
                     let! result =
-                        linkedStoragePolicy.SetPathPolicy
+                        provider.StoragePolicy.SetPathPolicy
+                            linkedRepository
                             (RepositoryPath.tryCreate "selected.bin" |> Result.defaultWith failwith)
                             true
                             (OperationContext.detached "track-through-junction")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderFailure "track through junction" result |> ignore
@@ -2138,15 +2143,14 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let attributesPath = join [| workspace.Binding.RepositoryRoot; ".gitattributes" |]
+                    let attributesPath = join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |]
                     let original = "# preserved bytes\r\nlegacy.bin filter=lfs diff=lfs merge=lfs -text\r\n"
                     do! writeUtf8FileAsync attributesPath original
                     let before = readFileBase64Async attributesPath
                     let restoreRename = injectRenameSyncFailure ()
 
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let selectedPath = RepositoryPath.tryCreate "selected.bin" |> Result.defaultWith failwith
 
@@ -2154,10 +2158,11 @@ Vitest.describe (
                         promise {
                             try
                                 return!
-                                    storagePolicy.SetPathPolicy
+                                    storagePolicy.SetPathPolicy workspace.Repository
                                         selectedPath
                                         true
                                         (OperationContext.detached "atomic-attributes-failure")
+                                    |> executed
                                     |> Async.StartAsPromise
                             finally
                                 restoreRename ()
@@ -2184,22 +2189,22 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let attributesPath = join [| workspace.Binding.RepositoryRoot; ".gitattributes" |]
+                    let attributesPath = join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |]
                     let legacyRules =
                         "file.bin filter=lfs diff=lfs merge=lfs -text\r\n*.dat filter=lfs diff=lfs merge=lfs -text\r\n"
 
                     do! writeUtf8FileAsync attributesPath legacyRules
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     for value in [| "nested/file.bin"; "nested/report.dat" |] do
                         let path = RepositoryPath.tryCreate value |> Result.defaultWith failwith
                         let! result =
-                            storagePolicy.SetPathPolicy
+                            storagePolicy.SetPathPolicy workspace.Repository
                                 path
                                 false
                                 (OperationContext.detached $"preserve-legacy-{value}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"untrack {value}" result |> ignore
@@ -2219,7 +2224,7 @@ Vitest.describe (
 
                     let! attributeOutput =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "check-attr"; "-z"; "filter"; "--"; "nested/file.bin"; "nested/report.dat" |]
                             None
@@ -2232,18 +2237,20 @@ Vitest.describe (
                     for value in [| "nested/file.bin"; "nested/report.dat" |] do
                         let path = RepositoryPath.tryCreate value |> Result.defaultWith failwith
                         let! enableResult =
-                            storagePolicy.SetPathPolicy
+                            storagePolicy.SetPathPolicy workspace.Repository
                                 path
                                 true
                                 (OperationContext.detached $"cycle-enable-{value}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"cycle enable {value}" enableResult |> ignore
                         let! disableResult =
-                            storagePolicy.SetPathPolicy
+                            storagePolicy.SetPathPolicy workspace.Repository
                                 path
                                 false
                                 (OperationContext.detached $"cycle-disable-{value}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue $"cycle disable {value}" disableResult |> ignore
@@ -2276,8 +2283,7 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
 
                     let maintenance =
-                        workspace.Session.Maintenance
-                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+                        workspace.Provider.Maintenance
 
                     let cancellation = OperationCancellation.Source()
                     let mutable progressObserved = false
@@ -2291,7 +2297,7 @@ Vitest.describe (
                                     progressObserved <- true
                                     cancellation.Cancel())
 
-                    let! result = maintenance.Deduplicate context |> Async.StartAsPromise
+                    let! result = maintenance.Deduplicate workspace.Repository context |> executed |> Async.StartAsPromise
 
                     Vitest.expect(progressObserved).toBe true
                     let failure = expectProviderFailure "canceled running maintenance" result
@@ -2321,14 +2327,14 @@ Vitest.describe (
                         let! _ = fsPromisesDynamic?copyFile (nodeExecutablePath, fakeGitPath) |> unbox<JS.Promise<obj>>
                         do!
                             writeUtf8FileAsync
-                                (join [| workspace.Binding.RepositoryRoot; "rev-parse" |])
+                                (join [| workspace.Repository.Descriptor.RepositoryRoot; "rev-parse" |])
                                 "console.log('true');\n"
 
-                        do! writeUtf8FileAsync (join [| workspace.Binding.RepositoryRoot; "status" |]) ""
+                        do! writeUtf8FileAsync (join [| workspace.Repository.Descriptor.RepositoryRoot; "status" |]) ""
 
                         do!
                             writeUtf8FileAsync
-                                (join [| workspace.Binding.RepositoryRoot; "lfs" |])
+                                (join [| workspace.Repository.Descriptor.RepositoryRoot; "lfs" |])
                                 ("console.log('deduplicate: 75% ("
                                  + completedCount
                                  + "/"
@@ -2361,15 +2367,14 @@ Vitest.describe (
                         OperationContext.create "large-maintenance-progress" OperationCancellation.none reports.Add
 
                     let maintenance =
-                        workspace.Session.Maintenance
-                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
+                        workspace.Provider.Maintenance
 
                     let originalPath = currentProcessPath ()
                     let! result =
                         promise {
                             try
                                 setCurrentProcessPath (fakeRoot + pathDelimiter + originalPath)
-                                return! maintenance.Deduplicate context |> Async.StartAsPromise
+                                return! maintenance.Deduplicate workspace.Repository context |> executed |> Async.StartAsPromise
                             finally
                                 setCurrentProcessPath originalPath
                         }
@@ -2407,27 +2412,27 @@ Vitest.describe (
 
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "--literal-pathspecs"; "add"; "--"; ".gitattributes"; literalPath |]
                             None
 
                     let! _ =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "commit"; "-m"; "test: cached lfs object" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "commit"; "-m"; "test: cached lfs object" |] None
 
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
 
                     let! pointer =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; $"HEAD:{literalPath}" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; $"HEAD:{literalPath}" |] None
 
                     do! workspace.WriteFile literalPath pointer
 
                     let materialization =
-                        workspace.Session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                        workspace.Provider.ObjectMaterialization
 
                     let! listResult =
-                        materialization.ListObjects(OperationContext.detached "cached-literal-list")
+                        materialization.ListObjects workspace.Repository (OperationContext.detached "cached-literal-list")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let objectState =
@@ -2455,7 +2460,8 @@ Vitest.describe (
                     do! workspace.WriteFile "local.txt" "local revision\n"
 
                     let! beforeRevisionResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "preview-local-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "preview-local-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let beforeRevision = expectProviderValue "preview local status" beforeRevisionResult
@@ -2464,13 +2470,14 @@ Vitest.describe (
                         |> Result.defaultWith failwith
 
                     let! localRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "local preview revision"
                                 Paths = [| localPath |]
                                 ExpectedRepositoryVersion = beforeRevision.RepositoryVersion
                             }
                             (OperationContext.detached "preview-local-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "create local preview revision" localRevisionResult |> ignore
@@ -2502,13 +2509,18 @@ Vitest.describe (
                         Barrier = None
                     }
 
-                    let session = GitWorkspaceSession.createSession hooks workspace.Binding
-                    let synchronization =
-                        session.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
+
+                    let! repository =
+                        openFolder
+                            provider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "preview-indeterminate-open"
 
                     let! previewResult =
-                        synchronization.PreviewUpdate(OperationContext.detached "preview-indeterminate")
+                        provider.Synchronization.PreviewUpdate repository (OperationContext.detached "preview-indeterminate")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "indeterminate update preview" previewResult
@@ -2539,17 +2551,21 @@ Vitest.describe (
                         Barrier = None
                     }
 
-                    let changedPathSession =
-                        GitWorkspaceSession.createSession changedPathHooks workspace.Binding
+                    let changedPathProvider =
+                        GitProvider.create { GitProviderOptions.defaults with Hooks = changedPathHooks }
 
-                    let changedPathSynchronization =
-                        changedPathSession.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git synchronization.")
+                    let! changedPathRepository =
+                        openFolder
+                            changedPathProvider
+                            workspace.Repository.Descriptor.RepositoryRoot
+                            (locationOf workspace).ConnectionProfileId
+                            "preview-indeterminate-changed-paths-open"
 
                     let! changedPathPreview =
-                        changedPathSynchronization.PreviewUpdate(
-                            OperationContext.detached "preview-indeterminate-changed-paths"
-                        )
+                        changedPathProvider.Synchronization.PreviewUpdate
+                            changedPathRepository
+                            (OperationContext.detached "preview-indeterminate-changed-paths")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let changedPathFailure =
@@ -2580,13 +2596,12 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
                     do! workspace.WriteFile ".gitattributes" "materialized.bin filter=lfs diff=lfs merge=lfs -text\n"
                     do! workspace.WriteFile "materialized.bin" "materialization context content\n"
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; "-A" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "commit"; "-m"; "test: materialization context" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "commit"; "-m"; "test: materialization context" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
 
                     let materialization =
-                        workspace.Session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                        workspace.Provider.ObjectMaterialization
 
                     let cancellation = OperationCancellation.Source()
                     let mutable transferStarted = false
@@ -2599,7 +2614,7 @@ Vitest.describe (
                                     transferStarted <- true
                                     cancellation.Cancel())
 
-                    let! result = materialization.ListObjects context |> Async.StartAsPromise
+                    let! result = materialization.ListObjects workspace.Repository context |> executed |> Async.StartAsPromise
                     Vitest.expect(transferStarted).toBe true
                     let failure = expectProviderFailure "canceled LFS listing" result
                     Vitest.expect(failure.Category).toEqual Canceled
@@ -2621,18 +2636,18 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
                     do! workspace.WriteFile ".gitattributes" "materialized.bin filter=lfs diff=lfs merge=lfs -text\n"
                     do! workspace.WriteFile "materialized.bin" "materialization context content\n"
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; "-A" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "commit"; "-m"; "test: materialization context" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "commit"; "-m"; "test: materialization context" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
 
                     let materialization =
-                        workspace.Session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                        workspace.Provider.ObjectMaterialization
 
                     let path = RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith
 
                     let! initialDematerialize =
-                        materialization.Dematerialize [| path |] (OperationContext.detached "materialization-prepare")
+                        materialization.Dematerialize workspace.Repository [| path |] (OperationContext.detached "materialization-prepare")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "prepare materialization context" initialDematerialize |> ignore
@@ -2649,34 +2664,35 @@ Vitest.describe (
                                     materializeCancellation.Cancel())
 
                     let! materializeResult =
-                        materialization.Materialize [| path |] materializeContext |> Async.StartAsPromise
+                        materialization.Materialize workspace.Repository [| path |] materializeContext |> executed |> Async.StartAsPromise
 
                     Vitest.expect(materializeTransferStarted).toBe true
                     let materializeFailure = expectProviderFailure "canceled materialization" materializeResult
                     Vitest.expect(materializeFailure.Category).toEqual Canceled
 
                     let! restoredMaterialization =
-                        materialization.Materialize [| path |] (OperationContext.detached "materialization-restore")
+                        materialization.Materialize workspace.Repository [| path |] (OperationContext.detached "materialization-restore")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "restore materialization" restoredMaterialization |> ignore
 
                     let! listingJson =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "lfs"; "ls-files"; "-j" |]
                             None
 
                     let! pointerText =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [|
                                 "lfs"
                                 "pointer"
                                 "--file"
-                                join [| workspace.Binding.RepositoryRoot; "materialized.bin" |]
+                                join [| workspace.Repository.Descriptor.RepositoryRoot; "materialized.bin" |]
                             |]
                             None
 
@@ -2700,39 +2716,39 @@ Vitest.describe (
                         let! _ = fsPromisesDynamic?chmod (fakeGitPath, 493) |> unbox<JS.Promise<obj>>
                         ()
 
-                    do! writeUtf8FileAsync (join [| workspace.Binding.RepositoryRoot; "status" |]) ""
+                    do! writeUtf8FileAsync (join [| workspace.Repository.Descriptor.RepositoryRoot; "status" |]) ""
                     // Like `git checkout HEAD -- <path>` with smudge skipped, write the committed pointer.
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; "checkout" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; "checkout" |])
                             "const fs = require('node:fs');\nconst target = process.argv[process.argv.length - 1].replace(/^:\\([^)]*\\)/, '');\nfs.writeFileSync(target, fs.readFileSync(process.env.VCS_TEST_LFS_POINTER, 'utf8'));\n"
-                    do! writeUtf8FileAsync (join [| workspace.Binding.RepositoryRoot; "rev-parse" |]) "console.log('true');\n"
+                    do! writeUtf8FileAsync (join [| workspace.Repository.Descriptor.RepositoryRoot; "rev-parse" |]) "console.log('true');\n"
 
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; "config" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; "config" |])
                             "process.stdout.write(process.env.VCS_TEST_LFS_REMOTE + '\\n');\n"
 
-                    // The LFS session reads the effective remote URL with `git remote get-url`.
+                    // The LFS functions read the effective remote URL with `git remote get-url`.
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; "remote" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; "remote" |])
                             "process.stdout.write(process.env.VCS_TEST_LFS_REMOTE + '\\n');\n"
 
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; "check-attr" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; "check-attr" |])
                             "process.stdout.write('materialized.bin\\0filter\\0lfs\\0');\n"
 
                     // Free reads the committed pointer with `git cat-file blob HEAD:<path>`.
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; "cat-file" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; "cat-file" |])
                             "process.stdout.write(require('node:fs').readFileSync(process.env.VCS_TEST_LFS_POINTER, 'utf8'));\n"
 
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; "lfs" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; "lfs" |])
                             """
 const fs = require('node:fs');
 const net = require('node:net');
@@ -2801,13 +2817,13 @@ if (command === 'ls-files') {
                         promise {
                             try
                                 setCurrentProcessPath (fakeRoot + pathDelimiter + originalPath)
-                                setCurrentProcessWorkingDirectory workspace.Binding.RepositoryRoot
+                                setCurrentProcessWorkingDirectory workspace.Repository.Descriptor.RepositoryRoot
                                 setProcessEnvironment "VCS_TEST_LFS_LISTING" listingPath
                                 setProcessEnvironment "VCS_TEST_LFS_POINTER" pointerPath
                                 setProcessEnvironment "VCS_TEST_LFS_MARKER" markerPath
                                 setProcessEnvironment "VCS_TEST_LFS_LOCK_PORT" "43871"
-                                setProcessEnvironment "VCS_TEST_LFS_REMOTE" workspace.Binding.Location.ProviderLocation
-                                setProcessEnvironment "VCS_TEST_LFS_DISPATCH_ROOT" workspace.Binding.RepositoryRoot
+                                setProcessEnvironment "VCS_TEST_LFS_REMOTE" (locationOf workspace).ProviderLocation
+                                setProcessEnvironment "VCS_TEST_LFS_DISPATCH_ROOT" workspace.Repository.Descriptor.RepositoryRoot
 
                                 let dematerializeCancellation = OperationCancellation.Source()
                                 let mutable transferStarted = false
@@ -2825,13 +2841,15 @@ if (command === 'ls-files') {
                                                 |> ignore)
 
                                 let! canceledResult =
-                                    materialization.Dematerialize [| path |] dematerializeContext
+                                    materialization.Dematerialize workspace.Repository [| path |] dematerializeContext
+                                    |> executed
                                     |> Async.StartAsPromise
 
                                 let! immediateRetry =
-                                    materialization.Dematerialize
+                                    materialization.Dematerialize workspace.Repository
                                         [| path |]
                                         (OperationContext.detached "dematerialization-immediate-retry")
+                                    |> executed
                                     |> Async.StartAsPromise
 
                                 if isWindowsProcess () then
@@ -2874,24 +2892,24 @@ if (command === 'ls-files') {
                     let expectedSize = float content.Length
                     do! workspace.WriteFile ".gitattributes" "materialized.bin filter=lfs diff=lfs merge=lfs -text\n"
                     do! workspace.WriteFile "materialized.bin" content
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; "-A" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "commit"; "-m"; "test: materialization progress" |] None
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; "-A" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "commit"; "-m"; "test: materialization progress" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "push"; "origin"; "main" |] None
 
                     let materialization =
-                        workspace.Session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                        workspace.Provider.ObjectMaterialization
 
                     let path = RepositoryPath.tryCreate "materialized.bin" |> Result.defaultWith failwith
                     let listReports = ResizeArray<OperationProgress>()
                     let listContext =
                         OperationContext.create "listing-progress" OperationCancellation.none listReports.Add
 
-                    let! listResult = materialization.ListObjects listContext |> Async.StartAsPromise
+                    let! listResult = materialization.ListObjects workspace.Repository listContext |> executed |> Async.StartAsPromise
                     expectProviderValue "listing progress" listResult |> ignore
 
                     let! _ =
-                        materialization.Dematerialize [| path |] (OperationContext.detached "progress-prepare")
+                        materialization.Dematerialize workspace.Repository [| path |] (OperationContext.detached "progress-prepare")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let materializeReports = ResizeArray<OperationProgress>()
@@ -2902,11 +2920,12 @@ if (command === 'ls-files') {
                             materializeReports.Add
 
                     let! materializeResult =
-                        materialization.Materialize [| path |] materializeContext |> Async.StartAsPromise
+                        materialization.Materialize workspace.Repository [| path |] materializeContext |> executed |> Async.StartAsPromise
                     expectProviderValue "materialization progress" materializeResult |> ignore
 
                     let! _ =
-                        materialization.Dematerialize [| path |] (OperationContext.detached "progress-reset")
+                        materialization.Dematerialize workspace.Repository [| path |] (OperationContext.detached "progress-reset")
+                        |> executed
                         |> Async.StartAsPromise
                     let dematerializeReports = ResizeArray<OperationProgress>()
                     let dematerializeContext =
@@ -2916,7 +2935,7 @@ if (command === 'ls-files') {
                             dematerializeReports.Add
 
                     let! dematerializeResult =
-                        materialization.Dematerialize [| path |] dematerializeContext |> Async.StartAsPromise
+                        materialization.Dematerialize workspace.Repository [| path |] dematerializeContext |> executed |> Async.StartAsPromise
 
                     expectProviderValue "dematerialization progress" dematerializeResult |> ignore
 
@@ -2955,7 +2974,8 @@ Vitest.describe (
                     do! workspace.WriteFile "above.bin" (String.replicate (oneMiB + 1) "a")
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-lfs-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-lfs-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "automatic LFS status" statusResult
@@ -2965,20 +2985,21 @@ Vitest.describe (
                         |> Array.map (RepositoryPath.tryCreate >> Result.defaultWith failwith)
 
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: automatic LFS threshold"
                                 Paths = paths
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-lfs-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic LFS revision" revisionResult |> ignore
 
-                    let! below = runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:below.bin" |] None
-                    let! exact = runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:exact.bin" |] None
-                    let! above = runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:above.bin" |] None
+                    let! below = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:below.bin" |] None
+                    let! exact = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:exact.bin" |] None
+                    let! above = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:above.bin" |] None
 
                     Vitest.expect(below.Contains "git-lfs").toBe false
                     Vitest.expect(exact.Contains "git-lfs").toBe true
@@ -3006,36 +3027,36 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let! setResult =
-                        storagePolicy.SetSettings
+                        storagePolicy.SetSettings workspace.Repository
                             {
                                 AutoPolicyThresholdMb = Some 4
                                 MaterializeLargeObjects = true
                             }
                             (OperationContext.detached "set-library-lfs-settings")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "set library LFS settings" setResult |> ignore
 
                     let! threshold =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "config"; "--local"; "--get"; "versioncontrolservice.lfs.autotrackthresholdmb" |]
                             None
 
                     let! materialize =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "config"; "--local"; "--get"; "versioncontrolservice.lfs.materializelargeobjects" |]
                             None
 
                     let! localConfig =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "config"; "--local"; "--list" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "config"; "--local"; "--list" |] None
 
                     Vitest.expect(threshold.Trim()).toBe "4"
                     Vitest.expect(materialize.Trim()).toBe "true"
@@ -3050,7 +3071,8 @@ Vitest.describe (
                     do! workspace.WriteFile "configured exact [file].bin" (String.replicate fourMiB "e")
 
                     let! configuredStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "configured-lfs-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "configured-lfs-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let configuredStatus = expectProviderValue "configured LFS status" configuredStatusResult
@@ -3060,23 +3082,24 @@ Vitest.describe (
                         |> Array.map (RepositoryPath.tryCreate >> Result.defaultWith failwith)
 
                     let! configuredRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: configured automatic LFS threshold"
                                 Paths = configuredPaths
                                 ExpectedRepositoryVersion = configuredStatus.RepositoryVersion
                             }
                             (OperationContext.detached "configured-lfs-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "configured automatic LFS revision" configuredRevisionResult |> ignore
 
                     let! configuredBelow =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:configured-below.bin" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:configured-below.bin" |] None
 
                     let! configuredExact =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "show"; "HEAD:configured exact [file].bin" |]
                             None
@@ -3089,10 +3112,11 @@ Vitest.describe (
                     Vitest.expect(configuredAttributes.Contains "\"/configured exact \\\\[file\\\\].bin\" filter=lfs").toBe true
 
                     let! literalRuleResult =
-                        storagePolicy.SetPathPolicy
+                        storagePolicy.SetPathPolicy workspace.Repository
                             (RepositoryPath.tryCreate "literal[auto]* name.bin" |> Result.defaultWith failwith)
                             true
                             (OperationContext.detached "literal-rule-policy")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "literal rule policy" literalRuleResult |> ignore
@@ -3107,12 +3131,13 @@ Vitest.describe (
 
                     for invalidThreshold in [| 0; -1 |] do
                         let! invalidResult =
-                            storagePolicy.SetSettings
+                            storagePolicy.SetSettings workspace.Repository
                                 {
                                     AutoPolicyThresholdMb = Some invalidThreshold
                                     MaterializeLargeObjects = false
                                 }
                                 (OperationContext.detached $"invalid-lfs-threshold-{invalidThreshold}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let failure = expectProviderFailure "invalid LFS threshold" invalidResult
@@ -3121,7 +3146,7 @@ Vitest.describe (
 
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [|
                                 "config"
@@ -3134,7 +3159,8 @@ Vitest.describe (
                     do! workspace.WriteFile "fractional.bin" (String.replicate (1024 * 1024) "f")
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "fractional-threshold-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "fractional-threshold-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "fractional threshold status" statusResult
@@ -3143,13 +3169,14 @@ Vitest.describe (
                         |> Result.defaultWith failwith
 
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: reject fractional threshold"
                                 Paths = [| fractionalPath |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "fractional-threshold-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let fractionalFailure = expectProviderFailure "fractional LFS threshold" revisionResult
@@ -3171,12 +3198,12 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let attributesContent = "# committed policy\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
-                    let attributesPath = join [| workspace.Binding.RepositoryRoot; ".gitattributes" |]
+                    let attributesPath = join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |]
                     do! workspace.WriteFile ".gitattributes" attributesContent
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "commit"; "-m"; "test: commit wildcard LFS policy" |]
                             None
@@ -3188,22 +3215,24 @@ Vitest.describe (
                         do! workspace.WriteFile "data/big.bin" (String.replicate oneMiB marker)
 
                         let! statusResult =
-                            workspace.Session.Core.GetStatus(OperationContext.detached $"automatic-policy-covered-status-{index}")
+                            workspace.Provider.GetStatus workspace.Repository (OperationContext.detached $"automatic-policy-covered-status-{index}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue "automatic policy covered status" statusResult
                         let! revisionResult =
-                            workspace.Session.Core.CreateRevision
+                            workspace.Provider.CreateRevision workspace.Repository
                                 {
                                     Message = $"test: automatic policy covered commit {index}"
                                     Paths = [| mkRepositoryPath "data/big.bin" |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached $"automatic-policy-covered-revision-{index}")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue "automatic policy covered revision" revisionResult |> ignore
-                        let! committed = runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:data/big.bin" |] None
+                        let! committed = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:data/big.bin" |] None
                         let! attributesAfter = readFileBase64Async attributesPath
                         Vitest.expect(committed.Contains "git-lfs").toBe true
                         Vitest.expect(attributesAfter).toBe attributesBefore
@@ -3226,10 +3255,10 @@ Vitest.describe (
                     let committedAttributes = "*.bin filter=lfs diff=lfs merge=lfs -text\n"
                     let dirtyAttributes = committedAttributes + "# unrelated consumer edit\n"
                     do! workspace.WriteFile ".gitattributes" committedAttributes
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "commit"; "-m"; "test: commit wildcard policy" |]
                             None
@@ -3238,23 +3267,25 @@ Vitest.describe (
                     do! workspace.WriteFile "data/big.bin" (String.replicate (1024 * 1024) "d")
 
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-dirty-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-dirty-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "automatic policy dirty status" statusResult
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: automatic policy ignores dirty attributes"
                                 Paths = [| mkRepositoryPath "data/big.bin" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-dirty-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy dirty revision" revisionResult |> ignore
-                    let! committed = runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:data/big.bin" |] None
-                    let! attributesAfter = tryReadUtf8FileAsync (join [| workspace.Binding.RepositoryRoot; ".gitattributes" |])
+                    let! committed = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:data/big.bin" |] None
+                    let! attributesAfter = tryReadUtf8FileAsync (join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |])
                     Vitest.expect(committed.Contains "git-lfs").toBe true
                     Vitest.expect(attributesAfter).toEqual (Some dirtyAttributes)
                     do! harness.Cleanup()
@@ -3273,36 +3304,36 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     do! workspace.WriteFile ".gitattributes" "*.bin filter=lfs diff=lfs merge=lfs -text\n"
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "commit"; "-m"; "test: commit wildcard disable policy" |]
                             None
 
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let! result =
-                        storagePolicy.SetPathPolicy
+                        storagePolicy.SetPathPolicy workspace.Repository
                             (mkRepositoryPath "data/big.bin")
                             false
                             (OperationContext.detached "automatic-policy-disable-wildcard")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy disable wildcard" result |> ignore
                     let! attributes =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "check-attr"; "-z"; "filter"; "--"; "data/big.bin" |]
                             None
 
                     Vitest.expect(attributes.Contains("data/big.bin\000filter\000lfs\000")).toBe false
                     Vitest.expect(attributes.Contains("data/big.bin\000filter\000unset\000")).toBe true
-                    let! attributeFile = tryReadUtf8FileAsync (join [| workspace.Binding.RepositoryRoot; ".gitattributes" |])
+                    let! attributeFile = tryReadUtf8FileAsync (join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |])
                     Vitest.expect(attributeFile |> Option.exists _.Contains("\"/data/big.bin\" -filter -diff -merge")).toBe true
                     do! harness.Cleanup()
                 with error ->
@@ -3319,32 +3350,32 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let attributesPath = join [| workspace.Binding.RepositoryRoot; ".gitattributes" |]
+                    let attributesPath = join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |]
                     do! workspace.WriteFile ".gitattributes" "*.bin filter=lfs diff=lfs merge=lfs -text\n"
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "commit"; "-m"; "test: commit wildcard opt-out policy" |]
                             None
 
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let! unsetResult =
-                        storagePolicy.SetPathPolicy
+                        storagePolicy.SetPathPolicy workspace.Repository
                             (mkRepositoryPath "data/big.bin")
                             false
                             (OperationContext.detached "automatic-policy-explicit-unset")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy explicit unset" unsetResult |> ignore
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "commit"; "-m"; "test: commit explicit LFS opt-out" |]
                             None
@@ -3353,26 +3384,28 @@ Vitest.describe (
                     let content = String.replicate (1024 * 1024) "n"
                     do! workspace.WriteFile "data/big.bin" content
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-opt-out-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-opt-out-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "automatic policy opt-out status" statusResult
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: preserve explicit automatic LFS opt-out"
                                 Paths = [| mkRepositoryPath "data/big.bin" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-opt-out-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy opt-out revision" revisionResult |> ignore
-                    let! committed = runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:data/big.bin" |] None
+                    let! committed = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:data/big.bin" |] None
                     let! attributesAfter = readFileBase64Async attributesPath
                     let! filter =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "check-attr"; "-z"; "filter"; "--"; "data/big.bin" |]
                             None
@@ -3404,22 +3437,24 @@ Vitest.describe (
 
                     do! workspace.WriteFile relativePath (String.replicate (1024 * 1024) "p")
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-literal-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-literal-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "automatic policy literal status" statusResult
                     let! revisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: automatic LFS literal metacharacter path"
                                 Paths = [| mkRepositoryPath relativePath |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-literal-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy literal revision" revisionResult |> ignore
-                    let attributesPath = join [| workspace.Binding.RepositoryRoot; ".gitattributes" |]
+                    let attributesPath = join [| workspace.Repository.Descriptor.RepositoryRoot; ".gitattributes" |]
                     let! generatedAttributes = tryReadUtf8FileAsync attributesPath
                     let generatedAttributes = generatedAttributes |> Option.defaultValue ""
                     let escapedPattern =
@@ -3436,29 +3471,29 @@ Vitest.describe (
                             ".gitattributes"
                             (generatedAttributes + "*.bin filter=lfs diff=lfs merge=lfs -text\n")
 
-                    let! _ = runGitIn workspace.Binding.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
+                    let! _ = runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "add"; ".gitattributes" |] None
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "commit"; "-m"; "test: add wildcard for literal disable" |]
                             None
 
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let! disableResult =
-                        storagePolicy.SetPathPolicy
+                        storagePolicy.SetPathPolicy workspace.Repository
                             (mkRepositoryPath relativePath)
                             false
                             (OperationContext.detached "automatic-policy-literal-disable")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy literal disable" disableResult |> ignore
                     let! filter =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "check-attr"; "-z"; "filter"; "--"; relativePath |]
                             None
@@ -3480,24 +3515,26 @@ Vitest.describe (
 
                     let asteriskPath = "data/policy*.bin"
                     let! enableAsterisk =
-                        storagePolicy.SetPathPolicy
+                        storagePolicy.SetPathPolicy workspace.Repository
                             (mkRepositoryPath asteriskPath)
                             true
                             (OperationContext.detached "automatic-policy-asterisk-enable")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy asterisk enable" enableAsterisk |> ignore
                     let! disableAsterisk =
-                        storagePolicy.SetPathPolicy
+                        storagePolicy.SetPathPolicy workspace.Repository
                             (mkRepositoryPath asteriskPath)
                             false
                             (OperationContext.detached "automatic-policy-asterisk-disable")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy asterisk disable" disableAsterisk |> ignore
                     let! asteriskFilter =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "check-attr"; "-z"; "filter"; "--"; asteriskPath |]
                             None
@@ -3522,21 +3559,22 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let! setFourResult =
-                        storagePolicy.SetSettings
+                        storagePolicy.SetSettings workspace.Repository
                             {
                                 AutoPolicyThresholdMb = Some 4
                                 MaterializeLargeObjects = true
                             }
                             (OperationContext.detached "automatic-policy-set-four")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy set four" setFourResult |> ignore
                     let! settingsFourResult =
-                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-get-four")
+                        storagePolicy.GetSettings workspace.Repository (OperationContext.detached "automatic-policy-get-four")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let settingsFour = expectProviderValue "automatic policy get four" settingsFourResult
@@ -3545,24 +3583,26 @@ Vitest.describe (
                     do! workspace.WriteFile "four-megabyte-threshold.bin" (String.replicate (1024 * 1024) "f")
 
                     let! firstStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-four-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-four-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let firstStatus = expectProviderValue "automatic policy four status" firstStatusResult
                     let! firstRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: automatic policy four MiB threshold"
                                 Paths = [| mkRepositoryPath "four-megabyte-threshold.bin" |]
                                 ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-four-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy four revision" firstRevisionResult |> ignore
                     let! firstCommitted =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "show"; "HEAD:four-megabyte-threshold.bin" |]
                             None
@@ -3570,17 +3610,19 @@ Vitest.describe (
                     Vitest.expect(firstCommitted.Contains "git-lfs").toBe false
 
                     let! setOneResult =
-                        storagePolicy.SetSettings
+                        storagePolicy.SetSettings workspace.Repository
                             {
                                 AutoPolicyThresholdMb = Some 1
                                 MaterializeLargeObjects = false
                             }
                             (OperationContext.detached "automatic-policy-set-one")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy set one" setOneResult |> ignore
                     let! settingsOneResult =
-                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-get-one")
+                        storagePolicy.GetSettings workspace.Repository (OperationContext.detached "automatic-policy-get-one")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let settingsOne = expectProviderValue "automatic policy get one" settingsOneResult
@@ -3589,24 +3631,26 @@ Vitest.describe (
                     do! workspace.WriteFile "one-megabyte-threshold.bin" (String.replicate (1024 * 1024) "o")
 
                     let! secondStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-one-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-one-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let secondStatus = expectProviderValue "automatic policy one status" secondStatusResult
                     let! secondRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: automatic policy one MiB threshold"
                                 Paths = [| mkRepositoryPath "one-megabyte-threshold.bin" |]
                                 ExpectedRepositoryVersion = secondStatus.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-one-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy one revision" secondRevisionResult |> ignore
                     let! secondCommitted =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "show"; "HEAD:one-megabyte-threshold.bin" |]
                             None
@@ -3614,13 +3658,14 @@ Vitest.describe (
                     Vitest.expect(secondCommitted.Contains "git-lfs").toBe true
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "config"; "--local"; "versioncontrolservice.lfs.autotrackthresholdmb"; "garbage" |]
                             None
 
                     let! corruptSettingsResult =
-                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-corrupt-settings")
+                        storagePolicy.GetSettings workspace.Repository (OperationContext.detached "automatic-policy-corrupt-settings")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let corruptSettingsFailure = expectProviderFailure "automatic policy corrupt settings" corruptSettingsResult
@@ -3628,18 +3673,20 @@ Vitest.describe (
 
                     do! workspace.WriteFile "corrupt-threshold.bin" (String.replicate (1024 * 1024) "c")
                     let! corruptStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-corrupt-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-corrupt-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let corruptStatus = expectProviderValue "automatic policy corrupt status" corruptStatusResult
                     let! corruptRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: reject corrupt automatic threshold"
                                 Paths = [| mkRepositoryPath "corrupt-threshold.bin" |]
                                 ExpectedRepositoryVersion = corruptStatus.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-corrupt-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let corruptRevisionFailure = expectProviderFailure "automatic policy corrupt revision" corruptRevisionResult
@@ -3660,28 +3707,28 @@ Vitest.describe (
 
                 try
                     let! workspace = harness.CreateWorkspace()
-                    let globalConfig = join [| dirname workspace.Binding.RepositoryRoot; "automatic-policy-global.config" |]
+                    let globalConfig = join [| dirname workspace.Repository.Descriptor.RepositoryRoot; "automatic-policy-global.config" |]
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "config"; "--file"; globalConfig; "versioncontrolservice.lfs.autotrackthresholdmb"; "4" |]
                             None
 
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "config"; "--file"; globalConfig; "versioncontrolservice.lfs.materializelargeobjects"; "true" |]
                             None
 
                     setProcessEnvironment "GIT_CONFIG_GLOBAL" globalConfig
                     let storagePolicy =
-                        workspace.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                        workspace.Provider.StoragePolicy
 
                     let! defaultSettingsResult =
-                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-global-default-settings")
+                        storagePolicy.GetSettings workspace.Repository (OperationContext.detached "automatic-policy-global-default-settings")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let defaultSettings = expectProviderValue "automatic policy global default settings" defaultSettingsResult
@@ -3689,44 +3736,48 @@ Vitest.describe (
                     Vitest.expect(defaultSettings.MaterializeLargeObjects).toBe false
                     do! workspace.WriteFile "global-only.bin" (String.replicate (1024 * 1024) "g")
                     let! firstStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-global-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-global-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let firstStatus = expectProviderValue "automatic policy global status" firstStatusResult
                     let! firstRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: ignore global automatic LFS settings"
                                 Paths = [| mkRepositoryPath "global-only.bin" |]
                                 ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-global-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy global revision" firstRevisionResult |> ignore
                     let! firstCommitted =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:global-only.bin" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:global-only.bin" |] None
 
                     Vitest.expect(firstCommitted.Contains "git-lfs").toBe true
                     let! _ =
                         runGitIn
-                            workspace.Binding.RepositoryRoot
+                            workspace.Repository.Descriptor.RepositoryRoot
                             [||]
                             [| "config"; "--file"; globalConfig; "versioncontrolservice.lfs.autotrackthresholdmb"; "1" |]
                             None
 
                     let! localSettingsResult =
-                        storagePolicy.SetSettings
+                        storagePolicy.SetSettings workspace.Repository
                             {
                                 AutoPolicyThresholdMb = Some 4
                                 MaterializeLargeObjects = true
                             }
                             (OperationContext.detached "automatic-policy-local-wins-set")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy local wins set" localSettingsResult |> ignore
                     let! localReportedResult =
-                        storagePolicy.GetSettings (OperationContext.detached "automatic-policy-local-wins-get")
+                        storagePolicy.GetSettings workspace.Repository (OperationContext.detached "automatic-policy-local-wins-get")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let localReported = expectProviderValue "automatic policy local wins get" localReportedResult
@@ -3734,23 +3785,25 @@ Vitest.describe (
                     Vitest.expect(localReported.MaterializeLargeObjects).toBe true
                     do! workspace.WriteFile "local-wins.bin" (String.replicate (1024 * 1024) "l")
                     let! secondStatusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "automatic-policy-local-wins-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "automatic-policy-local-wins-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let secondStatus = expectProviderValue "automatic policy local wins status" secondStatusResult
                     let! secondRevisionResult =
-                        workspace.Session.Core.CreateRevision
+                        workspace.Provider.CreateRevision workspace.Repository
                             {
                                 Message = "test: local automatic LFS settings win"
                                 Paths = [| mkRepositoryPath "local-wins.bin" |]
                                 ExpectedRepositoryVersion = secondStatus.RepositoryVersion
                             }
                             (OperationContext.detached "automatic-policy-local-wins-revision")
+                        |> executed
                         |> Async.StartAsPromise
 
                     expectProviderValue "automatic policy local wins revision" secondRevisionResult |> ignore
                     let! secondCommitted =
-                        runGitIn workspace.Binding.RepositoryRoot [||] [| "show"; "HEAD:local-wins.bin" |] None
+                        runGitIn workspace.Repository.Descriptor.RepositoryRoot [||] [| "show"; "HEAD:local-wins.bin" |] None
 
                     Vitest.expect(secondCommitted.Contains "git-lfs").toBe false
                     match originalGlobal with
@@ -3836,21 +3889,9 @@ let private createDownloadedLfsRestoreFixtureWithHooks (hooks: GitWorkspaceSessi
     let! _ = runGitIn repoPath [||] [| "lfs"; "install"; "--local" |] None
     let! _ = runGitIn repoPath [||] [| "lfs"; "pull"; "origin" |] None
 
-    let binding: WorkspaceBinding = {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = gitProviderId
-        RepositoryRoot = repoPath
-        ProviderStateRef = None
-        Location = {
-            ProviderId = gitProviderId
-            DisplayName = None
-            ProviderLocation = barePath
-            ConnectionProfileId = None
-        }
-        ConnectionProfileId = None
-    }
-
-    return root, repoPath, GitWorkspaceSession.createSession hooks binding
+    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
+    let! repository = openFolder provider repoPath None "downloaded-lfs-open"
+    return root, repoPath, provider, repository
 }
 
 let private createDownloadedLfsRestoreFixture () =
@@ -3891,24 +3932,26 @@ let private restoreLfsFileWithIndexError (createLock: bool) (operationName: stri
                     })
     }
 
-    let! root, repoPath, session = createDownloadedLfsRestoreFixtureWithHooks hooks
+    let! root, repoPath, provider, repository = createDownloadedLfsRestoreFixtureWithHooks hooks
 
     try
         do! writeUtf8FileAsync (join [| repoPath; "large.bin" |]) "local edit\n"
 
         let! statusResult =
-            session.Core.GetStatus(OperationContext.detached $"{operationName}-status")
+            provider.GetStatus repository (OperationContext.detached $"{operationName}-status")
+            |> executed
             |> Async.StartAsPromise
 
         let status = expectProviderValue "status before restoring the LFS file" statusResult
 
         let! restoreResult =
-            session.Core.RestorePaths
+            provider.RestorePaths repository
                 {
                     Paths = [| repositoryPath "large.bin" |]
                     ExpectedRepositoryVersion = status.RepositoryVersion
                 }
                 (OperationContext.detached operationName)
+            |> executed
             |> Async.StartAsPromise
 
         let lockExists = NodeFileSystem.existsSync (join [| repoPath; ".git"; "index.lock" |])
@@ -3937,9 +3980,9 @@ Vitest.describe (
                         ConnectionProfileId = None
                     }
 
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let provider = GitProvider.create GitProviderOptions.defaults
                     let! result =
-                        factory.Clone
+                        provider.Clone
                             {
                                 Location = location
                                 TargetPath = targetPath
@@ -3947,6 +3990,7 @@ Vitest.describe (
                                 MaterializeAllObjects = false
                             }
                             (OperationContext.detached "clone-unsupported-target-ref")
+                        |> executed
                         |> Async.StartAsPromise
 
                     match result with
@@ -3966,10 +4010,10 @@ Vitest.describe (
 )
 
 Vitest.describe (
-    "Git workspace adoption",
+    "Git open of an existing folder",
     fun () ->
         Vitest.test (
-            "Git adopts an existing repository",
+            "Git opens an existing repository",
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
 
@@ -3990,23 +4034,29 @@ Vitest.describe (
 
                     let configPath = join [| repoPath; ".git"; "config" |]
                     let! configBefore = readFileBase64Async configPath
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let provider = GitProvider.create GitProviderOptions.defaults
 
-                    let! adoptionResult =
+                    let! openResult =
                         Async.StartAsPromise(
-                            factory.Adopt
+                            provider.Open
                                 {
                                     RepositoryRoot = repoPath
                                     ConnectionProfileId = Some "account-a"
                                 }
-                                (OperationContext.detached "adopt-remote")
+                                (OperationContext.detached "open-remote")
+                            |> executed
                         )
 
-                    let binding = expectProviderValue "adopt existing Git repository" adoptionResult
-                    Vitest.expect(binding.RepositoryRoot).toBe (repoPath.Replace("\\", "/"))
-                    Vitest.expect(binding.Location.ProviderLocation).toBe (expectedRemoteLocation.Trim())
-                    Vitest.expect(binding.ConnectionProfileId).toEqual (Some "account-a")
-                    Vitest.expect(binding.Location.ConnectionProfileId).toEqual (Some "account-a")
+                    let repository = expectProviderValue "open existing Git repository" openResult
+                    Vitest.expect(repository.Descriptor.RepositoryRoot).toBe (repoPath.Replace("\\", "/"))
+
+                    Vitest.expect(repository.Descriptor.Location |> Option.map _.ProviderLocation).toEqual (
+                        Some(expectedRemoteLocation.Trim())
+                    )
+
+                    Vitest.expect(repository.Descriptor.Location |> Option.bind _.ConnectionProfileId).toEqual (
+                        Some "account-a"
+                    )
 
                     let! configAfter = readFileBase64Async configPath
                     Vitest.expect(configAfter).toBe (configBefore)
@@ -4014,26 +4064,29 @@ Vitest.describe (
                     let! _ = runGitIn root [||] [| "init"; "-b"; "main"; localOnlyPath |] None
                     do! writeUtf8FileAsync (join [| localOnlyPath; "uncommitted.txt" |]) "local change\n"
 
-                    let! localAdoptionResult =
+                    let! localOpenResult =
                         Async.StartAsPromise(
-                            factory.Adopt
+                            provider.Open
                                 {
                                     RepositoryRoot = localOnlyPath
                                     ConnectionProfileId = None
                                 }
-                                (OperationContext.detached "adopt-local")
+                                (OperationContext.detached "open-local")
+                            |> executed
                         )
 
-                    let localBinding = expectProviderValue "adopt remote-less Git repository" localAdoptionResult
-                    Vitest.expect(localBinding.RepositoryRoot).toBe (localOnlyPath.Replace("\\", "/"))
-                    Vitest.expect(localBinding.Location.ProviderLocation).toBe (localOnlyPath.Replace("\\", "/"))
+                    let localRepository = expectProviderValue "open remote-less Git repository" localOpenResult
+                    Vitest.expect(localRepository.Descriptor.RepositoryRoot).toBe (localOnlyPath.Replace("\\", "/"))
 
-                    let! opened =
-                        Async.StartAsPromise(factory.Open localBinding (OperationContext.detached "open-adopted-local"))
+                    Vitest.expect(localRepository.Descriptor.Location |> Option.map _.ProviderLocation).toEqual (
+                        Some(localOnlyPath.Replace("\\", "/"))
+                    )
 
-                    let session = expectProviderValue "open adopted local repository" opened
                     let! statusResult =
-                        Async.StartAsPromise(session.Core.GetStatus(OperationContext.detached "adopted-local-status"))
+                        Async.StartAsPromise(
+                            provider.GetStatus localRepository (OperationContext.detached "adopted-local-status")
+                            |> executed
+                        )
 
                     let status = expectProviderValue "adopted local status" statusResult
                     Vitest.expect(status.Changes |> Array.map (fun change -> RepositoryPath.value change.Path)).toEqual ([| "uncommitted.txt" |])
@@ -4050,7 +4103,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "Git adoption strips origin userinfo from the binding and keeps the remote unchanged",
+            "Git open strips origin userinfo from the repository location and keeps the remote unchanged",
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
 
@@ -4061,20 +4114,24 @@ Vitest.describe (
                     let! _ = runGitIn root [||] [| "init"; "-b"; "main"; repoPath |] None
                     let! _ = runGitIn repoPath [||] [| "remote"; "add"; "origin"; credentialUrl |] None
 
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let provider = GitProvider.create GitProviderOptions.defaults
 
-                    let! adoptionResult =
+                    let! openResult =
                         Async.StartAsPromise(
-                            factory.Adopt
+                            provider.Open
                                 {
                                     RepositoryRoot = repoPath
                                     ConnectionProfileId = None
                                 }
-                                (OperationContext.detached "adopt-credential-origin")
+                                (OperationContext.detached "open-credential-origin")
+                            |> executed
                         )
 
-                    let binding = expectProviderValue "adopt credential-bearing Git origin" adoptionResult
-                    Vitest.expect(binding.Location.ProviderLocation).toBe "https://example.invalid/org/repo.git"
+                    let repository = expectProviderValue "open credential-bearing Git origin" openResult
+
+                    Vitest.expect(repository.Descriptor.Location |> Option.map _.ProviderLocation).toEqual (
+                        Some "https://example.invalid/org/repo.git"
+                    )
 
                     let! configuredRemote =
                         runGitIn repoPath [||] [| "config"; "--get"; "remote.origin.url" |] None
@@ -4089,7 +4146,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "Git Bind strips userinfo from the binding when fetch fails",
+            "Git Bind strips userinfo from the repository location when fetch fails",
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
 
@@ -4116,7 +4173,7 @@ Vitest.describe (
                                         NodeProcess.run request context)
                     }
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
                     let location = {
                         ProviderId = gitProviderId
                         DisplayName = None
@@ -4126,17 +4183,21 @@ Vitest.describe (
 
                     let! bindResult =
                         Async.StartAsPromise(
-                            factory.Bind
+                            provider.Bind
                                 {
                                     RepositoryRoot = repoPath
                                     Location = location
                                 }
                                 (OperationContext.detached "bind-credential-origin")
+                            |> executed
                         )
 
-                    let binding = expectProviderValue "bind credential-bearing Git location" bindResult
+                    let repository = expectProviderValue "bind credential-bearing Git location" bindResult
                     Vitest.expect(fetchObserved).toBe true
-                    Vitest.expect(binding.Location.ProviderLocation).toBe "https://example.invalid/org/repo.git"
+
+                    Vitest.expect(repository.Descriptor.Location |> Option.map _.ProviderLocation).toEqual (
+                        Some "https://example.invalid/org/repo.git"
+                    )
 
                     do! removeDirectoryAsync root
                 with error ->
@@ -4156,28 +4217,25 @@ Vitest.describe (
                     let filePath = join [| nonGitPath; "uncommitted.txt" |]
                     do! writeUtf8FileAsync filePath "uncommitted bytes\n"
                     let! bytesBefore = readFileBase64Async filePath
-                    let factory = GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+                    let provider = GitProvider.create GitProviderOptions.defaults
 
                     let! initializationResult =
                         Async.StartAsPromise(
-                            factory.Initialize
+                            provider.Initialize
                                 {
                                     TargetPath = nonGitPath
                                     Location = None
                                 }
                                 (OperationContext.detached "initialize-non-git")
+                            |> executed
                         )
 
-                    let binding = expectProviderValue "initialize non-Git directory" initializationResult
+                    let repository = expectProviderValue "initialize non-Git directory" initializationResult
                     let! bytesAfter = readFileBase64Async filePath
                     Vitest.expect(bytesAfter).toBe (bytesBefore)
 
-                    let! opened =
-                        Async.StartAsPromise(factory.Open binding (OperationContext.detached "open-initialized-non-git"))
-
-                    let session = expectProviderValue "open initialized non-Git directory" opened
                     let! statusResult =
-                        Async.StartAsPromise(session.Core.GetStatus(OperationContext.detached "initialized-non-git-status"))
+                        Async.StartAsPromise(provider.GetStatus repository (OperationContext.detached "initialized-non-git-status") |> executed)
 
                     let status = expectProviderValue "initialized non-Git status" statusResult
                     Vitest.expect(status.Changes |> Array.map (fun change -> RepositoryPath.value change.Path)).toEqual ([| "uncommitted.txt" |])
@@ -4186,12 +4244,13 @@ Vitest.describe (
 
                     let! existingResult =
                         Async.StartAsPromise(
-                            factory.Initialize
+                            provider.Initialize
                                 {
                                     TargetPath = existingGitPath
                                     Location = None
                                 }
                                 (OperationContext.detached "initialize-existing-git")
+                            |> executed
                         )
 
                     let existingFailure = expectProviderFailure "initialize existing Git repository" existingResult
@@ -4206,59 +4265,81 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "Git adoption preserves origin lookup failure semantics",
+            "Git open preserves origin lookup failure semantics",
             fun () -> promise {
                 let request = {
                     RepositoryRoot = "C:/adoption-fixture"
                     ConnectionProfileId = None
                 }
 
-                let missingOriginFactory =
-                    GitWorkspaceSession.createFactory(
-                        adoptionHooks (OperationResult.succeeded (processOutput 1 "" ""))
-                    )
+                let missingOriginProvider =
+                    GitProvider.create {
+                        GitProviderOptions.defaults with
+                            Hooks = adoptionHooks (OperationResult.succeeded (processOutput 1 "" ""))
+                    }
 
                 let! missingOriginResult =
-                    Async.StartAsPromise(missingOriginFactory.Adopt request (OperationContext.detached "origin-missing"))
-
-                let missingOrigin = expectProviderValue "adopt without origin" missingOriginResult
-                Vitest.expect(missingOrigin.Location.ProviderLocation).toBe ("C:/adoption-fixture")
-
-                let canceledFactory =
-                    GitWorkspaceSession.createFactory(
-                        adoptionHooks (OperationResult.canceled "The origin lookup was canceled.")
+                    Async.StartAsPromise(
+                        missingOriginProvider.Open request (OperationContext.detached "origin-missing")
+                        |> executed
                     )
 
+                let missingOrigin = expectProviderValue "open without origin" missingOriginResult
+
+                Vitest.expect(missingOrigin.Descriptor.Location |> Option.map _.ProviderLocation).toEqual (
+                    Some "C:/adoption-fixture"
+                )
+
+                let canceledProvider =
+                    GitProvider.create {
+                        GitProviderOptions.defaults with
+                            Hooks = adoptionHooks (OperationResult.canceled "The origin lookup was canceled.")
+                    }
+
                 let! canceledResult =
-                    Async.StartAsPromise(canceledFactory.Adopt request (OperationContext.detached "origin-canceled"))
+                    Async.StartAsPromise(
+                        canceledProvider.Open request (OperationContext.detached "origin-canceled") |> executed
+                    )
 
                 let canceledFailure = expectProviderFailure "canceled origin lookup" canceledResult
                 Vitest.expect(canceledFailure.Category).toEqual (Canceled)
                 Vitest.expect(canceledFailure.Code).toBe ("operation_canceled")
 
-                let processFailureFactory =
-                    GitWorkspaceSession.createFactory(
-                        adoptionHooks (
-                            OperationResult.failed(
-                                OperationFailure.create Network "origin_process_failed" "The origin lookup process failed."
-                            )
-                        )
-                    )
+                let processFailureProvider =
+                    GitProvider.create {
+                        GitProviderOptions.defaults with
+                            Hooks =
+                                adoptionHooks (
+                                    OperationResult.failed(
+                                        OperationFailure.create
+                                            Network
+                                            "origin_process_failed"
+                                            "The origin lookup process failed."
+                                    )
+                                )
+                    }
 
                 let! processFailureResult =
-                    Async.StartAsPromise(processFailureFactory.Adopt request (OperationContext.detached "origin-process-failed"))
+                    Async.StartAsPromise(
+                        processFailureProvider.Open request (OperationContext.detached "origin-process-failed")
+                        |> executed
+                    )
 
                 let processFailure = expectProviderFailure "failed origin lookup process" processFailureResult
                 Vitest.expect(processFailure.Category).toEqual (Network)
                 Vitest.expect(processFailure.Code).toBe ("origin_process_failed")
 
-                let unexpectedOutputFactory =
-                    GitWorkspaceSession.createFactory(
-                        adoptionHooks (OperationResult.succeeded (processOutput 2 "" "fatal: config is unreadable"))
-                    )
+                let unexpectedOutputProvider =
+                    GitProvider.create {
+                        GitProviderOptions.defaults with
+                            Hooks = adoptionHooks (OperationResult.succeeded (processOutput 2 "" "fatal: config is unreadable"))
+                    }
 
                 let! unexpectedOutputResult =
-                    Async.StartAsPromise(unexpectedOutputFactory.Adopt request (OperationContext.detached "origin-unexpected-output"))
+                    Async.StartAsPromise(
+                        unexpectedOutputProvider.Open request (OperationContext.detached "origin-unexpected-output")
+                        |> executed
+                    )
 
                 let unexpectedOutputFailure =
                     expectProviderFailure "unexpected origin lookup output" unexpectedOutputResult
@@ -4269,7 +4350,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "provider locations are validated before corrupt adoption guesses a binding",
+            "provider locations are validated before the open of a corrupt folder guesses a repository",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
@@ -4307,19 +4388,20 @@ Vitest.describe (
                                     })
                     }
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
-                    let! adoptionResult =
+                    let! openResult =
                         Async.StartAsPromise(
-                            factory.Adopt
+                            provider.Open
                                 {
                                     RepositoryRoot = workspacePath
                                     ConnectionProfileId = None
                                 }
-                                (OperationContext.detached "adopt-corrupt-repository")
+                                (OperationContext.detached "open-corrupt-repository")
+                            |> executed
                         )
 
-                    let failure = expectProviderFailure "adopt corrupt repository" adoptionResult
+                    let failure = expectProviderFailure "open corrupt repository" openResult
                     Vitest.expect(failure.Category).toEqual (Unsupported)
                     Vitest.expect(failure.Code).toBe ("adoption_unsupported")
                     Vitest.expect(failure.Message.Contains("without guessing")).toBe true
@@ -4334,7 +4416,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "provider locations are validated without hiding dubious-ownership adoption remediation",
+            "provider locations are validated without hiding the dubious-ownership remediation of an open",
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
 
@@ -4363,19 +4445,20 @@ Vitest.describe (
                                     })
                     }
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
                     let! result =
                         Async.StartAsPromise(
-                            factory.Adopt
+                            provider.Open
                                 {
                                     RepositoryRoot = workspacePath
                                     ConnectionProfileId = None
                                 }
-                                (OperationContext.detached "adopt-dubious-repository")
+                                (OperationContext.detached "open-dubious-repository")
+                            |> executed
                         )
 
-                    let failure = expectProviderFailure "adopt dubious repository" result
+                    let failure = expectProviderFailure "open dubious repository" result
                     Vitest.expect(failure.Category).toEqual (ProviderError)
                     Vitest.expect(failure.Code).toBe ("git_failure")
                     Vitest.expect(failure.Message.Contains("dubious ownership")).toBe true
@@ -4401,23 +4484,25 @@ Vitest.describe (
                 if lfsProbe.ExitCode <> 0 then
                     Vitest.expect(true).toBe true
                 else
-                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+                    let! root, repoPath, provider, repository = createDownloadedLfsRestoreFixture ()
 
                     try
                         do! writeUtf8FileAsync (join [| repoPath; "large.bin" |]) "local edit\n"
                         let! statusResult =
-                            session.Core.GetStatus(OperationContext.detached "restore-downloaded-lfs-status")
+                            provider.GetStatus repository (OperationContext.detached "restore-downloaded-lfs-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue "status before restoring the LFS file" statusResult
 
                         let! restoreResult =
-                            session.Core.RestorePaths
+                            provider.RestorePaths repository
                                 {
                                     Paths = [| repositoryPath "large.bin" |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached "restore-downloaded-lfs")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue "restore downloaded LFS file" restoreResult |> ignore
@@ -4491,7 +4576,7 @@ Vitest.describe (
                 if lfsProbe.ExitCode <> 0 then
                     Vitest.expect(true).toBe true
                 else
-                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+                    let! root, repoPath, provider, repository = createDownloadedLfsRestoreFixture ()
 
                     try
                         let! pointer = runGitIn repoPath [||] [| "show"; "HEAD:large.bin" |] None
@@ -4502,18 +4587,20 @@ Vitest.describe (
                         do! writeUtf8FileAsync (join [| repoPath; "large.bin" |]) "local edit\n"
 
                         let! statusResult =
-                            session.Core.GetStatus(OperationContext.detached "restore-lfs-without-local-object-status")
+                            provider.GetStatus repository (OperationContext.detached "restore-lfs-without-local-object-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue "status before restoring the LFS file" statusResult
 
                         let! restoreResult =
-                            session.Core.RestorePaths
+                            provider.RestorePaths repository
                                 {
                                     Paths = [| repositoryPath "large.bin" |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached "restore-lfs-without-local-object")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue "restore LFS path without a local object" restoreResult |> ignore
@@ -4535,7 +4622,7 @@ Vitest.describe (
                 if lfsProbe.ExitCode <> 0 then
                     Vitest.expect(true).toBe true
                 else
-                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+                    let! root, repoPath, provider, repository = createDownloadedLfsRestoreFixture ()
 
                     try
                         let firstPath = "data/first.bin"
@@ -4552,18 +4639,20 @@ Vitest.describe (
                         do! writeUtf8FileAsync (join [| repoPath; secondPath |]) "second local edit\n"
 
                         let! statusResult =
-                            session.Core.GetStatus(OperationContext.detached "restore-LFS-directory-status")
+                            provider.GetStatus repository (OperationContext.detached "restore-LFS-directory-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue "status before restoring the LFS directory" statusResult
 
                         let! restoreResult =
-                            session.Core.RestorePaths
+                            provider.RestorePaths repository
                                 {
                                     Paths = [| repositoryPath "data" |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached "restore-LFS-directory")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue "restore the LFS directory" restoreResult |> ignore
@@ -4588,7 +4677,7 @@ Vitest.describe (
                 if lfsProbe.ExitCode <> 0 then
                     Vitest.expect(true).toBe true
                 else
-                    let! root, repoPath, session = createDownloadedLfsRestoreFixture ()
+                    let! root, repoPath, provider, repository = createDownloadedLfsRestoreFixture ()
 
                     try
                         let relativePath = "data/Messung_ä.csv"
@@ -4602,18 +4691,20 @@ Vitest.describe (
                         do! writeUtf8FileAsync path "edited;value\n"
 
                         let! statusResult =
-                            session.Core.GetStatus(OperationContext.detached "restore-non-ASCII-status")
+                            provider.GetStatus repository (OperationContext.detached "restore-non-ASCII-status")
+                            |> executed
                             |> Async.StartAsPromise
 
                         let status = expectProviderValue "status before restoring the non-ASCII path" statusResult
 
                         let! restoreResult =
-                            session.Core.RestorePaths
+                            provider.RestorePaths repository
                                 {
                                     Paths = [| repositoryPath relativePath |]
                                     ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (OperationContext.detached "restore-non-ASCII-path")
+                            |> executed
                             |> Async.StartAsPromise
 
                         expectProviderValue "restore the non-ASCII path" restoreResult |> ignore
@@ -4641,18 +4732,18 @@ Vitest.describe (
                 try
                     let! workspace = harness.CreateWorkspace()
                     let materialization =
-                        workspace.Session.ObjectMaterialization
-                        |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                        workspace.Provider.ObjectMaterialization
 
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; ".git"; "index.lock" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; ".git"; "index.lock" |])
                             "manual lock\n"
 
                     let! result =
-                        materialization.Materialize
+                        materialization.Materialize workspace.Repository
                             [| mkRepositoryPath "base.txt" |]
                             (OperationContext.detached "materialize-index-lock")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "locked Materialize" result
@@ -4680,22 +4771,24 @@ Vitest.describe (
                     let! workspace = harness.CreateWorkspace()
                     do! workspace.WriteFile "base.txt" "changed for restore\n"
                     let! statusResult =
-                        workspace.Session.Core.GetStatus(OperationContext.detached "restore-index-lock-status")
+                        workspace.Provider.GetStatus workspace.Repository (OperationContext.detached "restore-index-lock-status")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let status = expectProviderValue "status before locked restore" statusResult
                     do!
                         writeUtf8FileAsync
-                            (join [| workspace.Binding.RepositoryRoot; ".git"; "index.lock" |])
+                            (join [| workspace.Repository.Descriptor.RepositoryRoot; ".git"; "index.lock" |])
                             "manual lock\n"
 
                     let! restoreResult =
-                        workspace.Session.Core.RestorePaths
+                        workspace.Provider.RestorePaths workspace.Repository
                             {
                                 Paths = [| mkRepositoryPath "base.txt" |]
                                 ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (OperationContext.detached "restore-index-lock")
+                        |> executed
                         |> Async.StartAsPromise
 
                     let failure = expectProviderFailure "locked RestorePaths" restoreResult
@@ -4749,7 +4842,7 @@ Vitest.describe (
                 // so the fake answers that at once and only the listing writes markers and stays silent.
                 do!
                     writeUtf8FileAsync
-                        (join [| workspace.Binding.RepositoryRoot; "lfs" |])
+                        (join [| workspace.Repository.Descriptor.RepositoryRoot; "lfs" |])
                         ("if (process.argv.includes('--version')) {\n"
                          + "  process.stdout.write('git-lfs/3.0.0 (fake)\\n');\n"
                          + "  process.exit(0);\n"
@@ -4763,8 +4856,7 @@ Vitest.describe (
                          + "}, Number(process.env.VCS_TEST_LS_DELAY_MS));\n")
 
                 let materialization =
-                    workspace.Session.ObjectMaterialization
-                    |> Option.defaultWith (fun () -> failwith "Expected Git object materialization.")
+                    workspace.Provider.ObjectMaterialization
 
                 let cancellation = OperationCancellation.Source()
                 let context = OperationContext.create "lfs-list-silent" cancellation.Cancellation ignore
@@ -4781,9 +4873,9 @@ Vitest.describe (
                     promise {
                         try
                             setCurrentProcessPath (fakeRoot + pathDelimiter + originalPath)
-                            setCurrentProcessWorkingDirectory workspace.Binding.RepositoryRoot
+                            setCurrentProcessWorkingDirectory workspace.Repository.Descriptor.RepositoryRoot
                             setProcessEnvironment "VCS_TEST_LS_DELAY_MS" (string delayMs)
-                            setProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" workspace.Binding.RepositoryRoot
+                            setProcessEnvironment "VCS_TEST_LS_DISPATCH_ROOT" workspace.Repository.Descriptor.RepositoryRoot
                             setProcessEnvironment "VCS_TEST_LS_MARKER_DIR" fakeRoot
 
                             if cancelOnStart then
@@ -4797,7 +4889,7 @@ Vitest.describe (
 
                                 cancelWhenStarted 0 |> ignore
 
-                            return! materialization.ListObjects context |> Async.StartAsPromise
+                            return! materialization.ListObjects workspace.Repository context |> executed |> Async.StartAsPromise
                         finally
                             setCurrentProcessWorkingDirectory originalWorkingDirectory
                             setCurrentProcessPath originalPath

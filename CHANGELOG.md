@@ -19,7 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 -   `DiffComparison.Revision` compares the version in a revision with the version in its first parent. The comparison does not read the working tree. The Git provider accepts only a full object id as the revision.
--   `HistoryService` is a new optional service. `ListRevisions` returns the revisions that lead to the current one, newest first, in pages, and `GetRevisionChanges` returns the objects that a revision changed against its first parent. The Git provider supplies it and lakeFS leaves it out. The new public types of the history are `ListRevisionsRequest`, `RevisionPage`, `RevisionEntry` and `RevisionSignature`. `ListRevisions` fails with the new code `invalid_cursor` for a malformed cursor, and `GetRevisionChanges` fails with the new code `revision_not_found` for a full object id that names no commit.
+-   `IHistory` is a new group of functions. `ListRevisions` returns the revisions that lead to the current one, newest first, in pages, and `GetRevisionChanges` returns the objects that a revision changed against its first parent. The Git provider has both and the lakeFS provider answers `NoOp`. The new public types of the history are `ListRevisionsRequest`, `RevisionPage`, `RevisionEntry` and `RevisionSignature`. `ListRevisions` fails with the new code `invalid_cursor` for a malformed cursor, and `GetRevisionChanges` fails with the new code `revision_not_found` for a full object id that names no commit.
+-   `IVersionControl` is the one interface of a provider and replaces `ProviderFactory` and `WorkspaceSession`. It has `Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Bind`, `Open`, `CheckDependencies`, `InstallDependency`, the eight functions of the former core (`GetStatus`, `ListRefs`, `CreateRef`, `PreflightSwitchRef`, `SwitchRef`, `CreateRevision`, `RestorePaths` and `GetDiffSummary`) and `Close`.
+-   The group interfaces `ISynchronization`, `IConflictResolution`, `ITextDiff`, `IHistory`, `IRepositoryBrowser`, `IObjectMaterialization`, `IStoragePolicy` and `IMaintenance` are members of `IVersionControl` and replace the optional services. Each function keeps the name it had and takes the `Repository` as its first argument.
+-   `Repository` is an opened repository. `Open`, `Clone`, `Initialize` and `Bind` return it and `Close` releases it. Every other function takes it as its first argument. `Repository.Descriptor` holds the `RepositoryDescriptor`. A provider that receives a repository that another provider opened answers with the failure of `Repository.ofAnotherProvider`, which has the code `repository_of_another_provider`.
+-   Every call through the interface returns `CallResult<'T>`. `Executed` holds the `OperationResult<'T>` of a provider that ran the function, and `NoOp` holds the reason of a provider that does not have it. A call to a function that is missing never throws.
+-   `ProviderFunctions` lists every function of a provider except `Probe` and `Close`. Each function is an `Entry`, either `Implemented` with the function or `Missing` with the reason. The groups have their own records, `SynchronizationFunctions`, `ConflictResolutionFunctions`, `TextDiffFunctions`, `HistoryFunctions`, `RepositoryBrowserFunctions`, `ObjectMaterializationFunctions`, `StoragePolicyFunctions` and `MaintenanceFunctions`.
+-   `ListedProvider(probe, close, functions)` builds an `IVersionControl` from a `ProviderFunctions` list. It is the only implementation of the interface in the library, and an external provider uses it too.
+-   `Subscribe.single` returns one function of a provider with its own signature and its direct result, or the reason when the provider does not have it. `Subscribe.all` returns the whole `ProviderFunctions` list. Both fail for an `IVersionControl` that is not a `ListedProvider`. Subscribing runs no check and calls no function.
+-   `GitProvider.create` takes a `GitProviderOptions` record (`Hooks`, `Credentials`, `RevisionIdentity`, `RevisionPolicy` and `TextDiff`) and returns the Git provider. `GitProviderOptions.defaults` has no hooks, anonymous credentials and identity, the automatic revision policy and no text diff pool. The Git provider has every function.
+-   `LakeFsProvider.create` takes a `LakeFsProviderOptions` record and returns the lakeFS provider. The record has the new fields `Hooks` and `Credentials` beside `StateRoot` and `PathCaseSensitivity`. The lakeFS provider has no `InstallDependency`, text diff, history, `GetRepositoryWebUrl`, object materialization, storage policy or maintenance, and a call to one of them answers `NoOp`.
+-   `OpenRequest` (`RepositoryRoot` and an optional `ConnectionProfileId`) replaces `AdoptRequest`. `Open` takes it, finds the repository root and returns the opened `Repository`.
+-   `Clone`, `Initialize` and `Bind` return the opened `Repository`. The lakeFS provider runs the first open of the folder as part of each of them.
+-   The lakeFS provider finds the state of a folder by the folder, so `Open` needs no stored reference. When the first open of a folder did not finish, `Open` fails with the new code `first_open_incomplete`, and the folder has to be initialized or bound again, or deleted and cloned again.
 
 ### Changed
 
@@ -27,24 +39,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `OperationEffect.NoOp` is renamed to `OperationEffect.Unchanged`. Its `reason` field stays, and a match on `OperationEffect` has to use the new case name.
 -   `OperationOutcome.noOp` is renamed to `OperationOutcome.unchanged`. Its signature and behavior stay.
 -   `OperationResult.noOp` is renamed to `OperationResult.unchanged`. Its signature and behavior stay.
--   `WorkspaceSession` and `ServiceAvailability` have a new field `History`, so record literals have to set it. `WorkspaceSession.createCoreOnly` sets it to `None`.
 -   `OpenDiffRequest` has a new required field `Comparison`, so record literals have to set it. `DiffComparison.WorkingFile` keeps the earlier behavior.
 -   A committed side of a text diff reports its revision in `DiffSourceInfo.Revision`, also when its content is a Git LFS object. Such a side used to report none.
 -   `WorkspaceDescriptor` is renamed to `RepositoryDescriptor`. Its fields and behavior stay, and the `WorkspaceRoot` field is renamed as described below.
--   `WorkspaceStatus` is renamed to `RepositoryStatus`. `CoreVersionControl.GetStatus` and `SwitchRef` return the new type name.
--   The field `WorkspaceRoot` is renamed to `RepositoryRoot` in `RepositoryDescriptor`, `WorkspaceBinding`, `AdoptRequest`, `BindRequest` and the `RevisionIdentityRequest` of the Git package.
+-   `WorkspaceStatus` is renamed to `RepositoryStatus`. `GetStatus` and `SwitchRef` return the new type name.
+-   The field `WorkspaceRoot` is renamed to `RepositoryRoot` in `RepositoryDescriptor`, `BindRequest` and the `RevisionIdentityRequest` of the Git package.
 -   The field `WorkspaceVersion` of `RepositoryStatus` is renamed to `RepositoryVersion`.
 -   The field `ExpectedWorkspaceVersion` is renamed to `ExpectedRepositoryVersion` in `CreateRefRequest`, `SwitchRefRequest`, `CreateRevisionRequest`, `RestoreRequest`, `UpdateRequest`, `PublishRequest`, `SynchronizeRequest`, `ResolveConflictRequest`, `FinalizeConflictRequest` and `CancelConflictRequest`.
 -   The field `ResultingWorkspaceVersion` of `OperationOutcome` is renamed to `ResultingRepositoryVersion`.
 -   The field `WorkspaceRevision` of `SynchronizationState` is renamed to `LocalRevision`.
+-   The Git provider always has a text diff. Without a pool in `GitProviderOptions.TextDiff`, `ITextDiff.Open` fails with `diff_worker_failed`. The creation functions that took no `GitSessionOptions` used to leave the text diff absent.
+-   `LakeFsSessionHooks` moved from `LakeFsWorkspaceSession` to the module `LakeFsProviderOptions`.
+-   `LakeFsProviderFactory.probe` takes the `LakeFsProviderOptions` and the folder. It answers `Detected` when the provider state records the folder and no longer looks for `.lakefs_ref.yaml`.
+-   `TextDiffPool.Service` and `GitTextDiffService.create` return the new record `TextDiffPool.TextDiffCalls`, which holds the seven text diff functions without a repository argument. They returned a `TextDiffService` before.
 
 ### Removed
 
--   `WorkspaceSession.withFallbackServices` and `ProviderFactory.withFallbackServices` are removed, together with the stand-in services that filled absent optional services.
+-   `ProviderFactory`, `WorkspaceSession` with `WorkspaceSession.createCoreOnly` and `WorkspaceSession.availability`, `ServiceAvailability` and `CoreVersionControl` are removed. `IVersionControl` replaces them.
+-   `ProviderFactory.Id` is removed, and `IVersionControl` has no member for it. A host takes the provider id from `Descriptor.ProviderId` of an opened `Repository`. Before it has opened one, it knows the id because it chose the provider, and `WellKnownProviderIds` holds the ids of the two built-in providers.
+-   The service records `SynchronizationService`, `ConflictResolutionService`, `TextDiffService`, `ObjectMaterializationService`, `StoragePolicyService`, `StorageMaintenanceService` and `RepositoryBrowserService` are removed, together with the optional services as `option` values on the session. The group interfaces replace them.
+-   `WorkspaceBinding`, `WorkspaceBinding.CurrentSchemaVersion` and the `ProviderStateRef` field are removed. A host stores no binding. It gives the folder to `Open`, and the provider finds its own state.
+-   `AdoptRequest` and the `Adopt` function of the factory are removed. `Open` with an `OpenRequest` does what adopt and open did together.
+-   The failure code `operation_not_supported` is removed. A function that a provider does not have answers `NoOp`, and a refusal for one input is a failure with a code of the provider.
+-   The ten creation functions `GitWorkspaceSession.createFactory`, `createFactoryWithCredentials`, `createFactoryWithCredentialsAndIdentity`, `createFactoryWithCredentialsIdentityAndPolicy`, `createFactoryWithOptions`, `createSession`, `createSessionWithCredentials`, `createSessionWithCredentialsAndIdentity`, `createSessionWithCredentialsIdentityAndPolicy` and `createSessionWithOptions` are removed, together with `GitSessionOptions`. `GitProvider.create` replaces them, and `GitSessionHooks` stays.
+-   `LakeFsWorkspaceSession.createFactory`, `createFactoryWithPolicy`, `createFactoryWithHooks`, `createFactoryWithHooksAndPolicy`, `openSession` and `LakeFsProviderFactory.createFactory` are removed. `LakeFsProvider.create` replaces them. lakeFS ignored the revision policy that some of them accepted, so it is gone with them. `LakeFsWorkspaceSession.cleanupOwnedWorkspaceBranch` is no longer public.
+-   The stand-in services that filled absent optional services are removed, together with `WorkspaceSession.withFallbackServices` and `ProviderFactory.withFallbackServices`. A call to a function that a provider does not have answers `NoOp`.
 -   `FallbackServiceCodes` and its `FallbackServiceCodes.ServiceUnavailable` code (`service_unavailable`) are removed, because only the stand-in services reported it.
 -   `DiffBlocker.ProviderUnsupported` is removed, because only the stand-in text diff service returned it. A match on `DiffBlocker` has to drop the case.
--   `ProviderResolver.ProviderCatalog`, `ProviderResolver.tryCreateCatalog`, `ProviderResolver.factories` and `ProviderResolver.tryGetFactory` are removed. A host keeps its provider factories itself.
+-   `ProviderResolver.ProviderCatalog`, `ProviderResolver.tryCreateCatalog`, `ProviderResolver.factories` and `ProviderResolver.tryGetFactory` are removed. A host keeps its providers itself.
 -   `ProviderResolver.resolve` is removed, together with `ProviderResolver.ResolutionRequest`, `ProviderResolver.ResolutionReport`, `ProviderResolver.WorkspaceResolution` with its cases `Bound`, `ProbedWorkspace`, `AmbiguousWorkspace` and `UnmanagedWorkspace`, and `ProviderResolver.DetectionCandidate`. A host asks the `Probe` of each provider it has and decides itself which provider owns a folder. `ProviderResolver.normalizePath` and `PathCaseSensitivity` stay.
+-   The lakeFS failure code `provider_state_ref_missing` is removed. `Open` no longer fails with `provider_state_mismatch` for a location that differs from the stored index, because a host passes no reference and no location to `Open`. The code stays for a state entry that belongs to another folder.
 
 ### Fixed
 

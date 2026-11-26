@@ -6,8 +6,8 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
-/// Optional service suites: each runs only when the harness advertises the service.
-/// Absent services are absent — never stubs.
+/// Optional function suites: the tests of a group run only when `harness.ExpectedServices` names the group.
+/// The first test checks that the groups found in the function list of the provider match that list.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
     let profileName = $"{harness.Name} / optional service suites"
     let mutable testCount = 0
@@ -22,17 +22,8 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             profileTest "advertised optional services match the harness expectation"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
-                let discovered = discoverFeatures workspace.Session
+                let discovered = discoverFeatures workspace.Provider
                 Vitest.expect(List.toArray discovered).toEqual (List.toArray (List.sort harness.ExpectedServices))
-            }
-
-            profileTest "the availability of object materialization follows the harness expectation"
-            <| fun () -> promise {
-                let! workspace = harness.CreateWorkspace()
-                let availability = WorkspaceSession.availability workspace.Session
-
-                Vitest.expect(availability.ObjectMaterialization)
-                    .toBe (harness.ExpectedServices |> List.contains "materialization")
             }
 
             if harness.ExpectedServices |> List.contains "materialization" then
@@ -40,12 +31,9 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let materialization =
-                        match workspace.Session.ObjectMaterialization with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises materialization but the session lacks it."
+                    let materialization = workspace.Provider.ObjectMaterialization
 
-                    let! listResult = run (materialization.ListObjects(ctx "list-objects"))
+                    let! listResult = run (executed (materialization.ListObjects workspace.Repository (ctx "list-objects")))
                     expectValue "list objects" listResult |> ignore
                 }
 
@@ -53,15 +41,12 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let materialization =
-                        match workspace.Session.ObjectMaterialization with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises materialization but the session lacks it."
+                    let materialization = workspace.Provider.ObjectMaterialization
 
-                    let! materializeResult = run (materialization.Materialize [||] (ctx "materialize-none"))
+                    let! materializeResult = run (executed (materialization.Materialize workspace.Repository [||] (ctx "materialize-none")))
                     expectUnchanged "materialize of no paths" materializeResult |> ignore
 
-                    let! dematerializeResult = run (materialization.Dematerialize [||] (ctx "dematerialize-none"))
+                    let! dematerializeResult = run (executed (materialization.Dematerialize workspace.Repository [||] (ctx "dematerialize-none")))
                     expectUnchanged "dematerialize of no paths" dematerializeResult |> ignore
                 }
 
@@ -70,12 +55,9 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let storagePolicy =
-                        match workspace.Session.StoragePolicy with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises storage-policy but the session lacks it."
+                    let storagePolicy = workspace.Provider.StoragePolicy
 
-                    let! settingsResult = run (storagePolicy.GetSettings(ctx "get-settings"))
+                    let! settingsResult = run (executed (storagePolicy.GetSettings workspace.Repository (ctx "get-settings")))
                     expectValue "get storage settings" settingsResult |> ignore
                 }
 
@@ -84,12 +66,9 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let maintenance =
-                        match workspace.Session.Maintenance with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises maintenance but the session lacks it."
+                    let maintenance = workspace.Provider.Maintenance
 
-                    let! pruneResult = run (maintenance.Prune(ctx "prune"))
+                    let! pruneResult = run (executed (maintenance.Prune workspace.Repository (ctx "prune")))
 
                     // Success or a classified failure are both fine; hidden errors are not.
                     match pruneResult with
@@ -102,10 +81,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let maintenance =
-                        match workspace.Session.Maintenance with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises maintenance but the session lacks it."
+                    let maintenance = workspace.Provider.Maintenance
 
                     let progressReports = ResizeArray<OperationProgress>()
 
@@ -115,7 +91,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             OperationCancellation.none
                             progressReports.Add
 
-                    let! _ = run (maintenance.Deduplicate progressContext)
+                    let! _ = run (executed (maintenance.Deduplicate workspace.Repository progressContext))
                     Vitest.expect(progressReports.Count > 0).toBe (true)
 
                     let cancellation = OperationCancellation.Source()
@@ -124,7 +100,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     let canceledContext =
                         OperationContext.create "maintenance-canceled" cancellation.Cancellation ignore
 
-                    let! canceledResult = run (maintenance.Prune canceledContext)
+                    let! canceledResult = run (executed (maintenance.Prune workspace.Repository canceledContext))
                     let failure = expectFailure "canceled maintenance" canceledResult
                     Vitest.expect(failure.Category).toEqual (Canceled)
                     Vitest.expect(failure.StateChanged).toBe (false)
@@ -135,12 +111,9 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let browser =
-                        match workspace.Session.RepositoryBrowser with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises browser but the session lacks it."
+                    let browser = workspace.Provider.RepositoryBrowser
 
-                    let! urlResult = run (browser.GetRepositoryWebUrl(ctx "web-url"))
+                    let! urlResult = run (executed (browser.GetRepositoryWebUrl workspace.Repository (ctx "web-url")))
                     expectValue "repository web url" urlResult |> ignore
                 }
 
@@ -149,10 +122,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 <| fun () -> promise {
                     let! workspace = harness.CreateWorkspace()
 
-                    let history =
-                        match workspace.Session.History with
-                        | Some service -> service
-                        | None -> failwith "The harness advertises history but the session lacks it."
+                    let history = workspace.Provider.History
 
                     let! status = getStatus workspace
 
@@ -161,12 +131,12 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         | Some revision -> revision
                         | None -> failwith "Expected the workspace to report its current revision."
 
-                    let! pageResult = run (history.ListRevisions { Cursor = None; Limit = 10 } (ctx "list-revisions"))
+                    let! pageResult = run (executed (history.ListRevisions workspace.Repository { Cursor = None; Limit = 10 } (ctx "list-revisions")))
                     let page = expectValue "list revisions" pageResult
                     Vitest.expect(page.Revisions.Length > 0).toBe (true)
                     Vitest.expect(page.Revisions[0].Id = current).toBe (true)
 
-                    let! changesResult = run (history.GetRevisionChanges current (ctx "revision-changes"))
+                    let! changesResult = run (executed (history.GetRevisionChanges workspace.Repository current (ctx "revision-changes")))
                     let changes = expectValue "get revision changes" changesResult
                     Vitest.expect(changes.Entries.Length > 0).toBe (true)
                 }

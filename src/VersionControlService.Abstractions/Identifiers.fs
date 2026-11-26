@@ -86,7 +86,7 @@ type RepositoryLocation = {
 
 module RepositoryLocation =
 
-    /// Removes HTTP(S) userinfo and passwords from SSH userinfo. Providers use this when creating bindings so credentials do not reach a stored binding.
+    /// Removes HTTP(S) userinfo and passwords from SSH userinfo. Providers use this when they record a location so credentials do not reach it.
     let withoutUserInfo (location: string) : string =
         if isNull location then
             location

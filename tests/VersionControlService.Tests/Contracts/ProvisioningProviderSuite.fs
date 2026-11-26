@@ -28,21 +28,19 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! initializeResult =
                     run (
-                        harness.Factory.Initialize
-                            {
-                                TargetPath = targetPath
-                                Location = Some location
-                            }
-                            (ctx "initialize")
+                        executed (
+                            harness.Provider.Initialize
+                                {
+                                    TargetPath = targetPath
+                                    Location = Some location
+                                }
+                                (ctx "initialize")
+                        )
                     )
 
-                let binding = expectValue "initialize" initializeResult
-                Vitest.expect(binding.SchemaVersion).toBe (WorkspaceBinding.CurrentSchemaVersion)
+                let repository = expectValue "initialize" initializeResult
 
-                let! openResult = run (harness.Factory.Open binding (ctx "open-initialized"))
-                let session = expectValue "open initialized workspace" openResult
-
-                let! status = sessionStatus session
+                let! status = repositoryStatus harness.Provider repository
                 Vitest.expect(status.RepositoryVersion.Length > 0).toBe (true)
             }
 
@@ -53,21 +51,21 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! cloneResult =
                     run (
-                        harness.Factory.Clone
-                            {
-                                Location = anchor.Binding.Location
-                                TargetPath = clonePath
-                                TargetRef = None
-                                MaterializeAllObjects = true
-                            }
-                            (ctx "clone")
+                        executed (
+                            harness.Provider.Clone
+                                {
+                                    Location = locationOf anchor
+                                    TargetPath = clonePath
+                                    TargetRef = None
+                                    MaterializeAllObjects = true
+                                }
+                                (ctx "clone")
+                        )
                     )
 
-                let binding = expectValue "clone" cloneResult
-                let! openResult = run (harness.Factory.Open binding (ctx "open-clone"))
-                let session = expectValue "open cloned workspace" openResult
+                let repository = expectValue "clone" cloneResult
 
-                let! status = sessionStatus session
+                let! status = repositoryStatus harness.Provider repository
                 Vitest.expect(status.Changes.Length).toBe (0)
 
                 match status.Synchronization with
@@ -96,14 +94,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! cloneResult =
                     run (
-                        harness.Factory.Clone
-                            {
-                                Location = anchor.Binding.Location
-                                TargetPath = targetPath
-                                TargetRef = None
-                                MaterializeAllObjects = true
-                            }
-                            cloneContext
+                        executed (
+                            harness.Provider.Clone
+                                {
+                                    Location = locationOf anchor
+                                    TargetPath = targetPath
+                                    TargetRef = None
+                                    MaterializeAllObjects = true
+                                }
+                                cloneContext
+                        )
                     )
 
                 let failure = expectFailure "pre-canceled clone" cloneResult
@@ -132,25 +132,37 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! bindResult =
                     run (
-                        harness.Factory.Bind
-                            {
-                                RepositoryRoot = workspace.Binding.RepositoryRoot
-                                Location = otherWorkspace.Binding.Location
-                            }
-                            (ctx "bind")
+                        executed (
+                            harness.Provider.Bind
+                                {
+                                    RepositoryRoot = workspace.Repository.Descriptor.RepositoryRoot
+                                    Location = locationOf otherWorkspace
+                                }
+                                (ctx "bind")
+                        )
                     )
 
                 let rebound = expectValue "bind" bindResult
-                Vitest.expect(rebound.Location.ProviderLocation).toBe (otherWorkspace.Binding.Location.ProviderLocation)
 
-                let! openResult = run (harness.Factory.Open rebound (ctx "open-rebound"))
-                let session = expectValue "open rebound workspace" openResult
+                Vitest
+                    .expect(rebound.Descriptor.Location |> Option.map _.ProviderLocation)
+                    .toEqual (Some((locationOf otherWorkspace).ProviderLocation))
 
-                let! refreshResult = run ((syncService session).Refresh(ctx "rebound-refresh"))
+                let! refreshResult =
+                    run (executed (harness.Provider.Synchronization.Refresh rebound (ctx "rebound-refresh")))
+
                 let state = expectValue "rebound refresh" refreshResult
 
-                // The rebound session now observes the other target's live head.
-                let! otherRefreshResult = run ((syncService otherWorkspace.Session).Refresh(ctx "other-refresh"))
+                // The rebound repository now observes the other target's live head.
+                let! otherRefreshResult =
+                    run (
+                        executed (
+                            otherWorkspace.Provider.Synchronization.Refresh
+                                otherWorkspace.Repository
+                                (ctx "other-refresh")
+                        )
+                    )
+
                 let otherState = expectValue "other workspace refresh" otherRefreshResult
 
                 Vitest.expect(state.TargetRevision = otherState.TargetRevision).toBe (true)
@@ -162,14 +174,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! cloneResult =
                     run (
-                        harness.Factory.Clone
-                            {
-                                Location = anchor.Binding.Location
-                                TargetPath = anchor.Binding.RepositoryRoot
-                                TargetRef = None
-                                MaterializeAllObjects = true
-                            }
-                            (ctx "clone-nonempty")
+                        executed (
+                            harness.Provider.Clone
+                                {
+                                    Location = locationOf anchor
+                                    TargetPath = anchor.Repository.Descriptor.RepositoryRoot
+                                    TargetRef = None
+                                    MaterializeAllObjects = true
+                                }
+                                (ctx "clone-nonempty")
+                        )
                     )
 
                 let failure = expectFailure "clone into nonempty target" cloneResult
@@ -190,12 +204,14 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! goodResult =
                     run (
-                        harness.Factory.VerifyLocation
-                            {
-                                Location = goodLocation
-                                Intents = intents
-                            }
-                            (ctx "verify-good")
+                        executed (
+                            harness.Provider.VerifyLocation
+                                {
+                                    Location = goodLocation
+                                    Intents = intents
+                                }
+                                (ctx "verify-good")
+                        )
                     )
 
                 let goodReport = expectValue "verify authorized location" goodResult
@@ -206,12 +222,14 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! unauthorizedResult =
                     run (
-                        harness.Factory.VerifyLocation
-                            {
-                                Location = unauthorizedLocation
-                                Intents = intents
-                            }
-                            (ctx "verify-unauthorized")
+                        executed (
+                            harness.Provider.VerifyLocation
+                                {
+                                    Location = unauthorizedLocation
+                                    Intents = intents
+                                }
+                                (ctx "verify-unauthorized")
+                        )
                     )
 
                 // Either a structured failure or a report with denied intents is valid;
@@ -234,7 +252,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
             profileTest "dependency diagnostics report components with remediation"
             <| fun () -> promise {
-                let! dependenciesResult = run (harness.Factory.CheckDependencies(ctx "dependencies"))
+                let! dependenciesResult = run (executed (harness.Provider.CheckDependencies(ctx "dependencies")))
                 let dependencies = expectValue "check dependencies" dependenciesResult
 
                 for dependency in dependencies do

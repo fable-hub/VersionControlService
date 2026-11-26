@@ -34,13 +34,16 @@ let private openConflict (harness: ProviderTestHarness) = promise {
 
     let! saveResult =
         run (
-            workspace.Session.Core.CreateRevision
-                {
-                    Message = "workspace conflicting change"
-                    Paths = [| mkPath "base.txt" |]
-                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
-                }
-                (ctx "conflict-save")
+            executed (
+                workspace.Provider.CreateRevision
+                    workspace.Repository
+                    {
+                        Message = "workspace conflicting change"
+                        Paths = [| mkPath "base.txt" |]
+                        ExpectedRepositoryVersion = saveStatus.RepositoryVersion
+                    }
+                    (ctx "conflict-save")
+            )
         )
 
     expectPerformed "workspace conflicting revision" saveResult |> ignore
@@ -48,15 +51,18 @@ let private openConflict (harness: ProviderTestHarness) = promise {
 
     let! updateResult =
         run (
-            (syncService workspace.Session).Update
-                { ExpectedRepositoryVersion = status.RepositoryVersion }
-                (ctx "conflict-update")
+            executed (
+                workspace.Provider.Synchronization.Update
+                    workspace.Repository
+                    { ExpectedRepositoryVersion = status.RepositoryVersion }
+                    (ctx "conflict-update")
+            )
         )
 
     let failure = carriedFailure "conflicting update" updateResult
     Vitest.expect(failure.Code).toBe (ConformanceCodes.ConflictsDetected)
 
-    let! sessionResult = run ((conflictService workspace.Session).GetActiveSession(ctx "conflict-session"))
+    let! sessionResult = run (executed (workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (ctx "conflict-session")))
 
     match expectValue "active conflict session" sessionResult with
     | Some summary -> return workspace, summary
@@ -83,13 +89,16 @@ let private openModifyDeleteConflict (harness: ProviderTestHarness) (targetDelet
 
     let! saveResult =
         run (
-            workspace.Session.Core.CreateRevision
-                {
-                    Message = "workspace modify-delete change"
-                    Paths = [| mkPath "base.txt" |]
-                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
-                }
-                (ctx "modify-delete-save")
+            executed (
+                workspace.Provider.CreateRevision
+                    workspace.Repository
+                    {
+                        Message = "workspace modify-delete change"
+                        Paths = [| mkPath "base.txt" |]
+                        ExpectedRepositoryVersion = saveStatus.RepositoryVersion
+                    }
+                    (ctx "modify-delete-save")
+            )
         )
 
     expectPerformed "workspace modify-delete revision" saveResult |> ignore
@@ -97,15 +106,18 @@ let private openModifyDeleteConflict (harness: ProviderTestHarness) (targetDelet
 
     let! updateResult =
         run (
-            (syncService workspace.Session).Update
-                { ExpectedRepositoryVersion = status.RepositoryVersion }
-                (ctx "modify-delete-update")
+            executed (
+                workspace.Provider.Synchronization.Update
+                    workspace.Repository
+                    { ExpectedRepositoryVersion = status.RepositoryVersion }
+                    (ctx "modify-delete-update")
+            )
         )
 
     let failure = carriedFailure "modify-delete update" updateResult
     Vitest.expect(failure.Code).toBe (ConformanceCodes.ConflictsDetected)
 
-    let! sessionResult = run ((conflictService workspace.Session).GetActiveSession(ctx "modify-delete-session"))
+    let! sessionResult = run (executed (workspace.Provider.ConflictResolution.GetActiveSession workspace.Repository (ctx "modify-delete-session")))
 
     match expectValue "active modify-delete session" sessionResult with
     | Some summary -> return workspace, summary
@@ -155,14 +167,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! status = getStatus workspace
                 let! resolveResult =
                     run (
-                        (conflictService workspace.Session).Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "target"
-                            }
-                            (ctx "pick-deleted-target")
+                        executed (
+                            workspace.Provider.ConflictResolution.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "pick-deleted-target")
+                        )
                     )
 
                 let resolution = expectValue "deleted target resolution" resolveResult
@@ -173,13 +188,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! afterResolve = getStatus workspace
                 let! finalizeResult =
                     run (
-                        (conflictService workspace.Session).Finalize
-                            {
-                                Handle = resolution.RefreshedHandle
-                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
-                                Message = Some "finalize deleted target"
-                            }
-                            (ctx "finalize-deleted-target")
+                        executed (
+                            workspace.Provider.ConflictResolution.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedRepositoryVersion = afterResolve.RepositoryVersion
+                                    Message = Some "finalize deleted target"
+                                }
+                                (ctx "finalize-deleted-target")
+                        )
                     )
 
                 expectValue "deleted target finalize" finalizeResult |> ignore
@@ -199,14 +217,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! status = getStatus workspace
                 let! resolveResult =
                     run (
-                        (conflictService workspace.Session).Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "workspace"
-                            }
-                            (ctx "pick-deleted-workspace")
+                        executed (
+                            workspace.Provider.ConflictResolution.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "workspace"
+                                }
+                                (ctx "pick-deleted-workspace")
+                        )
                     )
 
                 let resolution = expectValue "deleted workspace resolution" resolveResult
@@ -215,13 +236,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! afterResolve = getStatus workspace
                 let! finalizeResult =
                     run (
-                        (conflictService workspace.Session).Finalize
-                            {
-                                Handle = resolution.RefreshedHandle
-                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
-                                Message = Some "finalize deleted workspace"
-                            }
-                            (ctx "finalize-deleted-workspace")
+                        executed (
+                            workspace.Provider.ConflictResolution.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedRepositoryVersion = afterResolve.RepositoryVersion
+                                    Message = Some "finalize deleted workspace"
+                                }
+                                (ctx "finalize-deleted-workspace")
+                        )
                     )
 
                 expectValue "deleted workspace finalize" finalizeResult |> ignore
@@ -236,14 +260,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! resolveResult =
                     run (
-                        (conflictService workspace.Session).Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "target"
-                            }
-                            (ctx "resolve-pick")
+                        executed (
+                            workspace.Provider.ConflictResolution.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "resolve-pick")
+                        )
                     )
 
                 let resolution = expectValue "candidate resolution" resolveResult
@@ -259,14 +286,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! resolveResult =
                     run (
-                        (conflictService workspace.Session).Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = SupplyResolvedContent "hand-merged content\n"
-                            }
-                            (ctx "resolve-content")
+                        executed (
+                            workspace.Provider.ConflictResolution.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = SupplyResolvedContent "hand-merged content\n"
+                                }
+                                (ctx "resolve-content")
+                        )
                     )
 
                 let resolution = expectValue "supplied-content resolution" resolveResult
@@ -274,13 +304,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! finalizeResult =
                     run (
-                        (conflictService workspace.Session).Finalize
-                            {
-                                Handle = resolution.RefreshedHandle
-                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
-                                Message = Some "merge with supplied content"
-                            }
-                            (ctx "finalize-content")
+                        executed (
+                            workspace.Provider.ConflictResolution.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedRepositoryVersion = afterResolve.RepositoryVersion
+                                    Message = Some "merge with supplied content"
+                                }
+                                (ctx "finalize-content")
+                        )
                     )
 
                 expectValue "finalize" finalizeResult |> ignore
@@ -293,19 +326,22 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             <| fun () -> promise {
                 let! workspace, summary = openConflict harness
                 let! status = getStatus workspace
-                let conflicts = conflictService workspace.Session
+                let conflicts = workspace.Provider.ConflictResolution
 
                 // Rotate the handle with a real resolution, keeping the old handle.
                 let! resolveResult =
                     run (
-                        conflicts.Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "workspace"
-                            }
-                            (ctx "rotate")
+                        executed (
+                            conflicts.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "workspace"
+                                }
+                                (ctx "rotate")
+                        )
                     )
 
                 expectValue "rotation resolution" resolveResult |> ignore
@@ -314,14 +350,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 // Replaying the stale handle is rejected before mutation.
                 let! staleResult =
                     run (
-                        conflicts.Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = afterRotate.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "target"
-                            }
-                            (ctx "stale-replay")
+                        executed (
+                            conflicts.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = afterRotate.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "stale-replay")
+                        )
                     )
 
                 expectHandleRejection "stale handle replay" staleResult
@@ -329,16 +368,19 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 // A foreign handle is rejected the same way.
                 let! foreignResult =
                     run (
-                        conflicts.Finalize
-                            {
-                                Handle = {
-                                    SessionId = "foreign-session"
-                                    Version = "1"
+                        executed (
+                            conflicts.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = {
+                                        SessionId = "foreign-session"
+                                        Version = "1"
+                                    }
+                                    ExpectedRepositoryVersion = afterRotate.RepositoryVersion
+                                    Message = None
                                 }
-                                ExpectedRepositoryVersion = afterRotate.RepositoryVersion
-                                Message = None
-                            }
-                            (ctx "foreign-finalize")
+                                (ctx "foreign-finalize")
+                        )
                     )
 
                 expectHandleRejection "foreign handle finalize" foreignResult
@@ -352,38 +394,44 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             <| fun () -> promise {
                 let! workspace, summary = openConflict harness
                 let! status = getStatus workspace
-                let conflicts = conflictService workspace.Session
+                let conflicts = workspace.Provider.ConflictResolution
 
                 // A stale rejection (wrong workspace version) leaves the session live.
                 let! staleResult =
                     run (
-                        conflicts.Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = "not-the-current-version"
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "target"
-                            }
-                            (ctx "stale-version")
+                        executed (
+                            conflicts.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = "not-the-current-version"
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "stale-version")
+                        )
                     )
 
                 expectHandleRejection "stale workspace version" staleResult
 
                 // Refresh supplies the live handle; the deliberate retry succeeds.
-                let! refreshedSession = run (conflicts.GetActiveSession(ctx "refresh-session"))
+                let! refreshedSession = run (executed (conflicts.GetActiveSession workspace.Repository (ctx "refresh-session")))
 
                 match expectValue "refreshed session" refreshedSession with
                 | Some liveSummary ->
                     let! retryResult =
                         run (
-                            conflicts.Resolve
-                                {
-                                    Handle = liveSummary.Handle
-                                    ExpectedRepositoryVersion = status.RepositoryVersion
-                                    Path = mkPath "base.txt"
-                                    Resolution = PickCandidate "target"
-                                }
-                                (ctx "deliberate-retry")
+                            executed (
+                                conflicts.Resolve
+                                    workspace.Repository
+                                    {
+                                        Handle = liveSummary.Handle
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
+                                        Path = mkPath "base.txt"
+                                        Resolution = PickCandidate "target"
+                                    }
+                                    (ctx "deliberate-retry")
+                            )
                         )
 
                     expectValue "deliberate retry" retryResult |> ignore
@@ -394,18 +442,21 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             <| fun () -> promise {
                 let! workspace, summary = openConflict harness
                 let! status = getStatus workspace
-                let conflicts = conflictService workspace.Session
+                let conflicts = workspace.Provider.ConflictResolution
 
                 let! resolveResult =
                     run (
-                        conflicts.Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "target"
-                            }
-                            (ctx "resolve-before-finalize")
+                        executed (
+                            conflicts.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "resolve-before-finalize")
+                        )
                     )
 
                 let resolution = expectValue "resolution before finalize" resolveResult
@@ -413,19 +464,22 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! finalizeResult =
                     run (
-                        conflicts.Finalize
-                            {
-                                Handle = resolution.RefreshedHandle
-                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
-                                Message = Some "finalize conflict"
-                            }
-                            (ctx "finalize")
+                        executed (
+                            conflicts.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedRepositoryVersion = afterResolve.RepositoryVersion
+                                    Message = Some "finalize conflict"
+                                }
+                                (ctx "finalize")
+                        )
                     )
 
                 let mergedRevision = expectValue "finalize" finalizeResult
                 Vitest.expect(mergedRevision.IsSome).toBe (true)
 
-                let! closedSession = run (conflicts.GetActiveSession(ctx "closed-session"))
+                let! closedSession = run (executed (conflicts.GetActiveSession workspace.Repository (ctx "closed-session")))
                 Vitest.expect((expectValue "closed session" closedSession).IsNone).toBe (true)
 
                 // The terminal handle is closed: replay is rejected without mutation.
@@ -433,13 +487,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! replayResult =
                     run (
-                        conflicts.Finalize
-                            {
-                                Handle = resolution.RefreshedHandle
-                                ExpectedRepositoryVersion = afterFinalize.RepositoryVersion
-                                Message = None
-                            }
-                            (ctx "replay-finalize")
+                        executed (
+                            conflicts.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedRepositoryVersion = afterFinalize.RepositoryVersion
+                                    Message = None
+                                }
+                                (ctx "replay-finalize")
+                        )
                     )
 
                 expectHandleRejection "closed handle replay" replayResult
@@ -453,21 +510,24 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             <| fun () -> promise {
                 let! workspace, summary = openConflict harness
                 let! status = getStatus workspace
-                let conflicts = conflictService workspace.Session
+                let conflicts = workspace.Provider.ConflictResolution
 
                 let! cancelResult =
                     run (
-                        conflicts.Cancel
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                            }
-                            (ctx "cancel")
+                        executed (
+                            conflicts.Cancel
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "cancel")
+                        )
                     )
 
                 expectValue "cancel" cancelResult |> ignore
 
-                let! closedSession = run (conflicts.GetActiveSession(ctx "after-cancel"))
+                let! closedSession = run (executed (conflicts.GetActiveSession workspace.Repository (ctx "after-cancel")))
                 Vitest.expect((expectValue "session after cancel" closedSession).IsNone).toBe (true)
 
                 // The pre-update workspace content is restored.
@@ -479,18 +539,21 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
             <| fun () -> promise {
                 let! workspace, summary = openConflict harness
                 let! status = getStatus workspace
-                let conflicts = conflictService workspace.Session
+                let conflicts = workspace.Provider.ConflictResolution
 
                 let! resolveResult =
                     run (
-                        conflicts.Resolve
-                            {
-                                Handle = summary.Handle
-                                ExpectedRepositoryVersion = status.RepositoryVersion
-                                Path = mkPath "base.txt"
-                                Resolution = PickCandidate "target"
-                            }
-                            (ctx "race-resolve")
+                        executed (
+                            conflicts.Resolve
+                                workspace.Repository
+                                {
+                                    Handle = summary.Handle
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    Path = mkPath "base.txt"
+                                    Resolution = PickCandidate "target"
+                                }
+                                (ctx "race-resolve")
+                        )
                     )
 
                 let resolution = expectValue "resolution before race" resolveResult
@@ -507,13 +570,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! finalizeResult =
                     run (
-                        conflicts.Finalize
-                            {
-                                Handle = resolution.RefreshedHandle
-                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
-                                Message = Some "finalize during race"
-                            }
-                            (ctx "race-finalize")
+                        executed (
+                            conflicts.Finalize
+                                workspace.Repository
+                                {
+                                    Handle = resolution.RefreshedHandle
+                                    ExpectedRepositoryVersion = afterResolve.RepositoryVersion
+                                    Message = Some "finalize during race"
+                                }
+                                (ctx "race-finalize")
+                        )
                     )
 
                 let failure = carriedFailure "raced finalize" finalizeResult

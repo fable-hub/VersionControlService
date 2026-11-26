@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="LakeFsTypes.fs" />
+    <Compile Include="LakeFsCredentials.fs" />
     <Compile Include="LakeFsProviderOptions.fs" />
     <Compile Include="LakeFsStateStore.fs" />
     <Compile Include="LakeFsPathSafety.fs" />
@@ -13,7 +14,6 @@
     <Compile Include="LakeFsRequestOutput.fs" />
     <Compile Include="LakeFsBinaryTransfer.fs" />
     <Compile Include="LakeFsApi.fs" />
-    <Compile Include="LakeFsCredentials.fs" />
     <Compile Include="LakeFsWorkspaceIndex.fs" />
     <Compile Include="LakeFsMaterialization.fs" />
     <Compile Include="LakeFsProviderFactory.fs" />
@@ -22,6 +22,7 @@
     <Compile Include="LakeFsSynchronization.fs" />
     <Compile Include="LakeFsConflictSession.fs" />
     <Compile Include="LakeFsWorkspaceSession.fs" />
+    <Compile Include="LakeFsProvider.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\VersionControlService.Abstractions\VersionControlService.Abstractions.fsproj" />

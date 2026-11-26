@@ -1,4 +1,4 @@
-/// Git provider factory and per-workspace sessions over internal Git machinery.
+/// The Git provider and the state of one opened repository, over internal Git machinery.
 module VersionControlService.Git.GitWorkspaceSession
 
 open System
@@ -17,6 +17,7 @@ module GitInternals = VersionControlService.Git.GitInternals
 module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
 module GitTextDiffService = VersionControlService.Git.TextDiff.GitTextDiffService
+module TextDiffPool = VersionControlService.Git.TextDiff.TextDiffPool
 module NodeProcess = VersionControlService.Runtime.Node.Process
 module NodeOutput = VersionControlService.Runtime.Node.OutputReporter
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
@@ -42,18 +43,6 @@ module GitSessionHooks =
     /// A test seam for the post-merge inspection deadline, in milliseconds. Production
     /// leaves it None and the built-in deadline applies.
     let mutable postMergeInspectionTimeoutOverride: int option = None
-
-/// Session options. Without text diff options the session's text diff service fails Open with
-/// diff_worker_failed, because the provider diffs only in the worker pool.
-type GitSessionOptions = {
-    Hooks: GitSessionHooks
-    TextDiff: GitTextDiffService.GitTextDiffOptions option
-}
-
-type private TextDiffMode =
-    | NoTextDiff
-    | WithoutPool
-    | WithPool of GitTextDiffService.GitTextDiffOptions
 
 let private publicationVerificationTimeoutMilliseconds = 30_000
 /// The deadline cancels the inspection. The runner resolves after the process closes.
@@ -511,7 +500,7 @@ type private PickedConflictContent =
     | StoredConflictCandidate of stage: int * objectInfo: ConflictCandidateObject option * mode: string * blob: string
     | DeletedConflictCandidate
 
-/// Session-internal mutable state shared by all operations of one open session.
+/// Mutable state shared by all operations of one opened repository.
 type private SessionState = {
     RepoPath: string
     Hooks: GitSessionHooks
@@ -529,6 +518,30 @@ type private SessionState = {
     mutable ConflictGeneration: int
     mutable LfsMediaDirectory: string option
 }
+
+/// One opened Git repository: the state of the open, the text diff of that open and the function that
+/// closes its diffs.
+type private GitRepository
+    (
+        descriptor: RepositoryDescriptor,
+        state: SessionState,
+        textDiff: TextDiffPool.TextDiffCalls,
+        closeTextDiff: unit -> Async<unit>
+    ) =
+    inherit Repository(descriptor)
+    member _.State = state
+    member _.TextDiff = textDiff
+    member _.CloseTextDiff = closeTextDiff
+
+/// Runs the function on the state of the repository. A repository that another provider opened gets the
+/// failure for that.
+let private withRepository
+    (repository: Repository)
+    (run: GitRepository -> Async<OperationResult<'T>>)
+    : Async<OperationResult<'T>> =
+    match repository with
+    | :? GitRepository as git -> run git
+    | _ -> async { return Failed(Repository.ofAnotherProvider repository) }
 
 let private credentialAuthenticationForRemote
     (state: SessionState)
@@ -5358,20 +5371,152 @@ let private withSerializedConflictMutation
             state.Lock.Release()
     }
 
-let private createConflictService (state: SessionState) : ConflictResolutionService =
-    let stagePath (path: RepositoryPath) (context: OperationContext) =
-        async {
-            let payload = GitPathTransport.nulDelimitedLiteralPathspecs [| path |]
+let private stagePath (state: SessionState) (path: RepositoryPath) (context: OperationContext) =
+    async {
+        let payload = GitPathTransport.nulDelimitedLiteralPathspecs [| path |]
 
-            let! result =
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [| "add"; yield! GitPathTransport.pathspecFromStdinArguments |]
+                (Some payload)
+                context
+
+        match result with
+        | Ok output when output.ExitCode = 0 -> return Ok()
+        | Ok output ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"Staging the resolved path failed: {output.StdErr}"
+                )
+        | Error failure -> return Error failure
+    }
+
+let private readIndexStages (state: SessionState) (path: RepositoryPath) (context: OperationContext) =
+    async {
+        let pathValue = RepositoryPath.value path
+
+        let! result =
+            runGit
+                state.Hooks
+                state.RepoPath
+                [|
+                    "ls-files"
+                    "-s"
+                    "-z"
+                    "--"
+                    GitPathTransport.literalPathspec path
+                |]
+                None
+                context
+
+        match result with
+        | Error failure -> return Error { failure with AffectedPaths = [| pathValue |] }
+        | Ok output when output.ExitCode <> 0 ->
+            return
+                Error(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"Listing conflict stages at '{pathValue}' failed: {output.StdErr}"
+                    |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                )
+        | Ok output ->
+            let entries = output.StdOut.Split '\000' |> Array.filter (String.IsNullOrEmpty >> not)
+            let parsedEntries = ResizeArray<string * string * int>()
+            let mutable parseFailure = false
+
+            for entry in entries do
+                let separator = entry.IndexOf '\t'
+
+                if separator <= 0 then
+                    parseFailure <- true
+                else
+                    let fields = entry.Substring(0, separator).Split ' '
+
+                    match fields with
+                    | [| mode; blob; stageText |] ->
+                        match Int32.TryParse stageText with
+                        | true, stage -> parsedEntries.Add((mode, blob, stage))
+                        | _ -> parseFailure <- true
+                    | _ -> parseFailure <- true
+
+            if parseFailure then
+                return
+                    Error(
+                        OperationFailure.createRedacted
+                            ProviderError
+                            "invalid_git_output"
+                            $"Git returned invalid conflict stages for '{pathValue}'."
+                        |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                    )
+            else
+                return Ok(parsedEntries.ToArray())
+    }
+
+let private deleteConflictPath (state: SessionState) (path: RepositoryPath) (context: OperationContext) =
+    async {
+        let pathValue = RepositoryPath.value path
+        let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+
+        let canceledFailure () =
+            OperationFailure.create Canceled "operation_canceled" "The conflict deletion was canceled before the file was removed."
+            |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+
+        let deleteFailure detail =
+            OperationFailure.createRedacted
+                ProviderError
+                "file_delete_failed"
+                $"Deleting '{pathValue}' failed: {detail}"
+            |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+
+        let worktreeResult =
+            if context.Cancellation.IsCancellationRequested() then
+                Error(canceledFailure ())
+            else
+                let fileStatsResult =
+                    try
+                        Ok(NodeFileSystem.tryLstatSync absolutePath)
+                    with error ->
+                        Error error.Message
+
+                match fileStatsResult with
+                | Error detail -> Error(deleteFailure detail)
+                | Ok(Some stats) when stats.isDirectory () ->
+                    Error(
+                        OperationFailure.create
+                            Validation
+                            "deletion_blocked_by_directory"
+                            $"The conflicted path '{pathValue}' is a directory and cannot be deleted as a file."
+                        |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
+                    )
+                | Ok(Some stats) when stats.isFile () || stats.isSymbolicLink () ->
+                    try
+                        NodeFileSystem.unlinkSync absolutePath
+                        Ok()
+                    with error ->
+                        Error(deleteFailure error.Message)
+                | Ok(Some _) -> Error(deleteFailure "The worktree entry is not a regular file or symbolic link.")
+                | Ok None -> Ok()
+
+        match worktreeResult with
+        | Error failure -> return Error failure
+        | Ok() ->
+            let! removeIndexResult =
                 runGit
                     state.Hooks
                     state.RepoPath
-                    [| "add"; yield! GitPathTransport.pathspecFromStdinArguments |]
-                    (Some payload)
+                    [| "update-index"; "--force-remove"; "--"; pathValue |]
+                    None
                     context
 
-            match result with
+            match removeIndexResult with
+            | Error failure ->
+                return Error(refreshConflictSessionFailure { failure with AffectedPaths = [| pathValue |] })
             | Ok output when output.ExitCode = 0 -> return Ok()
             | Ok output ->
                 return
@@ -5380,811 +5525,1050 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                             ProviderError
                             "git_failure"
                             $"Staging the resolved path failed: {output.StdErr}"
+                        |> fun failure -> {
+                            refreshConflictSessionFailure failure with
+                                AffectedPaths = [| pathValue |]
+                        }
                     )
-            | Error failure -> return Error failure
-        }
+    }
 
-    let readIndexStages (path: RepositoryPath) (context: OperationContext) =
+let private repoGetActiveConflictSession
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<ConflictSessionSummary option>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
         async {
-            let pathValue = RepositoryPath.value path
+            let! summaryResult = getMergeConflictSummary state context
 
-            let! result =
-                runGit
-                    state.Hooks
-                    state.RepoPath
-                    [|
-                        "ls-files"
-                        "-s"
-                        "-z"
-                        "--"
-                        GitPathTransport.literalPathspec path
-                    |]
-                    None
-                    context
+            match summaryResult with
+            | Error failure -> return Failed failure
+            | Ok summary -> return OperationResult.succeeded summary
+        })
 
-            match result with
-            | Error failure -> return Error { failure with AffectedPaths = [| pathValue |] }
-            | Ok output when output.ExitCode <> 0 ->
-                return
-                    Error(
-                        OperationFailure.createRedacted
-                            ProviderError
-                            "git_failure"
-                            $"Listing conflict stages at '{pathValue}' failed: {output.StdErr}"
-                        |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
-                    )
-            | Ok output ->
-                let entries = output.StdOut.Split '\000' |> Array.filter (String.IsNullOrEmpty >> not)
-                let parsedEntries = ResizeArray<string * string * int>()
-                let mutable parseFailure = false
+let private repoResolveConflict
+    (repository: Repository)
+    (request: ResolveConflictRequest)
+    (context: OperationContext)
+    : Async<OperationResult<ConflictResolutionOutcome>> =
+    withRepository repository (fun git ->
+        let state = git.State
 
-                for entry in entries do
-                    let separator = entry.IndexOf '\t'
+        withSerializedConflictMutation state (fun () -> async {
+            let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
 
-                    if separator <= 0 then
-                        parseFailure <- true
-                    else
-                        let fields = entry.Substring(0, separator).Split ' '
+            match validation with
+            | Error failure -> return Failed failure
+            | Ok _ ->
+                let runner = conflictRunner state context
+                let! unmergedResult = GitConflictSession.listUnmergedPaths runner
 
-                        match fields with
-                        | [| mode; blob; stageText |] ->
-                            match Int32.TryParse stageText with
-                            | true, stage -> parsedEntries.Add((mode, blob, stage))
-                            | _ -> parseFailure <- true
-                        | _ -> parseFailure <- true
-
-                if parseFailure then
-                    return
-                        Error(
-                            OperationFailure.createRedacted
-                                ProviderError
-                                "invalid_git_output"
-                                $"Git returned invalid conflict stages for '{pathValue}'."
-                            |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
-                        )
-                else
-                    return Ok(parsedEntries.ToArray())
-        }
-
-    let deleteConflictPath (path: RepositoryPath) (context: OperationContext) =
-        async {
-            let pathValue = RepositoryPath.value path
-            let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
-
-            let canceledFailure () =
-                OperationFailure.create Canceled "operation_canceled" "The conflict deletion was canceled before the file was removed."
-                |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
-
-            let deleteFailure detail =
-                OperationFailure.createRedacted
-                    ProviderError
-                    "file_delete_failed"
-                    $"Deleting '{pathValue}' failed: {detail}"
-                |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
-
-            let worktreeResult =
-                if context.Cancellation.IsCancellationRequested() then
-                    Error(canceledFailure ())
-                else
-                    let fileStatsResult =
-                        try
-                            Ok(NodeFileSystem.tryLstatSync absolutePath)
-                        with error ->
-                            Error error.Message
-
-                    match fileStatsResult with
-                    | Error detail -> Error(deleteFailure detail)
-                    | Ok(Some stats) when stats.isDirectory () ->
-                        Error(
-                            OperationFailure.create
-                                Validation
-                                "deletion_blocked_by_directory"
-                                $"The conflicted path '{pathValue}' is a directory and cannot be deleted as a file."
-                            |> fun failure -> { failure with AffectedPaths = [| pathValue |] }
-                        )
-                    | Ok(Some stats) when stats.isFile () || stats.isSymbolicLink () ->
-                        try
-                            NodeFileSystem.unlinkSync absolutePath
-                            Ok()
-                        with error ->
-                            Error(deleteFailure error.Message)
-                    | Ok(Some _) -> Error(deleteFailure "The worktree entry is not a regular file or symbolic link.")
-                    | Ok None -> Ok()
-
-            match worktreeResult with
-            | Error failure -> return Error failure
-            | Ok() ->
-                let! removeIndexResult =
-                    runGit
-                        state.Hooks
-                        state.RepoPath
-                        [| "update-index"; "--force-remove"; "--"; pathValue |]
-                        None
-                        context
-
-                match removeIndexResult with
-                | Error failure ->
-                    return Error(refreshConflictSessionFailure { failure with AffectedPaths = [| pathValue |] })
-                | Ok output when output.ExitCode = 0 -> return Ok()
-                | Ok output ->
-                    return
-                        Error(
-                            OperationFailure.createRedacted
-                                ProviderError
-                                "git_failure"
-                                $"Staging the resolved path failed: {output.StdErr}"
-                            |> fun failure -> {
-                                refreshConflictSessionFailure failure with
-                                    AffectedPaths = [| pathValue |]
-                            }
-                        )
-        }
-
-    {
-        GetActiveSession =
-            fun context -> async {
-                let! summaryResult = getMergeConflictSummary state context
-
-                match summaryResult with
+                match unmergedResult with
                 | Error failure -> return Failed failure
-                | Ok summary -> return OperationResult.succeeded summary
-            }
-        Resolve =
-            fun request context ->
-                withSerializedConflictMutation state (fun () -> async {
-                    let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
+                | Ok unmergedPaths ->
+                    let pathValue = RepositoryPath.value request.Path
 
-                    match validation with
-                    | Error failure -> return Failed failure
-                    | Ok _ ->
-                        let runner = conflictRunner state context
-                        let! unmergedResult = GitConflictSession.listUnmergedPaths runner
+                    if not (unmergedPaths |> Array.contains pathValue) then
+                        return
+                            Failed(
+                                OperationFailure.create
+                                    NotFound
+                                    "conflict_item_not_found"
+                                    $"No unresolved conflict exists for the selected path."
+                            )
+                    else
+                        let! itemResult = getConflictItem state request.Path context
 
-                        match unmergedResult with
+                        match itemResult with
                         | Error failure -> return Failed failure
-                        | Ok unmergedPaths ->
-                            let pathValue = RepositoryPath.value request.Path
+                        | Ok item ->
+                            let unknownCandidateFailure () =
+                                OperationFailure.create
+                                    Validation
+                                    "unknown_candidate"
+                                    "The candidate ID is not part of this conflict item."
 
-                            if not (unmergedPaths |> Array.contains pathValue) then
+                            let candidateStageMemo: ConflictStageMemo = System.Collections.Generic.Dictionary()
+
+                            let readCandidate stage =
+                                async {
+                                    let! previewResult =
+                                        readConflictStagePreview state candidateStageMemo stage pathValue context
+
+                                    match previewResult with
+                                    | Error failure -> return Error failure
+                                    | Ok None -> return Ok None
+                                    | Ok(Some(TextPreview content)) -> return Ok(Some(TextConflictContent content))
+                                    | Ok(Some(UnsupportedPreview _)) ->
+                                        return Error(manualConflictResolutionFailure request.Path)
+                                }
+
+                            let resolveContent () =
+                                async {
+                                    match request.Resolution with
+                                    | SupplyResolvedContent content ->
+                                        match ensureConflictSupportsTextResolution request.Path item with
+                                        | Error failure -> return Error failure
+                                        | Ok() -> return Ok(Some(TextConflictContent content))
+                                    | PickCandidate candidateId ->
+                                        match
+                                            item.Candidates
+                                            |> Array.tryFind (fun candidate -> candidate.CandidateId = candidateId)
+                                        with
+                                        | None -> return Error(unknownCandidateFailure ())
+                                        | Some candidate ->
+                                            let stage =
+                                                match candidate.CandidateId with
+                                                | "workspace" -> Some 2
+                                                | "target" -> Some 3
+                                                | "base" -> Some 1
+                                                | _ -> None
+
+                                            match stage with
+                                            | None -> return Error(unknownCandidateFailure ())
+                                            | Some stage ->
+                                                let! stageEntriesResult = readIndexStages state request.Path context
+
+                                                match stageEntriesResult with
+                                                | Error failure -> return Error failure
+                                                | Ok stageEntries ->
+                                                    match stageEntries |> Array.tryFind (fun (_, _, entryStage) -> entryStage = stage) with
+                                                    | None -> return Ok(Some(DeletedConflictCandidate))
+                                                    | Some _ when item.SupportsResolvedContent ->
+                                                        return! readCandidate stage
+                                                    | Some(mode, blob, _) ->
+                                                        return Ok(Some(StoredConflictCandidate(stage, candidate.Object, mode, blob)))
+                                }
+
+                            let! contentResult = resolveContent ()
+
+                            match contentResult with
+                            | Error failure -> return Failed failure
+                            | Ok None ->
                                 return
                                     Failed(
                                         OperationFailure.create
-                                            NotFound
-                                            "conflict_item_not_found"
-                                            $"No unresolved conflict exists for the selected path."
-                                    )
-                            else
-                                let! itemResult = getConflictItem state request.Path context
-
-                                match itemResult with
-                                | Error failure -> return Failed failure
-                                | Ok item ->
-                                    let unknownCandidateFailure () =
-                                        OperationFailure.create
                                             Validation
-                                            "unknown_candidate"
-                                            "The candidate ID is not part of this conflict item."
+                                            "candidate_content_unavailable"
+                                            "The selected candidate has no content for this path."
+                                    )
+                            | Ok(Some content) ->
+                                let! writeResult =
+                                    async {
+                                        match content with
+                                        | TextConflictContent text ->
+                                            let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
 
-                                    let candidateStageMemo: ConflictStageMemo = System.Collections.Generic.Dictionary()
+                                            try
+                                                NodeFileSystem.writeFileSync
+                                                    absolutePath
+                                                    text
+                                                    NodeFileSystem.TextEncoding.Utf8
 
-                                    let readCandidate stage =
+                                                return Ok()
+                                            with error ->
+                                                return
+                                                    Error(
+                                                        {
+                                                            OperationFailure.createRedacted
+                                                                ProviderError
+                                                                "file_write_failed"
+                                                                $"Writing resolved content to '{pathValue}' failed: {error.Message}" with
+                                                                AffectedPaths = [| pathValue |]
+                                                        }
+                                                    )
+                                        | StoredConflictCandidate(stage, _, _, _) ->
+                                            let! result =
+                                                runGitEnv
+                                                    state.Hooks
+                                                    state.RepoPath
+                                                    [|
+                                                        "checkout-index"
+                                                        "-f"
+                                                        $"--stage={stage}"
+                                                        "--"
+                                                        // checkout-index takes file names, never pathspec magic.
+                                                        pathValue
+                                                    |]
+                                                    None
+                                                    [| "GIT_LFS_SKIP_SMUDGE", "1" |]
+                                                    context
+
+                                            match result with
+                                            // A runner failure (a canceled context included) keeps its own
+                                            // category. Git may have written part of the file before it stopped.
+                                            | Error failure ->
+                                                return Error { failure with AffectedPaths = [| pathValue |] }
+                                            | Ok output when output.ExitCode = 0 -> return Ok()
+                                            | Ok output ->
+                                                let detail =
+                                                    if String.IsNullOrWhiteSpace output.StdErr then
+                                                        $"Git exited with code {output.ExitCode}."
+                                                    else
+                                                        output.StdErr.Trim()
+
+                                                return
+                                                    Error(
+                                                        {
+                                                            OperationFailure.createRedacted
+                                                                ProviderError
+                                                                "file_write_failed"
+                                                                $"Writing the picked candidate to '{pathValue}' failed: {detail}" with
+                                                                AffectedPaths = [| pathValue |]
+                                                        }
+                                                    )
+                                        | DeletedConflictCandidate -> return Ok()
+                                    }
+
+                                match writeResult with
+                                | Error failure -> return Failed(refreshConflictSessionFailure failure)
+                                | Ok() ->
+                                    let! stagedResult =
                                         async {
-                                            let! previewResult =
-                                                readConflictStagePreview state candidateStageMemo stage pathValue context
+                                            match content with
+                                            | TextConflictContent _ ->
+                                                let! stageResult = stagePath state request.Path context
+                                                return stageResult |> Result.map (fun () -> [||], None)
+                                            | DeletedConflictCandidate ->
+                                                let! deletionResult = deleteConflictPath state request.Path context
+                                                return deletionResult |> Result.map (fun () -> [||], None)
+                                            | StoredConflictCandidate(_, candidateObject, mode, blob) ->
+                                                let indexInfo = $"{mode} {blob}\t{pathValue}\000"
+                                                let! updateIndexResult =
+                                                    runGit
+                                                        state.Hooks
+                                                        state.RepoPath
+                                                        [| "update-index"; "-z"; "--index-info" |]
+                                                        (Some indexInfo)
+                                                        context
 
-                                            match previewResult with
-                                            | Error failure -> return Error failure
-                                            | Ok None -> return Ok None
-                                            | Ok(Some(TextPreview content)) -> return Ok(Some(TextConflictContent content))
-                                            | Ok(Some(UnsupportedPreview _)) ->
-                                                return Error(manualConflictResolutionFailure request.Path)
-                                        }
-
-                                    let resolveContent () =
-                                        async {
-                                            match request.Resolution with
-                                            | SupplyResolvedContent content ->
-                                                match ensureConflictSupportsTextResolution request.Path item with
+                                                match updateIndexResult with
                                                 | Error failure -> return Error failure
-                                                | Ok() -> return Ok(Some(TextConflictContent content))
-                                            | PickCandidate candidateId ->
-                                                match
-                                                    item.Candidates
-                                                    |> Array.tryFind (fun candidate -> candidate.CandidateId = candidateId)
-                                                with
-                                                | None -> return Error(unknownCandidateFailure ())
-                                                | Some candidate ->
-                                                    let stage =
-                                                        match candidate.CandidateId with
-                                                        | "workspace" -> Some 2
-                                                        | "target" -> Some 3
-                                                        | "base" -> Some 1
-                                                        | _ -> None
+                                                | Ok output when output.ExitCode <> 0 ->
+                                                    return
+                                                        Error(
+                                                            OperationFailure.createRedacted
+                                                                ProviderError
+                                                                "git_failure"
+                                                                $"Staging the resolved path failed: {output.StdErr}"
+                                                        )
+                                                | Ok _ ->
+                                                    match candidateObject with
+                                                    | None -> return Ok([||], None)
+                                                    | Some objectInfo ->
+                                                        let objectNotMaterialized () =
+                                                            [|
+                                                                {
+                                                                    Code = "object_not_materialized"
+                                                                    Message =
+                                                                        $"The picked version of '{pathValue}' is not in the local cache, so the file holds a pointer until the object is downloaded."
+                                                                }
+                                                            |]
 
-                                                    match stage with
-                                                    | None -> return Error(unknownCandidateFailure ())
-                                                    | Some stage ->
-                                                        let! stageEntriesResult = readIndexStages request.Path context
+                                                        let materializationFailure detail =
+                                                            OperationFailure.createRedacted
+                                                                ProviderError
+                                                                "object_materialization_failed"
+                                                                $"The pick of '{pathValue}' is staged, but materializing its object failed: {detail}"
+                                                            |> fun failure -> {
+                                                                failure with
+                                                                    StateChanged = true
+                                                                    AffectedPaths = [| pathValue |]
+                                                            }
 
-                                                        match stageEntriesResult with
-                                                        | Error failure -> return Error failure
-                                                        | Ok stageEntries ->
-                                                            match stageEntries |> Array.tryFind (fun (_, _, entryStage) -> entryStage = stage) with
-                                                            | None -> return Ok(Some(DeletedConflictCandidate))
-                                                            | Some _ when item.SupportsResolvedContent ->
-                                                                return! readCandidate stage
-                                                            | Some(mode, blob, _) ->
-                                                                return Ok(Some(StoredConflictCandidate(stage, candidate.Object, mode, blob)))
+                                                        let canceledMaterializationFailure detail =
+                                                            OperationFailure.createRedacted
+                                                                Canceled
+                                                                "operation_canceled"
+                                                                $"Materializing the picked object for '{pathValue}' was canceled: {detail}"
+                                                            |> fun failure -> {
+                                                                failure with
+                                                                    StateChanged = true
+                                                                    AffectedPaths = [| pathValue |]
+                                                            }
+
+                                                        match objectInfo.ObjectId, objectInfo.SizeBytes with
+                                                        | Some objectId, Some sizeBytes ->
+                                                            let! result =
+                                                                materializeLocalLfsObject
+                                                                    state
+                                                                    pathValue
+                                                                    objectId
+                                                                    sizeBytes
+                                                                    context
+
+                                                            match result with
+                                                            | LocalLfsObjectUnavailable
+                                                            | LocalLfsStoreUnavailable _
+                                                            | LocalLfsCheckoutCompleted false ->
+                                                                return Ok(objectNotMaterialized (), None)
+                                                            | LocalLfsCheckoutCompleted true -> return Ok([||], None)
+                                                            | LocalLfsCheckoutFailed failure when failure.Category = Canceled ->
+                                                                return Ok([||], Some(canceledMaterializationFailure failure.Message))
+                                                            | LocalLfsCheckoutFailed failure
+                                                                when context.Cancellation.IsCancellationRequested() ->
+                                                                return Ok([||], Some(canceledMaterializationFailure failure.Message))
+                                                            | LocalLfsCheckoutFailed failure ->
+                                                                return
+                                                                    Ok(
+                                                                        [||],
+                                                                        Some {
+                                                                            materializationFailure failure.Message with
+                                                                                RecoveryAction = failure.RecoveryAction
+                                                                        }
+                                                                    )
+                                                        | _ -> return Ok(objectNotMaterialized (), None)
                                         }
 
-                                    let! contentResult = resolveContent ()
+                                    match stagedResult with
+                                    | Error failure ->
+                                        match content, failure.StateChanged with
+                                        | DeletedConflictCandidate, false -> return Failed failure
+                                        | _ -> return Failed(refreshConflictSessionFailure failure)
+                                    | Ok(warnings, materializationFailure) ->
+                                        let refreshedHandle = rotateConflictHandle state
+                                        let summaryContext =
+                                            if context.Cancellation.IsCancellationRequested() then
+                                                OperationContext.detached $"{context.OperationId}-conflict-refresh"
+                                            else
+                                                context
 
-                                    match contentResult with
-                                    | Error failure -> return Failed failure
-                                    | Ok None ->
+                                        let! summaryResult = getMergeConflictSummary state summaryContext
+
+                                        match summaryResult with
+                                        | Error failure -> return Failed(refreshConflictSessionFailure failure)
+                                        | Ok summary ->
+                                            let outcome =
+                                                OperationOutcome.performed {
+                                                    RefreshedHandle = refreshedHandle
+                                                    RemainingItems =
+                                                        summary
+                                                        |> Option.map _.Items
+                                                        |> Option.defaultValue [||]
+                                                }
+                                                |> fun result -> { result with Warnings = warnings }
+
+                                            match materializationFailure with
+                                            | None -> return Succeeded outcome
+                                            | Some failure ->
+                                                return
+                                                    OperationResult.partiallySucceeded
+                                                        outcome
+                                                        failure
+                                                        (failure.RecoveryAction
+                                                         |> Option.defaultWith localMaterializationRecovery)
+        }))
+
+let private repoFinalizeConflict
+    (repository: Repository)
+    (request: FinalizeConflictRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RevisionId option>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withSerializedConflictMutation state (fun () -> async {
+            let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
+
+            match validation with
+            | Error failure -> return Failed failure
+            | Ok _ ->
+                let runner = conflictRunner state context
+                let! unmergedResult = GitConflictSession.listUnmergedPaths runner
+
+                match unmergedResult with
+                | Error failure -> return Failed failure
+                | Ok unmergedPaths when unmergedPaths.Length > 0 ->
+                    return
+                        Failed {
+                            OperationFailure.create
+                                Validation
+                                "conflicts_unresolved"
+                                "Every conflict item must be resolved before finalizing." with
+                                AffectedPaths = unmergedPaths
+                        }
+                | Ok _ ->
+                    let! branchOutput =
+                        runGit state.Hooks state.RepoPath [| "symbolic-ref"; "-q"; "HEAD" |] None context
+
+                    match branchOutput with
+                    | Error failure -> return Failed failure
+                    | Ok branchResult when branchResult.ExitCode <> 0 ->
+                        return
+                            Failed(
+                                OperationFailure.create
+                                    Validation
+                                    "detached_head"
+                                    "Finalizing requires a current branch."
+                            )
+                    | Ok branchResult ->
+                        let branchRef = branchResult.StdOut.Trim()
+                        let! expectedHead = revParse state "HEAD" context
+
+                        match expectedHead with
+                        | None ->
+                            return
+                                Failed(
+                                    OperationFailure.create
+                                        ProviderError
+                                        "git_failure"
+                                        "The current head could not be resolved."
+                                )
+                        | Some expectedHeadValue ->
+                            let! currentMergeHeadResult = tryGetMergeHead state context
+
+                            match currentMergeHeadResult with
+                            | Error failure -> return Failed failure
+                            | Ok None -> return Failed(GitConflictSession.handleRejection ())
+                            | Ok(Some currentMergeHead) ->
+                                let! headParentsResult =
+                                    runGitChecked
+                                        state.Hooks
+                                        state.RepoPath
+                                        [| "rev-list"; "--parents"; "-n"; "1"; "HEAD" |]
+                                        None
+                                        context
+
+                                match headParentsResult with
+                                | Error failure -> return Failed failure
+                                | Ok headParentsOutput ->
+                                    let headParts =
+                                        headParentsOutput.StdOut.Trim().Split([| ' '; '\t'; '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+
+                                    match headParts |> Array.tryHead with
+                                    | None ->
                                         return
                                             Failed(
                                                 OperationFailure.create
-                                                    Validation
-                                                    "candidate_content_unavailable"
-                                                    "The selected candidate has no content for this path."
+                                                    ProviderError
+                                                    "git_failure"
+                                                    "Git returned no current head revision."
                                             )
-                                    | Ok(Some content) ->
-                                        let! writeResult =
-                                            async {
-                                                match content with
-                                                | TextConflictContent text ->
-                                                    let absolutePath = NodePath.join [| state.RepoPath; pathValue |]
+                                    | Some headRevision ->
+                                        let hasMergeParent =
+                                            headParts
+                                            |> Array.skip 1
+                                            |> Array.contains currentMergeHead
 
-                                                    try
-                                                        NodeFileSystem.writeFileSync
-                                                            absolutePath
-                                                            text
-                                                            NodeFileSystem.TextEncoding.Utf8
+                                        // The merge commit already exists once the parent matches, so the
+                                        // probe runs detached from the caller's cancellation: a cancel or
+                                        // a git failure here must not report a committed merge as a plain
+                                        // failure.
+                                        let! alreadyCommitted =
+                                            if not hasMergeParent then
+                                                async { return Ok false }
+                                            else
+                                                async {
+                                                    let probeContext = {
+                                                        context with
+                                                            Cancellation = OperationCancellation.none
+                                                    }
 
-                                                        return Ok()
-                                                    with error ->
-                                                        return
-                                                            Error(
-                                                                {
-                                                                    OperationFailure.createRedacted
-                                                                        ProviderError
-                                                                        "file_write_failed"
-                                                                        $"Writing resolved content to '{pathValue}' failed: {error.Message}" with
-                                                                        AffectedPaths = [| pathValue |]
-                                                                }
-                                                            )
-                                                | StoredConflictCandidate(stage, _, _, _) ->
-                                                    let! result =
-                                                        runGitEnv
+                                                    let! indexTreeResult =
+                                                        runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None probeContext
+
+                                                    match indexTreeResult with
+                                                    | Error failure -> return Error failure
+                                                    | Ok indexTreeOutput ->
+                                                        let! headTreeResult = revParseResult state "HEAD^{tree}" probeContext
+
+                                                        match headTreeResult with
+                                                        | Error failure -> return Error failure
+                                                        | Ok headTree ->
+                                                            return Ok(headTree = Some(indexTreeOutput.StdOut.Trim()))
+                                                }
+
+                                        match alreadyCommitted with
+                                        | Error failure ->
+                                            return
+                                                Failed {
+                                                    failure with
+                                                        StateChanged = true
+                                                        RecoveryAction =
+                                                            Some {
+                                                                Code = "inspect_workspace"
+                                                                Instructions =
+                                                                    Some
+                                                                        "The merge is committed, but the index could not be compared with it. Inspect the workspace, then finalize again to finish the cleanup."
+                                                            }
+                                                }
+                                        | Ok true -> return! cleanupCommittedConflict state headRevision context
+                                        | Ok false ->
+                                            let! identityResult = resolveRevisionIdentity state context
+
+                                            match identityResult with
+                                            | Error failure -> return Failed failure
+                                            | Ok identityArguments ->
+                                                do! barrier state.Hooks state.RepoPath "finalize-precheck-done" context
+
+                                                let! treeResult =
+                                                    runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None context
+
+                                                match treeResult with
+                                                | Error failure -> return Failed failure
+                                                | Ok treeOutput ->
+                                                    let message =
+                                                        request.Message |> Option.defaultValue "Merge online changes"
+
+                                                    let! commitResult =
+                                                        runGitChecked
                                                             state.Hooks
                                                             state.RepoPath
                                                             [|
-                                                                "checkout-index"
-                                                                "-f"
-                                                                $"--stage={stage}"
-                                                                "--"
-                                                                // checkout-index takes file names, never pathspec magic.
-                                                                pathValue
+                                                                yield! identityArguments
+                                                                "commit-tree"
+                                                                treeOutput.StdOut.Trim()
+                                                                "-p"
+                                                                expectedHeadValue
+                                                                "-p"
+                                                                currentMergeHead
+                                                                "-m"
+                                                                message
                                                             |]
                                                             None
-                                                            [| "GIT_LFS_SKIP_SMUDGE", "1" |]
                                                             context
 
-                                                    match result with
-                                                    // A runner failure (a canceled context included) keeps its own
-                                                    // category. Git may have written part of the file before it stopped.
-                                                    | Error failure ->
-                                                        return Error { failure with AffectedPaths = [| pathValue |] }
-                                                    | Ok output when output.ExitCode = 0 -> return Ok()
-                                                    | Ok output ->
-                                                        let detail =
-                                                            if String.IsNullOrWhiteSpace output.StdErr then
-                                                                $"Git exited with code {output.ExitCode}."
-                                                            else
-                                                                output.StdErr.Trim()
+                                                    match commitResult with
+                                                    | Error failure -> return Failed failure
+                                                    | Ok commitOutput ->
+                                                        let newCommit = commitOutput.StdOut.Trim()
 
-                                                        return
-                                                            Error(
-                                                                {
-                                                                    OperationFailure.createRedacted
-                                                                        ProviderError
-                                                                        "file_write_failed"
-                                                                        $"Writing the picked candidate to '{pathValue}' failed: {detail}" with
-                                                                        AffectedPaths = [| pathValue |]
-                                                                }
-                                                            )
-                                                | DeletedConflictCandidate -> return Ok()
-                                            }
-
-                                        match writeResult with
-                                        | Error failure -> return Failed(refreshConflictSessionFailure failure)
-                                        | Ok() ->
-                                            let! stagedResult =
-                                                async {
-                                                    match content with
-                                                    | TextConflictContent _ ->
-                                                        let! stageResult = stagePath request.Path context
-                                                        return stageResult |> Result.map (fun () -> [||], None)
-                                                    | DeletedConflictCandidate ->
-                                                        let! deletionResult = deleteConflictPath request.Path context
-                                                        return deletionResult |> Result.map (fun () -> [||], None)
-                                                    | StoredConflictCandidate(_, candidateObject, mode, blob) ->
-                                                        let indexInfo = $"{mode} {blob}\t{pathValue}\000"
-                                                        let! updateIndexResult =
+                                                        let! updateResult =
                                                             runGit
                                                                 state.Hooks
                                                                 state.RepoPath
-                                                                [| "update-index"; "-z"; "--index-info" |]
-                                                                (Some indexInfo)
+                                                                [|
+                                                                    "update-ref"
+                                                                    branchRef
+                                                                    newCommit
+                                                                    expectedHeadValue
+                                                                |]
+                                                                None
                                                                 context
 
-                                                        match updateIndexResult with
-                                                        | Error failure -> return Error failure
-                                                        | Ok output when output.ExitCode <> 0 ->
-                                                            return
-                                                                Error(
-                                                                    OperationFailure.createRedacted
-                                                                        ProviderError
-                                                                        "git_failure"
-                                                                        $"Staging the resolved path failed: {output.StdErr}"
-                                                                )
-                                                        | Ok _ ->
-                                                            match candidateObject with
-                                                            | None -> return Ok([||], None)
-                                                            | Some objectInfo ->
-                                                                let objectNotMaterialized () =
-                                                                    [|
-                                                                        {
-                                                                            Code = "object_not_materialized"
-                                                                            Message =
-                                                                                $"The picked version of '{pathValue}' is not in the local cache, so the file holds a pointer until the object is downloaded."
-                                                                        }
-                                                                    |]
-
-                                                                let materializationFailure detail =
-                                                                    OperationFailure.createRedacted
-                                                                        ProviderError
-                                                                        "object_materialization_failed"
-                                                                        $"The pick of '{pathValue}' is staged, but materializing its object failed: {detail}"
-                                                                    |> fun failure -> {
-                                                                        failure with
-                                                                            StateChanged = true
-                                                                            AffectedPaths = [| pathValue |]
-                                                                    }
-
-                                                                let canceledMaterializationFailure detail =
-                                                                    OperationFailure.createRedacted
-                                                                        Canceled
-                                                                        "operation_canceled"
-                                                                        $"Materializing the picked object for '{pathValue}' was canceled: {detail}"
-                                                                    |> fun failure -> {
-                                                                        failure with
-                                                                            StateChanged = true
-                                                                            AffectedPaths = [| pathValue |]
-                                                                    }
-
-                                                                match objectInfo.ObjectId, objectInfo.SizeBytes with
-                                                                | Some objectId, Some sizeBytes ->
-                                                                    let! result =
-                                                                        materializeLocalLfsObject
-                                                                            state
-                                                                            pathValue
-                                                                            objectId
-                                                                            sizeBytes
-                                                                            context
-
-                                                                    match result with
-                                                                    | LocalLfsObjectUnavailable
-                                                                    | LocalLfsStoreUnavailable _
-                                                                    | LocalLfsCheckoutCompleted false ->
-                                                                        return Ok(objectNotMaterialized (), None)
-                                                                    | LocalLfsCheckoutCompleted true -> return Ok([||], None)
-                                                                    | LocalLfsCheckoutFailed failure when failure.Category = Canceled ->
-                                                                        return Ok([||], Some(canceledMaterializationFailure failure.Message))
-                                                                    | LocalLfsCheckoutFailed failure
-                                                                        when context.Cancellation.IsCancellationRequested() ->
-                                                                        return Ok([||], Some(canceledMaterializationFailure failure.Message))
-                                                                    | LocalLfsCheckoutFailed failure ->
-                                                                        return
-                                                                            Ok(
-                                                                                [||],
-                                                                                Some {
-                                                                                    materializationFailure failure.Message with
-                                                                                        RecoveryAction = failure.RecoveryAction
-                                                                                }
-                                                                            )
-                                                                | _ -> return Ok(objectNotMaterialized (), None)
-                                                }
-
-                                            match stagedResult with
-                                            | Error failure ->
-                                                match content, failure.StateChanged with
-                                                | DeletedConflictCandidate, false -> return Failed failure
-                                                | _ -> return Failed(refreshConflictSessionFailure failure)
-                                            | Ok(warnings, materializationFailure) ->
-                                                let refreshedHandle = rotateConflictHandle state
-                                                let summaryContext =
-                                                    if context.Cancellation.IsCancellationRequested() then
-                                                        OperationContext.detached $"{context.OperationId}-conflict-refresh"
-                                                    else
-                                                        context
-
-                                                let! summaryResult = getMergeConflictSummary state summaryContext
-
-                                                match summaryResult with
-                                                | Error failure -> return Failed(refreshConflictSessionFailure failure)
-                                                | Ok summary ->
-                                                    let outcome =
-                                                        OperationOutcome.performed {
-                                                            RefreshedHandle = refreshedHandle
-                                                            RemainingItems =
-                                                                summary
-                                                                |> Option.map _.Items
-                                                                |> Option.defaultValue [||]
-                                                        }
-                                                        |> fun result -> { result with Warnings = warnings }
-
-                                                    match materializationFailure with
-                                                    | None -> return Succeeded outcome
-                                                    | Some failure ->
-                                                        return
-                                                            OperationResult.partiallySucceeded
-                                                                outcome
-                                                                failure
-                                                                (failure.RecoveryAction
-                                                                 |> Option.defaultWith localMaterializationRecovery)
-                })
-        Finalize =
-            fun request context ->
-                withSerializedConflictMutation state (fun () -> async {
-                    let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
-
-                    match validation with
-                    | Error failure -> return Failed failure
-                    | Ok _ ->
-                        let runner = conflictRunner state context
-                        let! unmergedResult = GitConflictSession.listUnmergedPaths runner
-
-                        match unmergedResult with
-                        | Error failure -> return Failed failure
-                        | Ok unmergedPaths when unmergedPaths.Length > 0 ->
-                            return
-                                Failed {
-                                    OperationFailure.create
-                                        Validation
-                                        "conflicts_unresolved"
-                                        "Every conflict item must be resolved before finalizing." with
-                                        AffectedPaths = unmergedPaths
-                                }
-                        | Ok _ ->
-                            let! branchOutput =
-                                runGit state.Hooks state.RepoPath [| "symbolic-ref"; "-q"; "HEAD" |] None context
-
-                            match branchOutput with
-                            | Error failure -> return Failed failure
-                            | Ok branchResult when branchResult.ExitCode <> 0 ->
-                                return
-                                    Failed(
-                                        OperationFailure.create
-                                            Validation
-                                            "detached_head"
-                                            "Finalizing requires a current branch."
-                                    )
-                            | Ok branchResult ->
-                                let branchRef = branchResult.StdOut.Trim()
-                                let! expectedHead = revParse state "HEAD" context
-
-                                match expectedHead with
-                                | None ->
-                                    return
-                                        Failed(
-                                            OperationFailure.create
-                                                ProviderError
-                                                "git_failure"
-                                                "The current head could not be resolved."
-                                        )
-                                | Some expectedHeadValue ->
-                                    let! currentMergeHeadResult = tryGetMergeHead state context
-
-                                    match currentMergeHeadResult with
-                                    | Error failure -> return Failed failure
-                                    | Ok None -> return Failed(GitConflictSession.handleRejection ())
-                                    | Ok(Some currentMergeHead) ->
-                                        let! headParentsResult =
-                                            runGitChecked
-                                                state.Hooks
-                                                state.RepoPath
-                                                [| "rev-list"; "--parents"; "-n"; "1"; "HEAD" |]
-                                                None
-                                                context
-
-                                        match headParentsResult with
-                                        | Error failure -> return Failed failure
-                                        | Ok headParentsOutput ->
-                                            let headParts =
-                                                headParentsOutput.StdOut.Trim().Split([| ' '; '\t'; '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
-
-                                            match headParts |> Array.tryHead with
-                                            | None ->
-                                                return
-                                                    Failed(
-                                                        OperationFailure.create
-                                                            ProviderError
-                                                            "git_failure"
-                                                            "Git returned no current head revision."
-                                                    )
-                                            | Some headRevision ->
-                                                let hasMergeParent =
-                                                    headParts
-                                                    |> Array.skip 1
-                                                    |> Array.contains currentMergeHead
-
-                                                // The merge commit already exists once the parent matches, so the
-                                                // probe runs detached from the caller's cancellation: a cancel or
-                                                // a git failure here must not report a committed merge as a plain
-                                                // failure.
-                                                let! alreadyCommitted =
-                                                    if not hasMergeParent then
-                                                        async { return Ok false }
-                                                    else
-                                                        async {
-                                                            let probeContext = {
+                                                        match updateResult with
+                                                        | Error failure ->
+                                                            let cleanupContext = {
                                                                 context with
                                                                     Cancellation = OperationCancellation.none
                                                             }
 
-                                                            let! indexTreeResult =
-                                                                runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None probeContext
+                                                            let! observedBranch = revParseResult state branchRef cleanupContext
 
-                                                            match indexTreeResult with
-                                                            | Error failure -> return Error failure
-                                                            | Ok indexTreeOutput ->
-                                                                let! headTreeResult = revParseResult state "HEAD^{tree}" probeContext
+                                                            match observedBranch with
+                                                            | Ok(Some branchHead) when branchHead = newCommit ->
+                                                                return! cleanupCommittedConflict state newCommit context
+                                                            | readResult ->
+                                                                let message =
+                                                                    match readResult with
+                                                                    | Error readFailure ->
+                                                                        $"{failure.Message} Branch inspection failed: {readFailure.Message}"
+                                                                    | Ok _ -> failure.Message
 
-                                                                match headTreeResult with
-                                                                | Error failure -> return Error failure
-                                                                | Ok headTree ->
-                                                                    return Ok(headTree = Some(indexTreeOutput.StdOut.Trim()))
-                                                        }
-
-                                                match alreadyCommitted with
-                                                | Error failure ->
-                                                    return
-                                                        Failed {
-                                                            failure with
-                                                                StateChanged = true
-                                                                RecoveryAction =
-                                                                    Some {
-                                                                        Code = "inspect_workspace"
-                                                                        Instructions =
-                                                                            Some
-                                                                                "The merge is committed, but the index could not be compared with it. Inspect the workspace, then finalize again to finish the cleanup."
+                                                                return
+                                                                    Failed {
+                                                                        failure with
+                                                                            Message = Redaction.redact message
+                                                                            StateChanged = true
+                                                                            RecoveryAction =
+                                                                                Some {
+                                                                                    Code = "inspect_workspace"
+                                                                                    Instructions =
+                                                                                        Some
+                                                                                            "The finalize may have updated the branch. Inspect the workspace before retrying."
+                                                                                }
                                                                     }
-                                                        }
-                                                | Ok true -> return! cleanupCommittedConflict state headRevision context
-                                                | Ok false ->
-                                                    let! identityResult = resolveRevisionIdentity state context
+                                                        | Ok updateOutput when updateOutput.ExitCode <> 0 ->
+                                                            let cleanupContext = {
+                                                                context with
+                                                                    Cancellation = OperationCancellation.none
+                                                            }
 
-                                                    match identityResult with
-                                                    | Error failure -> return Failed failure
-                                                    | Ok identityArguments ->
-                                                        do! barrier state.Hooks state.RepoPath "finalize-precheck-done" context
+                                                            if
+                                                                updateOutput.StdErr.IndexOf(
+                                                                    "but expected",
+                                                                    StringComparison.OrdinalIgnoreCase
+                                                                )
+                                                                >= 0
+                                                            then
+                                                                let! observedHead = revParse state branchRef cleanupContext
 
-                                                        let! treeResult =
-                                                            runGitChecked state.Hooks state.RepoPath [| "write-tree" |] None context
-
-                                                        match treeResult with
-                                                        | Error failure -> return Failed failure
-                                                        | Ok treeOutput ->
-                                                            let message =
-                                                                request.Message |> Option.defaultValue "Merge online changes"
-
-                                                            let! commitResult =
-                                                                runGitChecked
-                                                                    state.Hooks
-                                                                    state.RepoPath
-                                                                    [|
-                                                                        yield! identityArguments
-                                                                        "commit-tree"
-                                                                        treeOutput.StdOut.Trim()
-                                                                        "-p"
-                                                                        expectedHeadValue
-                                                                        "-p"
-                                                                        currentMergeHead
-                                                                        "-m"
-                                                                        message
-                                                                    |]
-                                                                    None
-                                                                    context
-
-                                                            match commitResult with
-                                                            | Error failure -> return Failed failure
-                                                            | Ok commitOutput ->
-                                                                let newCommit = commitOutput.StdOut.Trim()
-
-                                                                let! updateResult =
-                                                                    runGit
-                                                                        state.Hooks
-                                                                        state.RepoPath
-                                                                        [|
-                                                                            "update-ref"
-                                                                            branchRef
-                                                                            newCommit
-                                                                            expectedHeadValue
-                                                                        |]
-                                                                        None
-                                                                        context
-
-                                                                match updateResult with
-                                                                | Error failure ->
-                                                                    let cleanupContext = {
-                                                                        context with
-                                                                            Cancellation = OperationCancellation.none
+                                                                return
+                                                                    Failed {
+                                                                        OperationFailure.create
+                                                                            Concurrency
+                                                                            "precondition_failed"
+                                                                            "The destination advanced between the finalize pre-check and verification." with
+                                                                            RevisionEvidence = [|
+                                                                                "expected_destination", GitInternals.mkRevisionId expectedHeadValue
+                                                                                yield!
+                                                                                    observedHead
+                                                                                    |> Option.map (fun value ->
+                                                                                        "observed_destination", GitInternals.mkRevisionId value)
+                                                                                    |> Option.toList
+                                                                            |]
+                                                                            RecoveryAction =
+                                                                                Some {
+                                                                                    Code = ConflictRecovery.RefreshConflictSession
+                                                                                    Instructions =
+                                                                                        Some
+                                                                                            "Refresh the conflict session and deliberately retry."
+                                                                                }
                                                                     }
+                                                            else
+                                                                let details =
+                                                                    updateOutput.StdErr.Split(
+                                                                        [| '\r'; '\n' |],
+                                                                        StringSplitOptions.RemoveEmptyEntries
+                                                                    )
 
-                                                                    let! observedBranch = revParseResult state branchRef cleanupContext
+                                                                return
+                                                                    Failed(
+                                                                        OperationFailure.createRedacted
+                                                                            ProviderError
+                                                                            "git_failure"
+                                                                            "Git refused the finalize ref update."
+                                                                        |> OperationFailure.withDetails details
+                                                                    )
+                                                        | Ok _ ->
+                                                            return! cleanupCommittedConflict state newCommit context
+        }))
 
-                                                                    match observedBranch with
-                                                                    | Ok(Some branchHead) when branchHead = newCommit ->
-                                                                        return! cleanupCommittedConflict state newCommit context
-                                                                    | readResult ->
-                                                                        let message =
-                                                                            match readResult with
-                                                                            | Error readFailure ->
-                                                                                $"{failure.Message} Branch inspection failed: {readFailure.Message}"
-                                                                            | Ok _ -> failure.Message
+let private repoCancelConflict
+    (repository: Repository)
+    (request: CancelConflictRequest)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git ->
+        let state = git.State
 
-                                                                        return
-                                                                            Failed {
-                                                                                failure with
-                                                                                    Message = Redaction.redact message
-                                                                                    StateChanged = true
-                                                                                    RecoveryAction =
-                                                                                        Some {
-                                                                                            Code = "inspect_workspace"
-                                                                                            Instructions =
-                                                                                                Some
-                                                                                                    "The finalize may have updated the branch. Inspect the workspace before retrying."
-                                                                                        }
-                                                                            }
-                                                                | Ok updateOutput when updateOutput.ExitCode <> 0 ->
-                                                                    let cleanupContext = {
-                                                                        context with
-                                                                            Cancellation = OperationCancellation.none
-                                                                    }
+        withSerializedConflictMutation state (fun () -> async {
+            let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
 
-                                                                    if
-                                                                        updateOutput.StdErr.IndexOf(
-                                                                            "but expected",
-                                                                            StringComparison.OrdinalIgnoreCase
-                                                                        )
-                                                                        >= 0
-                                                                    then
-                                                                        let! observedHead = revParse state branchRef cleanupContext
+            match validation with
+            | Error failure -> return Failed failure
+            | Ok _ ->
+                let! abortResult =
+                    runGitChecked state.Hooks state.RepoPath [| "merge"; "--abort" |] None context
 
-                                                                        return
-                                                                            Failed {
-                                                                                OperationFailure.create
-                                                                                    Concurrency
-                                                                                    "precondition_failed"
-                                                                                    "The destination advanced between the finalize pre-check and verification." with
-                                                                                    RevisionEvidence = [|
-                                                                                        "expected_destination", GitInternals.mkRevisionId expectedHeadValue
-                                                                                        yield!
-                                                                                            observedHead
-                                                                                            |> Option.map (fun value ->
-                                                                                                "observed_destination", GitInternals.mkRevisionId value)
-                                                                                            |> Option.toList
-                                                                                    |]
-                                                                                    RecoveryAction =
-                                                                                        Some {
-                                                                                            Code = ConflictRecovery.RefreshConflictSession
-                                                                                            Instructions =
-                                                                                                Some
-                                                                                                    "Refresh the conflict session and deliberately retry."
-                                                                                        }
-                                                                            }
-                                                                    else
-                                                                        let details =
-                                                                            updateOutput.StdErr.Split(
-                                                                                [| '\r'; '\n' |],
-                                                                                StringSplitOptions.RemoveEmptyEntries
-                                                                            )
+                match abortResult with
+                | Ok _ ->
+                    state.ConflictSession <- None
+                    return OperationResult.succeeded ()
+                | Error failure ->
+                    let detachedContext = {
+                        context with
+                            Cancellation = OperationCancellation.none
+                    }
 
-                                                                        return
-                                                                            Failed(
-                                                                                OperationFailure.createRedacted
-                                                                                    ProviderError
-                                                                                    "git_failure"
-                                                                                    "Git refused the finalize ref update."
-                                                                                |> OperationFailure.withDetails details
-                                                                            )
-                                                                | Ok _ ->
-                                                                    return! cleanupCommittedConflict state newCommit context
-                })
-        Cancel =
-            fun request context ->
-                withSerializedConflictMutation state (fun () -> async {
-                    let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
+                    let! mergeHeadResult = tryGetMergeHead state detachedContext
 
-                    match validation with
-                    | Error failure -> return Failed failure
-                    | Ok _ ->
-                        let! abortResult =
-                            runGitChecked state.Hooks state.RepoPath [| "merge"; "--abort" |] None context
+                    match mergeHeadResult with
+                    | Ok None ->
+                        state.ConflictSession <- None
+                        return OperationResult.succeeded ()
+                    | readResult ->
+                        let message =
+                            match readResult with
+                            | Error readFailure ->
+                                $"{failure.Message} MERGE_HEAD inspection failed: {readFailure.Message}"
+                            | Ok _ -> failure.Message
 
-                        match abortResult with
-                        | Ok _ ->
-                            state.ConflictSession <- None
-                            return OperationResult.succeeded ()
-                        | Error failure ->
-                            let detachedContext = {
-                                context with
-                                    Cancellation = OperationCancellation.none
+                        return
+                            Failed {
+                                failure with
+                                    Message = Redaction.redact message
+                                    StateChanged = true
+                                    RecoveryAction =
+                                        Some {
+                                            Code = "abort_merge"
+                                            Instructions =
+                                                Some "Run git merge --abort in the workspace, check that MERGE_HEAD is gone, and refresh."
+                                        }
                             }
-
-                            let! mergeHeadResult = tryGetMergeHead state detachedContext
-
-                            match mergeHeadResult with
-                            | Ok None ->
-                                state.ConflictSession <- None
-                                return OperationResult.succeeded ()
-                            | readResult ->
-                                let message =
-                                    match readResult with
-                                    | Error readFailure ->
-                                        $"{failure.Message} MERGE_HEAD inspection failed: {readFailure.Message}"
-                                    | Ok _ -> failure.Message
-
-                                return
-                                    Failed {
-                                        failure with
-                                            Message = Redaction.redact message
-                                            StateChanged = true
-                                            RecoveryAction =
-                                                Some {
-                                                    Code = "abort_merge"
-                                                    Instructions =
-                                                        Some "Run git merge --abort in the workspace, check that MERGE_HEAD is gone, and refresh."
-                                                }
-                                    }
-                })
-    }
+        }))
 
 // ---------------------------------------------------------------------------
-// Optional services available from the shell
+// Functions of an opened repository
 // ---------------------------------------------------------------------------
 
-let private createBrowser (state: SessionState) : RepositoryBrowserService = {
-    GetRepositoryWebUrl =
-        fun _ -> async {
+let private repoGetRepositoryWebUrl
+    (repository: Repository)
+    (_: OperationContext)
+    : Async<OperationResult<string option>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        async {
             let! result = Async.AwaitPromise(GitService.getOriginRepositoryWebUrl state.RepoPath)
 
             match result with
             | Ok url -> return OperationResult.succeeded url
             | Error failure -> return Failed(toOperationFailure failure)
-        }
+        })
+
+let private runRepoGit (state: SessionState) arguments context =
+    runGit state.Hooks state.RepoPath arguments None context
+
+// A Save in the middle of a Free or Download could commit the file while it is missing
+// or half written, so these bodies take the mutation lock like every other workspace change.
+// The lock is not re-entrant, and nothing inside these bodies takes it again.
+let private serializeLargeObjectWork (state: SessionState) (body: unit -> Async<OperationResult<unit>>) = async {
+    do! state.Lock.Acquire()
+
+    try
+        return! body ()
+    finally
+        state.Lock.Release()
 }
 
+let private activeConflictFailure () =
+    {
+        OperationFailure.create
+            Conflict
+            "conflict_session_active"
+            "A conflict session is active. Resolve or cancel it first." with
+            StateChanged = false
+            RecoveryAction =
+                Some {
+                    Code = "resolve_conflict_session"
+                    Instructions = Some "Resolve every conflict item, then finalize, or cancel the session."
+                }
+    }
+
+let private repoGetStatus
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<RepositoryStatus>> =
+    withRepository repository (fun git -> getWorkspaceStatus git.State context)
+
+let private repoListRefs (repository: Repository) (context: OperationContext) : Async<OperationResult<LogicalRef[]>> =
+    withRepository repository (fun git -> listRefs git.State context)
+
+let private repoCreateRef
+    (repository: Repository)
+    (request: CreateRefRequest)
+    (context: OperationContext)
+    : Async<OperationResult<LogicalRef>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            createRef state request context))
+
+let private repoPreflightSwitchRef
+    (repository: Repository)
+    (request: SwitchRefRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SwitchPreflight>> =
+    withRepository repository (fun git -> preflightSwitchRef git.State request context)
+
+let private repoSwitchRef
+    (repository: Repository)
+    (request: SwitchRefRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RepositoryStatus>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            switchRef state request context))
+
+let private repoCreateRevision
+    (repository: Repository)
+    (request: CreateRevisionRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RevisionId>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            createRevision state request context))
+
+let private repoRestorePaths
+    (repository: Repository)
+    (request: RestoreRequest)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            restorePaths state request context))
+
+let private repoGetDiffSummary
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<DiffSummary>> =
+    withRepository repository (fun git -> getDiffSummary git.State context)
+
+let private repoRefresh
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun git -> refresh git.State context)
+
+let private repoPreviewUpdate
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<UpdatePreview>> =
+    withRepository repository (fun git -> previewUpdate git.State context)
+
+let private repoUpdate
+    (repository: Repository)
+    (request: UpdateRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            async {
+                let! guardResult = activeOperationGuard state context
+
+                match guardResult with
+                | Failed failure -> return Failed failure
+                | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
+                | Succeeded _ -> return! update state request context
+                | PartiallySucceeded(_, failure) -> return Failed failure
+            }))
+
+let private repoPublish
+    (repository: Repository)
+    (request: PublishRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            async {
+                let! guardResult = activeOperationGuard state context
+
+                match guardResult with
+                | Failed failure -> return Failed failure
+                | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
+                | Succeeded _ -> return! publish state request.ExpectedTargetRevision context
+                | PartiallySucceeded(_, failure) -> return Failed failure
+            }))
+
+let private repoSynchronize
+    (repository: Repository)
+    (request: SynchronizeRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
+            async {
+                let! result =
+                    Synchronization.compose
+                        {
+                            HasActiveConflictSession = fun context -> activeOperationGuard state context
+                            Refresh = fun context -> refresh state context
+                            PreviewUpdate = fun syncState context -> previewFromState state syncState context
+                            Update = fun syncState context -> updateFromState state syncState context
+                            Publish =
+                                fun syncState context ->
+                                    async {
+                                        let! expected = publicationTargetRevision state syncState context
+
+                                        match expected with
+                                        | Error failure -> return Failed failure
+                                        | Ok expected -> return! publish state expected context
+                                    }
+                        }
+                        request
+                        context
+
+                // The composition skips Update when there is nothing to merge, so a
+                // synchronization that neither updated nor published downloads here.
+                match result with
+                | Succeeded({ Effect = Unchanged _ } as outcome) when not request.PublishLocalRevisions ->
+                    return! downloadLargeObjectsWithoutUpdate state outcome "synchronization" context
+                | _ -> return result
+            }))
+
+let private repoOpenDiff
+    (repository: Repository)
+    (request: OpenDiffRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Resumable<OpenDiffResult>>> =
+    withRepository repository (fun git -> git.TextDiff.Open request context)
+
+let private repoReadDiffPage
+    (repository: Repository)
+    (request: ReadPageRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Resumable<DiffPage>>> =
+    withRepository repository (fun git -> git.TextDiff.ReadPage request context)
+
+let private repoReplayDiffPage
+    (repository: Repository)
+    (request: ReplayPageRequest)
+    (context: OperationContext)
+    : Async<OperationResult<DiffPage>> =
+    withRepository repository (fun git -> git.TextDiff.ReplayPage request context)
+
+let private repoExpandDiff
+    (repository: Repository)
+    (request: ExpandRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Resumable<DiffPart[]>>> =
+    withRepository repository (fun git -> git.TextDiff.Expand request context)
+
+let private repoReadDiffLine
+    (repository: Repository)
+    (request: ReadLineRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Resumable<DiffLine>>> =
+    withRepository repository (fun git -> git.TextDiff.ReadLine request context)
+
+let private repoGetDiffSourceInfo
+    (repository: Repository)
+    (request: SourceInfoRequest)
+    (context: OperationContext)
+    : Async<OperationResult<DiffSourceInfo * DiffSourceInfo>> =
+    withRepository repository (fun git -> git.TextDiff.GetSourceInfo request context)
+
+let private repoCloseDiff
+    (repository: Repository)
+    (handle: DiffHandle)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git -> git.TextDiff.Close handle context)
+
+let private historyRunner (state: SessionState) arguments environment context =
+    runGitEnv state.Hooks state.RepoPath arguments None environment context
+
+let private repoListRevisions
+    (repository: Repository)
+    (request: ListRevisionsRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RevisionPage>> =
+    withRepository repository (fun git ->
+        GitHistory.listRevisions (historyRunner git.State) checkGitExit request context)
+
+let private repoGetRevisionChanges
+    (repository: Repository)
+    (revision: RevisionId)
+    (context: OperationContext)
+    : Async<OperationResult<DiffSummary>> =
+    withRepository repository (fun git ->
+        GitHistory.getRevisionChanges (historyRunner git.State) checkGitExit parseNameStatusZ revision context)
+
+let private repoListObjects
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<ObjectState[]>> =
+    withRepository repository (fun git -> GitLfsExtensions.listObjects git.State.RepoPath context)
+
+let private repoMaterialize
+    (repository: Repository)
+    (paths: RepositoryPath[])
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        GitLfsExtensions.materialize
+            state.RepoPath
+            state.Credentials
+            state.ConnectionProfileId
+            (preflightIndexLock state)
+            (serializeLargeObjectWork state)
+            paths
+            context)
+
+let private repoDematerialize
+    (repository: Repository)
+    (paths: RepositoryPath[])
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        GitLfsExtensions.dematerialize
+            state.RepoPath
+            (runRepoGit state)
+            state.Credentials
+            state.ConnectionProfileId
+            (preflightIndexLock state)
+            (serializeLargeObjectWork state)
+            paths
+            context)
+
+let private repoSetPathPolicy
+    (repository: Repository)
+    (path: RepositoryPath)
+    (useLargeObjectStorage: bool)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        GitLfsExtensions.setPathPolicy
+            state.RepoPath
+            (runRepoGit state)
+            (preflightIndexLock state)
+            path
+            useLargeObjectStorage
+            context)
+
+let private repoGetStoragePolicySettings
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<StoragePolicySettings>> =
+    withRepository repository (fun git -> GitLfsExtensions.getStoragePolicySettings git.State.RepoPath context)
+
+let private repoSetStoragePolicySettings
+    (repository: Repository)
+    (settings: StoragePolicySettings)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun git ->
+        GitLfsExtensions.setStoragePolicySettings git.State.RepoPath settings context)
+
+let private repoPrune (repository: Repository) (context: OperationContext) : Async<OperationResult<string>> =
+    withRepository repository (fun git ->
+        let state = git.State
+
+        GitLfsExtensions.prune state.RepoPath state.Credentials state.ConnectionProfileId context)
+
+let private repoDeduplicate (repository: Repository) (context: OperationContext) : Async<OperationResult<string>> =
+    withRepository repository (fun git -> GitLfsExtensions.deduplicate git.State.RepoPath context)
+
+let private repoCanDeduplicate (repository: Repository) (context: OperationContext) : Async<OperationResult<bool>> =
+    withRepository repository (fun git -> GitLfsExtensions.canDeduplicate (runRepoGit git.State) context)
+
 // ---------------------------------------------------------------------------
-// Session and factory
+// Opening a repository and the provider
 // ---------------------------------------------------------------------------
 
-let private createSessionWithTextDiff
+/// Opens the repository at `repositoryRoot`. Each open has its own state and its own text diff, so two
+/// opens of one folder share nothing.
+let private openRepository
     (hooks: GitSessionHooks)
-    (textDiffMode: TextDiffMode)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
     (revisionPolicy: RevisionPolicyStrategy)
-    (binding: WorkspaceBinding)
-    : WorkspaceSession =
+    (textDiff: GitTextDiffService.GitTextDiffOptions option)
+    (repositoryRoot: string)
+    (location: RepositoryLocation)
+    : Repository =
+    let location = {
+        location with
+            ProviderLocation = RepositoryLocation.withoutUserInfo location.ProviderLocation
+    }
+
     let state = {
-        RepoPath = binding.RepositoryRoot
+        RepoPath = repositoryRoot
         Hooks = hooks
         Lock = MutationLock()
-        Location = binding.Location
-        ConnectionProfileId = binding.ConnectionProfileId
+        Location = location
+        ConnectionProfileId = location.ConnectionProfileId
         Credentials = credentials
         RevisionIdentity = revisionIdentity
         RevisionPolicy = revisionPolicy
@@ -6193,227 +6577,20 @@ let private createSessionWithTextDiff
         LfsMediaDirectory = None
     }
 
-    let runRepoGit arguments context =
-        runGit state.Hooks state.RepoPath arguments None context
-
-    // A Save in the middle of a Free or Download could commit the file while it is missing
-    // or half written, so these bodies take the mutation lock like every other workspace change.
-    // The lock is not re-entrant, and nothing inside these bodies takes it again.
-    let serializeLargeObjectWork (body: unit -> Async<OperationResult<unit>>) = async {
-        do! state.Lock.Acquire()
-
-        try
-            return! body ()
-        finally
-            state.Lock.Release()
-    }
-
-    let core: CoreVersionControl = {
-        GetStatus = fun context -> getWorkspaceStatus state context
-        ListRefs = fun context -> listRefs state context
-        CreateRef =
-            fun request context ->
-                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                    createRef state request context)
-        PreflightSwitchRef = fun request context -> preflightSwitchRef state request context
-        SwitchRef =
-            fun request context ->
-                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                    switchRef state request context)
-        CreateRevision =
-            fun request context ->
-                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                    createRevision state request context)
-        RestorePaths =
-            fun request context ->
-                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                    restorePaths state request context)
-        GetDiffSummary = fun context -> getDiffSummary state context
-    }
-
-    let descriptor = {
+    let descriptor: RepositoryDescriptor = {
         ProviderId = gitProviderId
-        RepositoryRoot = binding.RepositoryRoot
-        Location = Some binding.Location
+        RepositoryRoot = repositoryRoot
+        Location = Some location
     }
 
-    let activeConflictFailure () =
-        {
-            OperationFailure.create
-                Conflict
-                "conflict_session_active"
-                "A conflict session is active. Resolve or cancel it first." with
-                StateChanged = false
-                RecoveryAction =
-                    Some {
-                        Code = "resolve_conflict_session"
-                        Instructions = Some "Resolve every conflict item, then finalize, or cancel the session."
-                    }
-        }
+    let textDiffCalls, closeTextDiff =
+        match textDiff with
+        | None -> GitTextDiffService.unavailable, fun () -> async.Return ()
+        | Some options ->
+            GitTextDiffService.create options state.RepoPath (fun context ->
+                resolveSessionMediaDirectory state (fun arguments -> runGit state.Hooks state.RepoPath arguments None context))
 
-    let textDiff, closeTextDiff =
-        match textDiffMode with
-        | NoTextDiff -> None, fun () -> async.Return ()
-        | WithoutPool -> Some GitTextDiffService.unavailable, fun () -> async.Return ()
-        | WithPool options ->
-            let service, closeWorkspace =
-                GitTextDiffService.create options state.RepoPath (fun context ->
-                    resolveSessionMediaDirectory state (fun arguments -> runGit state.Hooks state.RepoPath arguments None context))
-
-            Some service, closeWorkspace
-
-    {
-        WorkspaceSession.createCoreOnly descriptor core with
-            TextDiff = textDiff
-            Close = closeTextDiff
-            Synchronization =
-                Some {
-                    Refresh = fun context -> refresh state context
-                    PreviewUpdate = fun context -> previewUpdate state context
-                    Update =
-                        fun request context ->
-                            withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                                async {
-                                    let! guardResult = activeOperationGuard state context
-
-                                    match guardResult with
-                                    | Failed failure -> return Failed failure
-                                    | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
-                                    | Succeeded _ -> return! update state request context
-                                    | PartiallySucceeded(_, failure) -> return Failed failure
-                                })
-                    Publish =
-                        fun request context ->
-                            withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                                async {
-                                    let! guardResult = activeOperationGuard state context
-
-                                    match guardResult with
-                                    | Failed failure -> return Failed failure
-                                    | Succeeded active when active.Value -> return Failed(activeConflictFailure ())
-                                    | Succeeded _ -> return! publish state request.ExpectedTargetRevision context
-                                    | PartiallySucceeded(_, failure) -> return Failed failure
-                                })
-                    Synchronize =
-                        fun request context ->
-                            withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
-                                async {
-                                    let! result =
-                                        Synchronization.compose
-                                            {
-                                                HasActiveConflictSession = fun context -> activeOperationGuard state context
-                                                Refresh = fun context -> refresh state context
-                                                PreviewUpdate = fun syncState context -> previewFromState state syncState context
-                                                Update = fun syncState context -> updateFromState state syncState context
-                                                Publish =
-                                                    fun syncState context ->
-                                                        async {
-                                                            let! expected = publicationTargetRevision state syncState context
-
-                                                            match expected with
-                                                            | Error failure -> return Failed failure
-                                                            | Ok expected -> return! publish state expected context
-                                                        }
-                                            }
-                                            request
-                                            context
-
-                                    // The composition skips Update when there is nothing to merge, so a
-                                    // synchronization that neither updated nor published downloads here.
-                                    match result with
-                                    | Succeeded({ Effect = Unchanged _ } as outcome) when not request.PublishLocalRevisions ->
-                                        return! downloadLargeObjectsWithoutUpdate state outcome "synchronization" context
-                                    | _ -> return result
-                                })
-                }
-            ConflictResolution = Some(createConflictService state)
-            // Git LFS is optional: the services exist because the Git provider
-            // supports them; their operations report their own dependency status
-            // when git-lfs is not installed. Core Git never requires LFS.
-            ObjectMaterialization =
-                Some(
-                    GitLfsExtensions.createObjectMaterialization
-                        state.RepoPath
-                        runRepoGit
-                        state.Credentials
-                        state.ConnectionProfileId
-                        (preflightIndexLock state)
-                        serializeLargeObjectWork
-                )
-            StoragePolicy =
-                Some(
-                    GitLfsExtensions.createStoragePolicy
-                        state.RepoPath
-                        runRepoGit
-                        (preflightIndexLock state)
-                )
-            Maintenance =
-                Some(
-                    GitLfsExtensions.createMaintenance
-                        state.RepoPath
-                        runRepoGit
-                        state.Credentials
-                        state.ConnectionProfileId
-                )
-            RepositoryBrowser = Some(createBrowser state)
-            History =
-                Some(
-                    GitHistory.create
-                        (fun arguments environment context ->
-                            runGitEnv state.Hooks state.RepoPath arguments None environment context)
-                        checkGitExit
-                        parseNameStatusZ
-                )
-    }
-
-let createSessionWithCredentialsIdentityAndPolicy
-    (hooks: GitSessionHooks)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
-    (revisionPolicy: RevisionPolicyStrategy)
-    (binding: WorkspaceBinding)
-    : WorkspaceSession =
-    createSessionWithTextDiff hooks NoTextDiff credentials revisionIdentity revisionPolicy binding
-
-/// Session with a text diff service. The service asks the options for the worker pool on each Open until it
-/// gets one. Options with no TextDiff produce a service whose Open fails with diff_worker_failed.
-let createSessionWithOptions
-    (options: GitSessionOptions)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
-    (revisionPolicy: RevisionPolicyStrategy)
-    (binding: WorkspaceBinding)
-    : WorkspaceSession =
-    let textDiffMode =
-        match options.TextDiff with
-        | Some textDiff -> WithPool textDiff
-        | None -> WithoutPool
-
-    createSessionWithTextDiff options.Hooks textDiffMode credentials revisionIdentity revisionPolicy binding
-
-let createSessionWithCredentialsAndIdentity
-    (hooks: GitSessionHooks)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
-    (binding: WorkspaceBinding)
-    : WorkspaceSession =
-    createSessionWithCredentialsIdentityAndPolicy
-        hooks
-        credentials
-        revisionIdentity
-        RevisionPolicyStrategy.automatic
-        binding
-
-let createSessionWithCredentials
-    (hooks: GitSessionHooks)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (binding: WorkspaceBinding)
-    : WorkspaceSession =
-    createSessionWithCredentialsAndIdentity hooks credentials GitCredentialStrategy.anonymousIdentity binding
-
-/// Session with the anonymous credential strategy.
-let createSession (hooks: GitSessionHooks) (binding: WorkspaceBinding) : WorkspaceSession =
-    createSessionWithCredentials hooks GitCredentialStrategy.anonymous binding
+    GitRepository(descriptor, state, textDiffCalls, closeTextDiff) :> Repository
 
 let private probe (workspacePath: string) : Async<ProbeResult> =
     async {
@@ -6428,18 +6605,6 @@ let private probe (workspacePath: string) : Async<ProbeResult> =
             return ProbeFailed(OperationFailure.createRedacted ProviderError "probe_exception" error.Message)
     }
 
-let private bindingFor (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
-    SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-    ProviderId = gitProviderId
-    RepositoryRoot = workspaceRoot
-    ProviderStateRef = None
-    Location = {
-        location with
-            ProviderLocation = RepositoryLocation.withoutUserInfo location.ProviderLocation
-    }
-    ConnectionProfileId = location.ConnectionProfileId
-}
-
 let private localLocation (providerLocation: string) : RepositoryLocation = {
     ProviderId = gitProviderId
     DisplayName = None
@@ -6447,7 +6612,7 @@ let private localLocation (providerLocation: string) : RepositoryLocation = {
     ConnectionProfileId = None
 }
 
-let private validateFactoryLocation (location: RepositoryLocation) =
+let private validateLocation (location: RepositoryLocation) =
     match GitService.ensureAllowedRemoteUrl location.ProviderLocation with
     | Ok providerLocation -> Ok { location with ProviderLocation = providerLocation }
     | Error failure ->
@@ -6473,7 +6638,7 @@ let private adoptionUnsupportedFailure (detail: string) =
     OperationFailure.createRedacted
         Unsupported
         "adoption_unsupported"
-        $"The workspace cannot be adopted without guessing because Git cannot parse its repository metadata: {detail}"
+        $"The folder cannot be opened without guessing because Git cannot parse its repository metadata: {detail}"
 
 /// The URL git will connect to for a location the caller supplied, with insteadOf
 /// rewriting applied. The query runs in the process working directory, so global and
@@ -6493,137 +6658,108 @@ let private expandLocationUrl (hooks: GitSessionHooks) (location: string) (conte
         | _ -> return location
     }
 
-let private createFactoryWithSessions
+// The remediation of an explicit selection names the path and the reason, so the host can show
+// which file the user chose.
+let private selectedGitRemediation (path: string) (problem: string) =
+    $"The selected Git executable '{path}' {problem}. Choose another file or use the Git found on PATH."
+
+// Every git command of the check runs with the one resolution passed in, so the three results
+// describe the same git.
+let private checkSelectedGit
     (hooks: GitSessionHooks)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (openSession: WorkspaceBinding -> WorkspaceSession)
-    : ProviderFactory =
-    // The remediation of an explicit selection names the path and the reason, so the host can show
-    // which file the user chose.
-    let selectedGitRemediation (path: string) (problem: string) =
-        $"The selected Git executable '{path}' {problem}. Choose another file or use the Git found on PATH."
+    (invocation: GitExecution.GitInvocation)
+    (probeExecutablePath: string option)
+    (context: OperationContext)
+    : Async<OperationResult<DependencyStatus[]>> =
+    let runGitForCheck (arguments: string[]) =
+        runGitWithInvocation invocation "git" false hooks "." arguments None [||] context
 
-    // Every git command of the check runs with the one resolution passed in, so the three results
-    // describe the same git.
-    let checkSelectedGit
-        (invocation: GitExecution.GitInvocation)
-        (probeExecutablePath: string option)
-        (context: OperationContext)
-        : Async<OperationResult<DependencyStatus[]>> =
-        let runGitForCheck (arguments: string[]) =
-            runGitWithInvocation invocation "git" false hooks "." arguments None [||] context
+    async {
+        let! gitVersion = runGitForCheck [| "--version" |]
 
-        async {
-            let! gitVersion = runGitForCheck [| "--version" |]
+        match gitVersion with
+        | Error failure when failure.Category = Canceled -> return Failed failure
+        | _ ->
+            let! lfsVersion = runGitForCheck [| "lfs"; "version" |]
 
-            match gitVersion with
+            match lfsVersion with
             | Error failure when failure.Category = Canceled -> return Failed failure
             | _ ->
-                let! lfsVersion = runGitForCheck [| "lfs"; "version" |]
+                let! lfsFilter =
+                    async {
+                        let! globalFilter = runGitForCheck [| "config"; "--global"; "--get"; "filter.lfs.process" |]
 
-                match lfsVersion with
+                        match globalFilter with
+                        | Error _ -> return globalFilter
+                        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                            return globalFilter
+                        | Ok _ ->
+                            let! systemFilter =
+                                runGitForCheck [| "config"; "--system"; "--get"; "filter.lfs.process" |]
+
+                            match systemFilter with
+                            | Error failure when failure.Category = Canceled -> return systemFilter
+                            | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                                return systemFilter
+                            | _ -> return globalFilter
+                    }
+
+                match lfsFilter with
                 | Error failure when failure.Category = Canceled -> return Failed failure
                 | _ ->
-                    let! lfsFilter =
-                        async {
-                            let! globalFilter = runGitForCheck [| "config"; "--global"; "--get"; "filter.lfs.process" |]
+                    // The remediation names the cause, so a Git that could not start or
+                    // failed does not read like a missing or outdated install.
+                    let versionFailureCause
+                        (command: string)
+                        (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
+                        =
+                        match result with
+                        | Error failure -> failure.Message.TrimEnd('.')
+                        | Ok output when String.IsNullOrWhiteSpace output.StdErr ->
+                            $"`{command}` exited with code {output.ExitCode}"
+                        | Ok output ->
+                            $"`{command}` exited with code {output.ExitCode}: {output.StdErr.Trim().TrimEnd('.')}"
 
-                            match globalFilter with
-                            | Error _ -> return globalFilter
-                            | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-                                return globalFilter
-                            | Ok _ ->
-                                let! systemFilter =
-                                    runGitForCheck [| "config"; "--system"; "--get"; "filter.lfs.process" |]
+                    let versionFailureDetail
+                        (command: string)
+                        (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
+                        =
+                        $"{versionFailureCause command result}. "
 
-                                match systemFilter with
-                                | Error failure when failure.Category = Canceled -> return systemFilter
-                                | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-                                    return systemFilter
-                                | _ -> return globalFilter
-                        }
+                    // A program that fails to start or does not print Git's version line is not
+                    // Git, whatever else it prints.
+                    let gitNotInstalled (cause: string) : DependencyStatus = {
+                        Component = "git"
+                        Installed = false
+                        Version = None
+                        Compatible = false
+                        Remediation =
+                            Some(
+                                if invocation.Explicit then
+                                    selectedGitRemediation
+                                        invocation.Executable
+                                        ("did not run as Git (" + cause + ")")
+                                else
+                                    cause + ". Install Git 2.42 or newer and ensure it is on PATH."
+                            )
+                        ProbeExecutablePath = probeExecutablePath
+                    }
 
-                    match lfsFilter with
-                    | Error failure when failure.Category = Canceled -> return Failed failure
-                    | _ ->
-                        // The remediation names the cause, so a Git that could not start or
-                        // failed does not read like a missing or outdated install.
-                        let versionFailureCause
-                            (command: string)
-                            (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
-                            =
-                            match result with
-                            | Error failure -> failure.Message.TrimEnd('.')
-                            | Ok output when String.IsNullOrWhiteSpace output.StdErr ->
-                                $"`{command}` exited with code {output.ExitCode}"
-                            | Ok output ->
-                                $"`{command}` exited with code {output.ExitCode}: {output.StdErr.Trim().TrimEnd('.')}"
+                    let gitStatus: DependencyStatus =
+                        match gitVersion with
+                        | Ok output when output.ExitCode = 0 ->
+                            let versionText = output.StdOut.Trim()
 
-                        let versionFailureDetail
-                            (command: string)
-                            (result: Result<NodeProcess.ProcessOutput, OperationFailure>)
-                            =
-                            $"{versionFailureCause command result}. "
-
-                        // A program that fails to start or does not print Git's version line is not
-                        // Git, whatever else it prints.
-                        let gitNotInstalled (cause: string) : DependencyStatus = {
-                            Component = "git"
-                            Installed = false
-                            Version = None
-                            Compatible = false
-                            Remediation =
-                                Some(
-                                    if invocation.Explicit then
-                                        selectedGitRemediation
-                                            invocation.Executable
-                                            ("did not run as Git (" + cause + ")")
-                                    else
-                                        cause + ". Install Git 2.42 or newer and ensure it is on PATH."
-                                )
-                            ProbeExecutablePath = probeExecutablePath
-                        }
-
-                        let gitStatus: DependencyStatus =
-                            match gitVersion with
-                            | Ok output when output.ExitCode = 0 ->
-                                let versionText = output.StdOut.Trim()
-
-                                match GitService.tryParseVersion versionText with
-                                | None -> gitNotInstalled "`git --version` printed no Git version line"
-                                | Some(major, minor, _) ->
-                                    // Git LFS 3.7 lists files from the index only with Git 2.42 or newer.
-                                    // With older Git, `git lfs checkout` reads the HEAD tree and leaves a
-                                    // picked conflict candidate, which is staged but not committed, as a pointer.
-                                    let compatible = major > 2 || (major = 2 && minor >= 42)
-
-                                    {
-                                        Component = "git"
-                                        Installed = true
-                                        Version = Some versionText
-                                        Compatible = compatible
-                                        Remediation =
-                                            if compatible then
-                                                None
-                                            else
-                                                Some
-                                                    "Install Git 2.42 or newer: Git LFS needs it to check out files that are staged but not committed."
-                                        ProbeExecutablePath = probeExecutablePath
-                                    }
-                            | _ -> gitNotInstalled (versionFailureCause "git --version" gitVersion)
-
-                        let lfsStatus: DependencyStatus =
-                            match lfsVersion with
-                            | Ok output when output.ExitCode = 0 ->
-                                let versionText = output.StdOut.Trim()
-
-                                let compatible =
-                                    match GitLfsService.tryParseVersion versionText with
-                                    | Some(major, minor, _) -> major > 3 || (major = 3 && minor >= 7)
-                                    | None -> false
+                            match GitService.tryParseVersion versionText with
+                            | None -> gitNotInstalled "`git --version` printed no Git version line"
+                            | Some(major, minor, _) ->
+                                // Git LFS 3.7 lists files from the index only with Git 2.42 or newer.
+                                // With older Git, `git lfs checkout` reads the HEAD tree and leaves a
+                                // picked conflict candidate, which is staged but not committed, as a pointer.
+                                let compatible = major > 2 || (major = 2 && minor >= 42)
 
                                 {
-                                    Component = "git-lfs"
+                                    Component = "git"
                                     Installed = true
                                     Version = Some versionText
                                     Compatible = compatible
@@ -6631,728 +6767,813 @@ let private createFactoryWithSessions
                                         if compatible then
                                             None
                                         else
-                                            Some "Install a supported Git LFS release and ensure `git lfs version` succeeds."
+                                            Some
+                                                "Install Git 2.42 or newer: Git LFS needs it to check out files that are staged but not committed."
                                     ProbeExecutablePath = probeExecutablePath
                                 }
-                            | _ ->
-                                {
-                                    Component = "git-lfs"
-                                    Installed = false
-                                    Version = None
-                                    Compatible = false
-                                    Remediation =
-                                        Some(
-                                            versionFailureDetail "git lfs version" lfsVersion
-                                            + "Install Git LFS and ensure `git lfs version` succeeds."
-                                        )
-                                    ProbeExecutablePath = probeExecutablePath
-                                }
+                        | _ -> gitNotInstalled (versionFailureCause "git --version" gitVersion)
 
-                        let filterInstalled =
-                            match lfsFilter with
-                            | Ok output when output.ExitCode = 0 ->
-                                output.StdOut.Trim().Equals("git-lfs filter-process", StringComparison.Ordinal)
-                            | _ -> false
+                    let lfsStatus: DependencyStatus =
+                        match lfsVersion with
+                        | Ok output when output.ExitCode = 0 ->
+                            let versionText = output.StdOut.Trim()
 
-                        let filterStatus: DependencyStatus =
+                            let compatible =
+                                match GitLfsService.tryParseVersion versionText with
+                                | Some(major, minor, _) -> major > 3 || (major = 3 && minor >= 7)
+                                | None -> false
+
                             {
-                                Component = "git-lfs-configuration"
-                                Installed = filterInstalled
-                                Version = None
-                                Compatible = filterInstalled && lfsStatus.Compatible
+                                Component = "git-lfs"
+                                Installed = true
+                                Version = Some versionText
+                                Compatible = compatible
                                 Remediation =
-                                    if filterInstalled && lfsStatus.Compatible then
+                                    if compatible then
                                         None
-                                    elif not lfsStatus.Installed then
-                                        Some "Install Git LFS before configuring its global filter process."
-                                    elif invocation.Explicit then
-                                        // A bare git on PATH can be another installation than the selected one.
-                                        Some
-                                            $"Run `\"{invocation.Executable}\" lfs install --skip-repo` to configure Git LFS globally."
                                     else
-                                        Some "Run `git lfs install --skip-repo` to configure Git LFS globally."
+                                        Some "Install a supported Git LFS release and ensure `git lfs version` succeeds."
+                                ProbeExecutablePath = probeExecutablePath
+                            }
+                        | _ ->
+                            {
+                                Component = "git-lfs"
+                                Installed = false
+                                Version = None
+                                Compatible = false
+                                Remediation =
+                                    Some(
+                                        versionFailureDetail "git lfs version" lfsVersion
+                                        + "Install Git LFS and ensure `git lfs version` succeeds."
+                                    )
                                 ProbeExecutablePath = probeExecutablePath
                             }
 
-                        return OperationResult.succeeded [| gitStatus; lfsStatus; filterStatus |]
-        }
+                    let filterInstalled =
+                        match lfsFilter with
+                        | Ok output when output.ExitCode = 0 ->
+                            output.StdOut.Trim().Equals("git-lfs filter-process", StringComparison.Ordinal)
+                        | _ -> false
 
-    // An explicit selection that cannot start git has no fallback to the git on PATH. All three
-    // components report it as not installed and name the path.
-    let unusableSelectionStatuses (path: string) (problem: string) : DependencyStatus[] =
-        let remediation = selectedGitRemediation path problem
+                    let filterStatus: DependencyStatus =
+                        {
+                            Component = "git-lfs-configuration"
+                            Installed = filterInstalled
+                            Version = None
+                            Compatible = filterInstalled && lfsStatus.Compatible
+                            Remediation =
+                                if filterInstalled && lfsStatus.Compatible then
+                                    None
+                                elif not lfsStatus.Installed then
+                                    Some "Install Git LFS before configuring its global filter process."
+                                elif invocation.Explicit then
+                                    // A bare git on PATH can be another installation than the selected one.
+                                    Some
+                                        $"Run `\"{invocation.Executable}\" lfs install --skip-repo` to configure Git LFS globally."
+                                else
+                                    Some "Run `git lfs install --skip-repo` to configure Git LFS globally."
+                            ProbeExecutablePath = probeExecutablePath
+                        }
 
-        [| "git"; "git-lfs"; "git-lfs-configuration" |]
-        |> Array.map (fun dependencyComponent -> {
-            Component = dependencyComponent
-            Installed = false
-            Version = None
-            Compatible = false
-            Remediation = Some remediation
-            ProbeExecutablePath = Some path
-        })
-
-    let checkDependencies (context: OperationContext) : Async<OperationResult<DependencyStatus[]>> = async {
-        let invocation = GitExecution.resolveInvocation ()
-
-        match GitExecution.explicitSelectionProblem invocation with
-        | Some problem -> return OperationResult.succeeded (unusableSelectionStatuses invocation.Executable problem)
-        | None -> return! checkSelectedGit invocation (GitExecution.probeExecutablePath invocation) context
+                    return OperationResult.succeeded [| gitStatus; lfsStatus; filterStatus |]
     }
 
-    let manualLfsInstallationRequired () =
-        OperationFailure.create
-            Unsupported
-            "manual_install_required"
-            "Install Git LFS 3.7 or newer manually, then rerun dependency checks."
+// An explicit selection that cannot start git has no fallback to the git on PATH. All three
+// components report it as not installed and name the path.
+let private unusableSelectionStatuses (path: string) (problem: string) : DependencyStatus[] =
+    let remediation = selectedGitRemediation path problem
 
-    {
-    Id = gitProviderId
-    Probe = probe
-    VerifyLocation =
-        fun request context -> async {
-            match validateFactoryLocation request.Location with
-            | Error failure -> return Failed failure
-            | Ok location ->
-                let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+    [| "git"; "git-lfs"; "git-lfs-configuration" |]
+    |> Array.map (fun dependencyComponent -> {
+        Component = dependencyComponent
+        Installed = false
+        Version = None
+        Compatible = false
+        Remediation = Some remediation
+        ProbeExecutablePath = Some path
+    })
 
-                let! authArguments =
-                    GitCredentialStrategy.resolveAuthArguments
-                        credentials
-                        effectiveLocation
-                        location.ConnectionProfileId
+let private checkDependencies
+    (hooks: GitSessionHooks)
+    (context: OperationContext)
+    : Async<OperationResult<DependencyStatus[]>> = async {
+    let invocation = GitExecution.resolveInvocation ()
 
-                let! result =
-                    runGit
+    match GitExecution.explicitSelectionProblem invocation with
+    | Some problem -> return OperationResult.succeeded (unusableSelectionStatuses invocation.Executable problem)
+    | None -> return! checkSelectedGit hooks invocation (GitExecution.probeExecutablePath invocation) context
+}
+
+let private manualLfsInstallationRequired () =
+    OperationFailure.create
+        Unsupported
+        "manual_install_required"
+        "Install Git LFS 3.7 or newer manually, then rerun dependency checks."
+
+let private verifyLocation
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (request: VerifyLocationRequest)
+    (context: OperationContext)
+    : Async<OperationResult<AccessReport>> = async {
+    match validateLocation request.Location with
+    | Error failure -> return Failed failure
+    | Ok location ->
+        let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+
+        let! authArguments =
+            GitCredentialStrategy.resolveAuthArguments
+                credentials
+                effectiveLocation
+                location.ConnectionProfileId
+
+        let! result =
+            runGit
+                hooks
+                "."
+                [|
+                    yield! authArguments
+                    "ls-remote"
+                    "--"
+                    location.ProviderLocation
+                |]
+                None
+                context
+
+        match result with
+        | Ok output when output.ExitCode = 0 ->
+            return
+                OperationResult.succeeded {
+                    Location = location
+                    GrantedIntents = request.Intents
+                    DeniedIntents = [||]
+                }
+        | Ok output ->
+            // Classify the failure so consumers can recover: authentication
+            // and authorization problems keep their categories instead of
+            // collapsing into a generic network error.
+            let category =
+                match GitService.classifyFailureKind output.StdErr with
+                | GitFailureKind.Unauthorized -> Authentication
+                | GitFailureKind.Forbidden -> Authorization
+                | GitFailureKind.Network -> Network
+                | GitFailureKind.Timeout -> Timeout
+                | _ -> NotFound
+
+            return
+                Failed(
+                    OperationFailure.createRedacted
+                        category
+                        "location_unreachable"
+                        $"The repository location is not reachable: {output.StdErr}"
+                )
+        | Error failure -> return Failed failure
+}
+
+let private initialize
+    (hooks: GitSessionHooks)
+    (openRepositoryAt: string -> RepositoryLocation -> Repository)
+    (request: InitializeRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> = async {
+    let validatedLocationResult =
+        match request.Location with
+        | None -> Ok None
+        | Some location -> validateLocation location |> Result.map Some
+
+    match validatedLocationResult with
+    | Error failure -> return Failed failure
+    | Ok requestedLocation ->
+        let! result = Async.AwaitPromise(GitProvisioningService.initRepository request.TargetPath)
+
+        match result with
+        | Error failure when failure.Message.Contains("already a git repository", StringComparison.OrdinalIgnoreCase) ->
+            return
+                Failed(
+                    OperationFailure.create
+                        Validation
+                        "already_initialized"
+                        "The target path is already initialized as a Git repository."
+                )
+        | Error failure -> return Failed(toOperationFailure failure)
+        | Ok normalizedPath ->
+            match requestedLocation with
+            | None -> return OperationResult.succeeded (openRepositoryAt normalizedPath (localLocation normalizedPath))
+            | Some location when resolvesToSamePath location.ProviderLocation normalizedPath ->
+                return OperationResult.succeeded (openRepositoryAt normalizedPath location)
+            | Some location ->
+                let! remoteResult =
+                    runGitChecked
                         hooks
-                        "."
+                        normalizedPath
                         [|
-                            yield! authArguments
-                            "ls-remote"
+                            "remote"
+                            "add"
+                            "origin"
                             "--"
                             location.ProviderLocation
                         |]
                         None
                         context
 
-                match result with
-                | Ok output when output.ExitCode = 0 ->
-                    return
-                        OperationResult.succeeded {
-                            Location = location
-                            GrantedIntents = request.Intents
-                            DeniedIntents = [||]
-                        }
-                | Ok output ->
-                    // Classify the failure so consumers can recover: authentication
-                    // and authorization problems keep their categories instead of
-                    // collapsing into a generic network error.
-                    let category =
-                        match GitService.classifyFailureKind output.StdErr with
-                        | GitFailureKind.Unauthorized -> Authentication
-                        | GitFailureKind.Forbidden -> Authorization
-                        | GitFailureKind.Network -> Network
-                        | GitFailureKind.Timeout -> Timeout
-                        | _ -> NotFound
+                match remoteResult with
+                | Error failure -> return Failed { failure with StateChanged = true }
+                | Ok _ -> return OperationResult.succeeded (openRepositoryAt normalizedPath location)
+}
 
-                    return
-                        Failed(
-                            OperationFailure.createRedacted
-                                category
-                                "location_unreachable"
-                                $"The repository location is not reachable: {output.StdErr}"
-                        )
-                | Error failure -> return Failed failure
-        }
-    Initialize =
-        fun request context -> async {
-            let validatedLocationResult =
-                match request.Location with
-                | None -> Ok None
-                | Some location -> validateFactoryLocation location |> Result.map Some
+let private clone
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (openRepositoryAt: string -> RepositoryLocation -> Repository)
+    (request: CloneRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> = async {
+    let targetNotEmptyFailure () =
+        OperationFailure.create
+            Validation
+            "target_not_empty"
+            "The clone target directory is not empty."
 
-            match validatedLocationResult with
-            | Error failure -> return Failed failure
-            | Ok requestedLocation ->
-                let! result = Async.AwaitPromise(GitProvisioningService.initRepository request.TargetPath)
+    let validatedLocation =
+        match request.TargetRef with
+        | Some _ ->
+            Error(
+                OperationFailure.create
+                    Unsupported
+                    "target_ref_unsupported"
+                    "Git clone does not support choosing a ref."
+            )
+        | None -> validateLocation request.Location
 
-                match result with
-                | Error failure when failure.Message.Contains("already a git repository", StringComparison.OrdinalIgnoreCase) ->
+    // Remember what the target looked like so a killed or failed clone can be
+    // undone without touching anything the caller already had there. A target
+    // that cannot be inspected counts as not empty.
+    let targetSnapshot =
+        try
+            match NodeFileSystem.tryLstatSync request.TargetPath with
+            | None -> false, false
+            | Some stats ->
+                let empty =
+                    stats.isDirectory ()
+                    && not (stats.isSymbolicLink ())
+                    && (NodeFileSystem.readdirSync request.TargetPath).Length = 0
+
+                true, empty
+        with _ ->
+            true, false
+
+    match validatedLocation, targetSnapshot with
+    | Error failure, _ -> return Failed failure
+    | Ok location, (targetExistedBefore, targetWasEmptyDirectory) ->
+        let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
+
+        let! authentication =
+            GitCredentialStrategy.resolveCommandAuthentication
+                credentials
+                effectiveLocation
+                location.ConnectionProfileId
+                "origin"
+
+        let mutable targetCreatedByClone = false
+        // Rollback runs only after the target was set up, so a refusal or a cancel
+        // before the clone never touches what someone else put into the target.
+        let mutable cloneStarted = false
+
+        let removeCloneResidue () : Async<string option> =
+            async {
+                try
+                    if targetCreatedByClone then
+                        do!
+                            NodeFileSystem.rmAsync
+                                request.TargetPath
+                                (NodeFileSystem.RmOptions(
+                                    recursive = true,
+                                    force = true,
+                                    maxRetries = 5,
+                                    retryDelay = 100
+                                ))
+                            |> Async.AwaitPromise
+
+                        return None
+                    elif targetExistedBefore && targetWasEmptyDirectory then
+                        for entry in NodeFileSystem.readdirSync request.TargetPath do
+                            do!
+                                NodeFileSystem.rmAsync
+                                    (NodePath.join [| request.TargetPath; entry |])
+                                    (NodeFileSystem.RmOptions(
+                                        recursive = true,
+                                        force = true,
+                                        maxRetries = 5,
+                                        retryDelay = 100
+                                    ))
+                                |> Async.AwaitPromise
+
+                        return None
+                    else
+                        return None
+                with error ->
+                    return Some error.Message
+            }
+
+        // When cleanup fails, name the target the caller has to clear.
+        let withResidue (failure: OperationFailure) (cleanupError: string option) =
+            match cleanupError with
+            | None -> failure
+            | Some message ->
+                {
+                    failure with
+                        StateChanged = true
+                        RecoveryAction =
+                            Some {
+                                Code = "remove_clone_target"
+                                Instructions =
+                                    Some(
+                                        Redaction.redact
+                                            $"Remove '{request.TargetPath}' before retrying the clone. Cleanup failed: {message}"
+                                    )
+                            }
+                }
+
+        let! result =
+            async {
+                if context.Cancellation.IsCancellationRequested() then
                     return
-                        Failed(
+                        Error(
                             OperationFailure.create
-                                Validation
-                                "already_initialized"
-                                "The target path is already initialized as a Git repository."
+                                Canceled
+                                "operation_canceled"
+                                "The clone was canceled before it started."
                         )
-                | Error failure -> return Failed(toOperationFailure failure)
-                | Ok normalizedPath ->
-                    match requestedLocation with
-                    | None -> return OperationResult.succeeded (bindingFor normalizedPath (localLocation normalizedPath))
-                    | Some location when resolvesToSamePath location.ProviderLocation normalizedPath ->
-                        return OperationResult.succeeded (bindingFor normalizedPath location)
-                    | Some location ->
-                        let! remoteResult =
-                            runGitChecked
+                elif targetExistedBefore && not targetWasEmptyDirectory then
+                    return Error(targetNotEmptyFailure ())
+                else
+                    let targetSetup =
+                        try
+                            if not targetExistedBefore then
+                                let parentPath = NodePath.dirname request.TargetPath
+
+                                if not (NodeFileSystem.existsSync parentPath) then
+                                    NodeFileSystem.mkdirSync
+                                        parentPath
+                                        (NodeFileSystem.MkdirOptions(recursive = true))
+
+                                NodeFileSystem.mkdirSync
+                                    request.TargetPath
+                                    (NodeFileSystem.MkdirOptions(recursive = false))
+
+                                targetCreatedByClone <- true
+
+                            Ok()
+                        with error ->
+                            if tryGetNodeErrorCode error = Some "EEXIST" then
+                                Error(targetNotEmptyFailure ())
+                            else
+                                Error(
+                                    OperationFailure.createRedacted
+                                        ProviderError
+                                        "clone_failed"
+                                        $"Could not create the clone target directory: {error.Message}"
+                                )
+
+                    match targetSetup with
+                    | Error failure -> return Error failure
+                    | Ok () ->
+                        cloneStarted <- true
+                        reportStepStart ProgressPhaseCodes.Clone "Cloning the repository" context
+
+                        // Git keeps large objects as pointers until hydration so a download
+                        // failure can be reported as partial success.
+                        return!
+                            runGitTransfer
+                                "clone"
+                                false
                                 hooks
-                                normalizedPath
+                                "."
                                 [|
-                                    "remote"
-                                    "add"
-                                    "origin"
+                                    yield! authentication.ConfigArgs
+                                    "clone"
+                                    "--progress"
                                     "--"
                                     location.ProviderLocation
+                                    request.TargetPath
                                 |]
-                                None
+                                [|
+                                    "GIT_TERMINAL_PROMPT", "0"
+                                    "GIT_LFS_SKIP_SMUDGE", "1"
+                                |]
                                 context
+            }
 
-                        match remoteResult with
-                        | Error failure -> return Failed { failure with StateChanged = true }
-                        | Ok _ -> return OperationResult.succeeded (bindingFor normalizedPath location)
-        }
-    Clone =
-        fun request context -> async {
-            let targetNotEmptyFailure () =
-                OperationFailure.create
-                    Validation
-                    "target_not_empty"
-                    "The clone target directory is not empty."
+        match result with
+        | Error failure when not cloneStarted -> return Failed failure
+        | Error failure ->
+            let! cleanupError = removeCloneResidue ()
 
-            let validatedLocation =
-                match request.TargetRef with
-                | Some _ ->
-                    Error(
-                        OperationFailure.create
-                            Unsupported
-                            "target_ref_unsupported"
-                            "Git clone does not support choosing a ref."
+            let failure =
+                if failure.Category = Canceled then
+                    OperationFailure.create Canceled "operation_canceled" failure.Message
+                else
+                    failure
+
+            return Failed(withResidue failure cleanupError)
+        | Ok output when output.ExitCode <> 0 ->
+            let combined = output.StdErr + output.StdOut
+
+            if combined.Contains "already exists and is not an empty directory" then
+                // git refused before writing anything. Whatever is in the target
+                // now belongs to someone else, so nothing is removed.
+                return Failed(targetNotEmptyFailure ())
+            else
+                let! cleanupError = removeCloneResidue ()
+
+                return
+                    Failed(
+                        withResidue
+                            (OperationFailure.createRedacted
+                                ProviderError
+                                "clone_failed"
+                                $"Clone failed: {combined}")
+                            cleanupError
                     )
-                | None -> validateFactoryLocation request.Location
+        | Ok _ ->
+            let repository = openRepositoryAt request.TargetPath location
 
-            // Remember what the target looked like so a killed or failed clone can be
-            // undone without touching anything the caller already had there. A target
-            // that cannot be inspected counts as not empty.
-            let targetSnapshot =
-                try
-                    match NodeFileSystem.tryLstatSync request.TargetPath with
-                    | None -> false, false
-                    | Some stats ->
-                        let empty =
-                            stats.isDirectory ()
-                            && not (stats.isSymbolicLink ())
-                            && (NodeFileSystem.readdirSync request.TargetPath).Length = 0
-
-                        true, empty
-                with _ ->
-                    true, false
-
-            match validatedLocation, targetSnapshot with
-            | Error failure, _ -> return Failed failure
-            | Ok location, (targetExistedBefore, targetWasEmptyDirectory) ->
-                let! effectiveLocation = expandLocationUrl hooks location.ProviderLocation context
-
-                let! authentication =
-                    GitCredentialStrategy.resolveCommandAuthentication
-                        credentials
-                        effectiveLocation
-                        location.ConnectionProfileId
-                        "origin"
-
-                let mutable targetCreatedByClone = false
-                // Rollback runs only after the target was set up, so a refusal or a cancel
-                // before the clone never touches what someone else put into the target.
-                let mutable cloneStarted = false
-
-                let removeCloneResidue () : Async<string option> =
-                    async {
-                        try
-                            if targetCreatedByClone then
-                                do!
-                                    NodeFileSystem.rmAsync
-                                        request.TargetPath
-                                        (NodeFileSystem.RmOptions(
-                                            recursive = true,
-                                            force = true,
-                                            maxRetries = 5,
-                                            retryDelay = 100
-                                        ))
-                                    |> Async.AwaitPromise
-
-                                return None
-                            elif targetExistedBefore && targetWasEmptyDirectory then
-                                for entry in NodeFileSystem.readdirSync request.TargetPath do
-                                    do!
-                                        NodeFileSystem.rmAsync
-                                            (NodePath.join [| request.TargetPath; entry |])
-                                            (NodeFileSystem.RmOptions(
-                                                recursive = true,
-                                                force = true,
-                                                maxRetries = 5,
-                                                retryDelay = 100
-                                            ))
-                                        |> Async.AwaitPromise
-
-                                return None
-                            else
-                                return None
-                        with error ->
-                            return Some error.Message
-                    }
-
-                // When cleanup fails, name the target the caller has to clear.
-                let withResidue (failure: OperationFailure) (cleanupError: string option) =
-                    match cleanupError with
-                    | None -> failure
-                    | Some message ->
-                        {
-                            failure with
-                                StateChanged = true
-                                RecoveryAction =
-                                    Some {
-                                        Code = "remove_clone_target"
-                                        Instructions =
-                                            Some(
-                                                Redaction.redact
-                                                    $"Remove '{request.TargetPath}' before retrying the clone. Cleanup failed: {message}"
-                                            )
-                                    }
-                        }
-
-                let! result =
-                    async {
-                        if context.Cancellation.IsCancellationRequested() then
-                            return
+            if not request.MaterializeAllObjects then
+                return OperationResult.succeeded repository
+            else
+                // Git transfer succeeded; object hydration failing afterwards is
+                // partial success with a retry action, never an overall error
+                // that hides the changed workspace.
+                let! hydration =
+                    if context.Cancellation.IsCancellationRequested() then
+                        async.Return {
+                            Output =
                                 Error(
                                     OperationFailure.create
                                         Canceled
                                         "operation_canceled"
-                                        "The clone was canceled before it started."
+                                        "The clone was canceled before large-object download started."
                                 )
-                        elif targetExistedBefore && not targetWasEmptyDirectory then
-                            return Error(targetNotEmptyFailure ())
-                        else
-                            let targetSetup =
-                                try
-                                    if not targetExistedBefore then
-                                        let parentPath = NodePath.dirname request.TargetPath
-
-                                        if not (NodeFileSystem.existsSync parentPath) then
-                                            NodeFileSystem.mkdirSync
-                                                parentPath
-                                                (NodeFileSystem.MkdirOptions(recursive = true))
-
-                                        NodeFileSystem.mkdirSync
-                                            request.TargetPath
-                                            (NodeFileSystem.MkdirOptions(recursive = false))
-
-                                        targetCreatedByClone <- true
-
-                                    Ok()
-                                with error ->
-                                    if tryGetNodeErrorCode error = Some "EEXIST" then
-                                        Error(targetNotEmptyFailure ())
-                                    else
-                                        Error(
-                                            OperationFailure.createRedacted
-                                                ProviderError
-                                                "clone_failed"
-                                                $"Could not create the clone target directory: {error.Message}"
-                                        )
-
-                            match targetSetup with
-                            | Error failure -> return Error failure
-                            | Ok () ->
-                                cloneStarted <- true
-                                reportStepStart ProgressPhaseCodes.Clone "Cloning the repository" context
-
-                                // Git keeps large objects as pointers until hydration so a download
-                                // failure can be reported as partial success.
-                                return!
-                                    runGitTransfer
-                                        "clone"
-                                        false
-                                        hooks
-                                        "."
-                                        [|
-                                            yield! authentication.ConfigArgs
-                                            "clone"
-                                            "--progress"
-                                            "--"
-                                            location.ProviderLocation
-                                            request.TargetPath
-                                        |]
-                                        [|
-                                            "GIT_TERMINAL_PROMPT", "0"
-                                            "GIT_LFS_SKIP_SMUDGE", "1"
-                                        |]
-                                        context
-                    }
-
-                match result with
-                | Error failure when not cloneStarted -> return Failed failure
-                | Error failure ->
-                    let! cleanupError = removeCloneResidue ()
-
-                    let failure =
-                        if failure.Category = Canceled then
-                            OperationFailure.create Canceled "operation_canceled" failure.Message
-                        else
-                            failure
-
-                    return Failed(withResidue failure cleanupError)
-                | Ok output when output.ExitCode <> 0 ->
-                    let combined = output.StdErr + output.StdOut
-
-                    if combined.Contains "already exists and is not an empty directory" then
-                        // git refused before writing anything. Whatever is in the target
-                        // now belongs to someone else, so nothing is removed.
-                        return Failed(targetNotEmptyFailure ())
-                    else
-                        let! cleanupError = removeCloneResidue ()
-
-                        return
-                            Failed(
-                                withResidue
-                                    (OperationFailure.createRedacted
-                                        ProviderError
-                                        "clone_failed"
-                                        $"Clone failed: {combined}")
-                                    cleanupError
-                            )
-                | Ok _ ->
-                    let binding = bindingFor request.TargetPath location
-
-                    if not request.MaterializeAllObjects then
-                        return OperationResult.succeeded binding
-                    else
-                        // Git transfer succeeded; object hydration failing afterwards is
-                        // partial success with a retry action, never an overall error
-                        // that hides the changed workspace.
-                        let! hydration =
-                            if context.Cancellation.IsCancellationRequested() then
-                                async.Return {
-                                    Output =
-                                        Error(
-                                            OperationFailure.create
-                                                Canceled
-                                                "operation_canceled"
-                                                "The clone was canceled before large-object download started."
-                                        )
-                                    CheckoutFailed = false
-                                    Details = [||]
-                                }
-                            else
-                                reportStepStart "clone-lfs-pull" "Downloading large files" context
-
-                                runLfsHydration
-                                    "clone-lfs-pull"
-                                    hooks
-                                    request.TargetPath
-                                    authentication.ConfigArgs
-                                    [| "origin" |]
-                                    context
-
-                        match hydration.Output with
-                        | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
-                            return OperationResult.succeeded binding
-                        | Ok hydrationOutput ->
-                            let failure = hydrationOutputFailure "clone" hydrationOutput hydration.Details
-
-                            let! recovery =
-                                hydrationRecovery hooks request.TargetPath failure hydration.CheckoutFailed context
-
-                            return
-                                OperationResult.partiallySucceeded
-                                    (OperationOutcome.performed binding)
-                                    failure
-                                    recovery
-                        | Error hydrationFailure ->
-                            if hydrationFailure.Category = Canceled then
-                                let! cleanupError = removeCloneResidue ()
-                                let canceledFailure =
-                                    OperationFailure.create Canceled "operation_canceled" hydrationFailure.Message
-
-                                return Failed(withResidue canceledFailure cleanupError)
-                            else
-                                let! recovery =
-                                    hydrationRecovery
-                                        hooks
-                                        request.TargetPath
-                                        hydrationFailure
-                                        hydration.CheckoutFailed
-                                        context
-
-                                return
-                                    OperationResult.partiallySucceeded
-                                        (OperationOutcome.performed binding)
-                                        hydrationFailure
-                                        recovery
-        }
-    Adopt =
-        fun request context ->
-            async {
-                let adoptParsedRoot workspaceRoot = async {
-                    let! remoteResult =
-                        runGit hooks workspaceRoot [| "config"; "--get"; "remote.origin.url" |] None context
-
-                    let bind providerLocation =
-                        let location = {
-                            ProviderId = gitProviderId
-                            DisplayName = None
-                            ProviderLocation = providerLocation
-                            ConnectionProfileId = request.ConnectionProfileId
+                            CheckoutFailed = false
+                            Details = [||]
                         }
+                    else
+                        reportStepStart "clone-lfs-pull" "Downloading large files" context
 
-                        OperationResult.succeeded (bindingFor workspaceRoot location)
+                        runLfsHydration
+                            "clone-lfs-pull"
+                            hooks
+                            request.TargetPath
+                            authentication.ConfigArgs
+                            [| "origin" |]
+                            context
 
-                    match remoteResult with
-                    | Error failure -> return Failed failure
-                    | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-                        return bind (output.StdOut.Trim())
-                    | Ok output
-                        when output.ExitCode = 1
-                             && String.IsNullOrWhiteSpace output.StdOut
-                             && String.IsNullOrWhiteSpace output.StdErr ->
-                        return bind workspaceRoot
-                    | Ok output ->
+                match hydration.Output with
+                | Ok hydrationOutput when hydrationOutput.ExitCode = 0 ->
+                    return OperationResult.succeeded repository
+                | Ok hydrationOutput ->
+                    let failure = hydrationOutputFailure "clone" hydrationOutput hydration.Details
+
+                    let! recovery =
+                        hydrationRecovery hooks request.TargetPath failure hydration.CheckoutFailed context
+
+                    return
+                        OperationResult.partiallySucceeded
+                            (OperationOutcome.performed repository)
+                            failure
+                            recovery
+                | Error hydrationFailure ->
+                    if hydrationFailure.Category = Canceled then
+                        let! cleanupError = removeCloneResidue ()
+                        let canceledFailure =
+                            OperationFailure.create Canceled "operation_canceled" hydrationFailure.Message
+
+                        return Failed(withResidue canceledFailure cleanupError)
+                    else
+                        let! recovery =
+                            hydrationRecovery
+                                hooks
+                                request.TargetPath
+                                hydrationFailure
+                                hydration.CheckoutFailed
+                                context
+
                         return
-                            Failed(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "origin_lookup_failed"
-                                    $"Git could not read remote.origin.url: {output.StdErr}"
-                            )
+                            OperationResult.partiallySucceeded
+                                (OperationOutcome.performed repository)
+                                hydrationFailure
+                                recovery
+}
+
+let private openExisting
+    (hooks: GitSessionHooks)
+    (openRepositoryAt: string -> RepositoryLocation -> Repository)
+    (request: OpenRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> = async {
+    let openParsedRoot workspaceRoot = async {
+        let! remoteResult =
+            runGit hooks workspaceRoot [| "config"; "--get"; "remote.origin.url" |] None context
+
+        let bind providerLocation =
+            let location = {
+                ProviderId = gitProviderId
+                DisplayName = None
+                ProviderLocation = providerLocation
+                ConnectionProfileId = request.ConnectionProfileId
+            }
+
+            OperationResult.succeeded (openRepositoryAt workspaceRoot location)
+
+        match remoteResult with
+        | Error failure -> return Failed failure
+        | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+            return bind (output.StdOut.Trim())
+        | Ok output
+            when output.ExitCode = 1
+                 && String.IsNullOrWhiteSpace output.StdOut
+                 && String.IsNullOrWhiteSpace output.StdErr ->
+            return bind workspaceRoot
+        | Ok output ->
+            return
+                Failed(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "origin_lookup_failed"
+                        $"Git could not read remote.origin.url: {output.StdErr}"
+                )
+    }
+
+    let! rootResult =
+        runGit hooks request.RepositoryRoot [| "rev-parse"; "--show-toplevel" |] None context
+
+    match rootResult with
+    | Error failure -> return Failed failure
+    | Ok rootOutput when rootOutput.ExitCode = 0 ->
+        return! openParsedRoot (rootOutput.StdOut.Trim())
+    | Ok output when hasGitEntry request.RepositoryRoot ->
+        let detail = output.StdErr + output.StdOut
+
+        if detail.Contains("dubious ownership", StringComparison.OrdinalIgnoreCase) then
+            return
+                Failed(
+                    OperationFailure.createRedacted
+                        ProviderError
+                        "git_failure"
+                        $"git rev-parse --show-toplevel failed: {detail}"
+                )
+        else
+            let reportedDetail =
+                if String.IsNullOrWhiteSpace detail then
+                    "Git exited without diagnostic output."
+                else
+                    detail
+
+            return Failed(adoptionUnsupportedFailure reportedDetail)
+    | Ok output ->
+        return
+            Failed(
+                OperationFailure.createRedacted
+                    ProviderError
+                    "git_failure"
+                    $"git rev-parse --show-toplevel failed: {output.StdErr + output.StdOut}"
+            )
+}
+
+let private bind
+    (hooks: GitSessionHooks)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (openRepositoryAt: string -> RepositoryLocation -> Repository)
+    (request: BindRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> = async {
+    match validateLocation request.Location with
+    | Error failure -> return Failed failure
+    | Ok location ->
+        // Attach or re-target: set the origin remote of the existing workspace.
+        let! existing = runGit hooks request.RepositoryRoot [| "remote" |] None context
+
+        let hasOrigin =
+            match existing with
+            | Ok output ->
+                remoteNames output.StdOut
+                |> Array.exists (fun candidate ->
+                    String.Equals(candidate, "origin", StringComparison.Ordinal))
+            | _ -> false
+
+        let! result =
+            if hasOrigin then
+                runGitChecked
+                    hooks
+                    request.RepositoryRoot
+                    [|
+                        "remote"
+                        "set-url"
+                        "origin"
+                        "--"
+                        location.ProviderLocation
+                    |]
+                    None
+                    context
+            else
+                runGitChecked
+                    hooks
+                    request.RepositoryRoot
+                    [|
+                        "remote"
+                        "add"
+                        "origin"
+                        "--"
+                        location.ProviderLocation
+                    |]
+                    None
+                    context
+
+        match result with
+        | Error failure -> return Failed failure
+        | Ok _ ->
+            // The remote exists in the repository now, so the repository's own answer
+            // is exactly what `git fetch origin` will use.
+            let! effectiveLocation =
+                async {
+                    let! result = runGit hooks request.RepositoryRoot [| "remote"; "get-url"; "origin" |] None context
+
+                    match result with
+                    | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
+                        return output.StdOut.Trim()
+                    | _ -> return location.ProviderLocation
                 }
 
-                let! rootResult =
-                    runGit hooks request.RepositoryRoot [| "rev-parse"; "--show-toplevel" |] None context
+            let! authArguments =
+                GitCredentialStrategy.resolveAuthArguments
+                    credentials
+                    effectiveLocation
+                    location.ConnectionProfileId
 
-                match rootResult with
+            let! _ =
+                runGitTransfer
+                    "fetch"
+                    false
+                    hooks
+                    request.RepositoryRoot
+                    (fetchArguments authArguments "origin")
+                    [||]
+                    context
+
+            return OperationResult.succeeded (openRepositoryAt request.RepositoryRoot location)
+}
+
+let private installDependency
+    (hooks: GitSessionHooks)
+    (dependencyComponent: string)
+    (context: OperationContext)
+    : Async<OperationResult<DependencyStatus>> = async {
+    match dependencyComponent with
+    | "git-lfs-configuration" ->
+        let! precheckResult = checkDependencies hooks context
+
+        match precheckResult with
+        | Failed failure -> return Failed failure
+        | PartiallySucceeded(_, failure) -> return Failed failure
+        | Succeeded precheck ->
+            match
+                precheck.Value
+                |> Array.tryFind (fun status -> status.Component = "git-lfs")
+            with
+            | Some status when status.Installed && status.Compatible ->
+                let! installResult =
+                    runGit hooks "." [| "lfs"; "install"; "--skip-repo" |] None context
+
+                match installResult with
                 | Error failure -> return Failed failure
-                | Ok rootOutput when rootOutput.ExitCode = 0 ->
-                    return! adoptParsedRoot (rootOutput.StdOut.Trim())
-                | Ok output when hasGitEntry request.RepositoryRoot ->
-                    let detail = output.StdErr + output.StdOut
-
-                    if detail.Contains("dubious ownership", StringComparison.OrdinalIgnoreCase) then
-                        return
-                            Failed(
-                                OperationFailure.createRedacted
-                                    ProviderError
-                                    "git_failure"
-                                    $"git rev-parse --show-toplevel failed: {detail}"
-                            )
-                    else
-                        let reportedDetail =
-                            if String.IsNullOrWhiteSpace detail then
-                                "Git exited without diagnostic output."
-                            else
-                                detail
-
-                        return Failed(adoptionUnsupportedFailure reportedDetail)
-                | Ok output ->
+                | Ok output when output.ExitCode <> 0 ->
                     return
                         Failed(
                             OperationFailure.createRedacted
-                                ProviderError
-                                "git_failure"
-                                $"git rev-parse --show-toplevel failed: {output.StdErr + output.StdOut}"
+                                DependencyMissing
+                                "lfs_configuration_install_failed"
+                                $"Git LFS configuration failed: {output.StdErr}"
                         )
-            }
-    Bind =
-        fun request context -> async {
-            match validateFactoryLocation request.Location with
-            | Error failure -> return Failed failure
-            | Ok location ->
-                // Attach or re-target: set the origin remote of the existing workspace.
-                let! existing = runGit hooks request.RepositoryRoot [| "remote" |] None context
-
-                let hasOrigin =
-                    match existing with
-                    | Ok output ->
-                        remoteNames output.StdOut
-                        |> Array.exists (fun candidate ->
-                            String.Equals(candidate, "origin", StringComparison.Ordinal))
-                    | _ -> false
-
-                let! result =
-                    if hasOrigin then
-                        runGitChecked
-                            hooks
-                            request.RepositoryRoot
-                            [|
-                                "remote"
-                                "set-url"
-                                "origin"
-                                "--"
-                                location.ProviderLocation
-                            |]
-                            None
-                            context
-                    else
-                        runGitChecked
-                            hooks
-                            request.RepositoryRoot
-                            [|
-                                "remote"
-                                "add"
-                                "origin"
-                                "--"
-                                location.ProviderLocation
-                            |]
-                            None
-                            context
-
-                match result with
-                | Error failure -> return Failed failure
                 | Ok _ ->
-                    // The remote exists in the repository now, so the repository's own answer
-                    // is exactly what `git fetch origin` will use.
-                    let! effectiveLocation =
-                        async {
-                            let! result = runGit hooks request.RepositoryRoot [| "remote"; "get-url"; "origin" |] None context
+                    let! dependenciesResult = checkDependencies hooks context
 
-                            match result with
-                            | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
-                                return output.StdOut.Trim()
-                            | _ -> return location.ProviderLocation
-                        }
-
-                    let! authArguments =
-                        GitCredentialStrategy.resolveAuthArguments
-                            credentials
-                            effectiveLocation
-                            location.ConnectionProfileId
-
-                    let! _ =
-                        runGitTransfer
-                            "fetch"
-                            false
-                            hooks
-                            request.RepositoryRoot
-                            (fetchArguments authArguments "origin")
-                            [||]
-                            context
-
-                    return OperationResult.succeeded (bindingFor request.RepositoryRoot location)
-        }
-    Open =
-        fun binding _ -> async {
-            return OperationResult.succeeded (openSession binding)
-        }
-    CheckDependencies = checkDependencies
-    InstallDependency =
-        fun dependencyComponent context ->
-            async {
-                match dependencyComponent with
-                | "git-lfs-configuration" ->
-                    let! precheckResult = checkDependencies context
-
-                    match precheckResult with
+                    match dependenciesResult with
                     | Failed failure -> return Failed failure
                     | PartiallySucceeded(_, failure) -> return Failed failure
-                    | Succeeded precheck ->
+                    | Succeeded outcome ->
                         match
-                            precheck.Value
-                            |> Array.tryFind (fun status -> status.Component = "git-lfs")
+                            outcome.Value
+                            |> Array.tryFind (fun status -> status.Component = "git-lfs-configuration")
                         with
                         | Some status when status.Installed && status.Compatible ->
-                            let! installResult =
-                                runGit hooks "." [| "lfs"; "install"; "--skip-repo" |] None context
+                            return OperationResult.succeeded status
+                        | _ ->
+                            return
+                                Failed(
+                                    OperationFailure.create
+                                        DependencyMissing
+                                        "lfs_configuration_unhealthy"
+                                        "Git LFS reported successful installation, but filter.lfs.process is still not configured."
+                                )
+            | _ -> return Failed(manualLfsInstallationRequired ())
+    | "git" ->
+        return
+            Failed(
+                OperationFailure.create
+                    Unsupported
+                    "manual_install_required"
+                    "Install Git 2.42 or newer manually, then rerun dependency checks."
+            )
+    | "git-lfs" ->
+        return Failed(manualLfsInstallationRequired ())
+    | _ ->
+        return
+            Failed(
+                OperationFailure.create
+                    Unsupported
+                    "dependency_not_supported"
+                    "Unsupported dependency component. Supported remediation: git-lfs-configuration."
+            )
+}
 
-                            match installResult with
-                            | Error failure -> return Failed failure
-                            | Ok output when output.ExitCode <> 0 ->
-                                return
-                                    Failed(
-                                        OperationFailure.createRedacted
-                                            DependencyMissing
-                                            "lfs_configuration_install_failed"
-                                            $"Git LFS configuration failed: {output.StdErr}"
-                                    )
-                            | Ok _ ->
-                                let! dependenciesResult = checkDependencies context
-
-                                match dependenciesResult with
-                                | Failed failure -> return Failed failure
-                                | PartiallySucceeded(_, failure) -> return Failed failure
-                                | Succeeded outcome ->
-                                    match
-                                        outcome.Value
-                                        |> Array.tryFind (fun status -> status.Component = "git-lfs-configuration")
-                                    with
-                                    | Some status when status.Installed && status.Compatible ->
-                                        return OperationResult.succeeded status
-                                    | _ ->
-                                        return
-                                            Failed(
-                                                OperationFailure.create
-                                                    DependencyMissing
-                                                    "lfs_configuration_unhealthy"
-                                                    "Git LFS reported successful installation, but filter.lfs.process is still not configured."
-                                            )
-                        | _ -> return Failed(manualLfsInstallationRequired ())
-                | "git" ->
-                    return
-                        Failed(
-                            OperationFailure.create
-                                Unsupported
-                                "manual_install_required"
-                                "Install Git 2.42 or newer manually, then rerun dependency checks."
-                        )
-                | "git-lfs" ->
-                    return Failed(manualLfsInstallationRequired ())
-                | _ ->
-                    return
-                        Failed(
-                            OperationFailure.create
-                                Unsupported
-                                "dependency_not_supported"
-                                "Unsupported dependency component. Supported remediation: git-lfs-configuration."
-                        )
-            }
+let private close (repository: Repository) : Async<unit> =
+    async {
+        match repository with
+        | :? GitRepository as git -> do! git.CloseTextDiff()
+        | _ -> invalidArg "repository" "The repository belongs to another provider."
     }
 
-let createFactoryWithCredentialsIdentityAndPolicy
+/// Builds the Git provider. `GitProvider.create` is the public way to get it.
+let internal createProvider
     (hooks: GitSessionHooks)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
     (revisionPolicy: RevisionPolicyStrategy)
-    : ProviderFactory =
-    createFactoryWithSessions
-        hooks
-        credentials
-        (createSessionWithCredentialsIdentityAndPolicy hooks credentials revisionIdentity revisionPolicy)
+    (textDiff: GitTextDiffService.GitTextDiffOptions option)
+    : IVersionControl =
+    let openRepositoryAt =
+        openRepository hooks credentials revisionIdentity revisionPolicy textDiff
 
-/// Factory whose sessions carry the text diff service described by the options.
-let createFactoryWithOptions
-    (options: GitSessionOptions)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
-    (revisionPolicy: RevisionPolicyStrategy)
-    : ProviderFactory =
-    createFactoryWithSessions
-        options.Hooks
-        credentials
-        (createSessionWithOptions options credentials revisionIdentity revisionPolicy)
+    let functions: ProviderFunctions = {
+        VerifyLocation = Implemented(verifyLocation hooks credentials)
+        Initialize = Implemented(initialize hooks openRepositoryAt)
+        Clone = Implemented(clone hooks credentials openRepositoryAt)
+        Bind = Implemented(bind hooks credentials openRepositoryAt)
+        Open = Implemented(openExisting hooks openRepositoryAt)
+        CheckDependencies = Implemented(checkDependencies hooks)
+        InstallDependency = Implemented(installDependency hooks)
+        GetStatus = Implemented repoGetStatus
+        ListRefs = Implemented repoListRefs
+        CreateRef = Implemented repoCreateRef
+        PreflightSwitchRef = Implemented repoPreflightSwitchRef
+        SwitchRef = Implemented repoSwitchRef
+        CreateRevision = Implemented repoCreateRevision
+        RestorePaths = Implemented repoRestorePaths
+        GetDiffSummary = Implemented repoGetDiffSummary
+        Synchronization = {
+            Refresh = Implemented repoRefresh
+            PreviewUpdate = Implemented repoPreviewUpdate
+            Update = Implemented repoUpdate
+            Publish = Implemented repoPublish
+            Synchronize = Implemented repoSynchronize
+        }
+        ConflictResolution = {
+            GetActiveSession = Implemented repoGetActiveConflictSession
+            Resolve = Implemented repoResolveConflict
+            Finalize = Implemented repoFinalizeConflict
+            Cancel = Implemented repoCancelConflict
+        }
+        TextDiff = {
+            Open = Implemented repoOpenDiff
+            ReadPage = Implemented repoReadDiffPage
+            ReplayPage = Implemented repoReplayDiffPage
+            Expand = Implemented repoExpandDiff
+            ReadLine = Implemented repoReadDiffLine
+            GetSourceInfo = Implemented repoGetDiffSourceInfo
+            Close = Implemented repoCloseDiff
+        }
+        History = {
+            ListRevisions = Implemented repoListRevisions
+            GetRevisionChanges = Implemented repoGetRevisionChanges
+        }
+        RepositoryBrowser = { GetRepositoryWebUrl = Implemented repoGetRepositoryWebUrl }
+        // Git LFS is optional: the Git provider has these functions in every repository, and they report their
+        // own dependency status when git-lfs is not installed. Core Git never requires LFS.
+        ObjectMaterialization = {
+            ListObjects = Implemented repoListObjects
+            Materialize = Implemented repoMaterialize
+            Dematerialize = Implemented repoDematerialize
+        }
+        StoragePolicy = {
+            SetPathPolicy = Implemented repoSetPathPolicy
+            GetSettings = Implemented repoGetStoragePolicySettings
+            SetSettings = Implemented repoSetStoragePolicySettings
+        }
+        Maintenance = {
+            Prune = Implemented repoPrune
+            Deduplicate = Implemented repoDeduplicate
+            CanDeduplicate = Implemented repoCanDeduplicate
+        }
+    }
 
-let createFactoryWithCredentialsAndIdentity
-    (hooks: GitSessionHooks)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    (revisionIdentity: GitCredentialStrategy.GitIdentityStrategy)
-    : ProviderFactory =
-    createFactoryWithCredentialsIdentityAndPolicy
-        hooks
-        credentials
-        revisionIdentity
-        RevisionPolicyStrategy.automatic
-
-let createFactoryWithCredentials
-    (hooks: GitSessionHooks)
-    (credentials: GitCredentialStrategy.GitCredentialStrategy)
-    : ProviderFactory =
-    createFactoryWithCredentialsAndIdentity hooks credentials GitCredentialStrategy.anonymousIdentity
-
-/// Factory with the anonymous credential strategy.
-let createFactory (hooks: GitSessionHooks) : ProviderFactory =
-    createFactoryWithCredentials hooks GitCredentialStrategy.anonymous
+    ListedProvider(probe, close, functions) :> IVersionControl

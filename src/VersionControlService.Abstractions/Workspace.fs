@@ -1,33 +1,12 @@
 namespace VersionControlService.Abstractions
 
 /// Result of probing a directory for provider ownership. Provider metadata on disk
-/// is a hint, never a binding; explicit host bindings always win.
+/// is a hint. A host's explicit choice of provider always wins.
 type ProbeResult =
     | NotDetected
     | Detected of root: string * confidence: int * bindingHint: string option
     | Invalid of message: string
     | ProbeFailed of OperationFailure
-
-/// Schema-versioned, host-persisted binding of a local workspace root to a provider
-/// and repository location. The host stores bindings in its own settings store keyed
-/// by normalized workspace root; the library never writes binding files into the
-/// managed workspace. Credentials are never serialized into a binding.
-type WorkspaceBinding = {
-    SchemaVersion: int
-    ProviderId: ProviderId
-    /// The local workspace root as the provider received it (for Adopt, the root the provider reports).
-    /// Hosts compare roots with `ProviderResolver.normalizePath`.
-    RepositoryRoot: string
-    /// Opaque provider state reference (e.g. a provider-owned workspace branch or index location).
-    ProviderStateRef: string option
-    Location: RepositoryLocation
-    ConnectionProfileId: string option
-}
-
-module WorkspaceBinding =
-
-    [<Literal>]
-    let CurrentSchemaVersion = 1
 
 /// Access intents a consumer can ask a provider to verify against a repository location.
 type AccessIntent =
@@ -68,10 +47,10 @@ type CloneRequest = {
     MaterializeAllObjects: bool
 }
 
-/// Registers an existing provider-owned workspace with the host without cloning
-/// or mutating the workspace. Provider discovery remains read-only; adoption is
-/// explicit and may be unsupported by a provider.
-type AdoptRequest = {
+/// Opens an existing provider-owned repository on disk without cloning or changing it.
+/// The provider finds the repository root from the given folder and reports it in the
+/// descriptor of the opened repository.
+type OpenRequest = {
     RepositoryRoot: string
     ConnectionProfileId: string option
 }
@@ -83,11 +62,12 @@ type BindRequest = {
     Location: RepositoryLocation
 }
 
-/// Identity of one opened workspace session.
+/// Identity of one opened repository.
 type RepositoryDescriptor = {
     ProviderId: ProviderId
-    /// The local workspace root as the provider received it (for Adopt, the root the provider reports).
-    /// Hosts compare roots with `ProviderResolver.normalizePath`.
+    /// The local workspace root as the provider received it. For Open it is the root the provider reports, and
+    /// the Git provider reports it as Git spells it, with links resolved. A host keys its own table by the folder
+    /// it passed to Open and compares folders with `ProviderResolver.normalizePath`.
     RepositoryRoot: string
     Location: RepositoryLocation option
 }

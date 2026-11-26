@@ -7,15 +7,15 @@ open VersionControlService.Abstractions.Tests.ContractShapeTests
 
 let private fakeProviderId = FakeProvider.providerId "fake.portable"
 
-/// A core whose diff summary is a 50-step long operation that reports progress each
+/// A provider whose diff summary is a 50-step long operation that reports progress each
 /// step and observes cancellation between steps.
-let private createLongOperationCore () : CoreVersionControl =
-    let baseCore = FakeProvider.createCore ()
+let private createFakeProvider () : IVersionControl =
+    let baseFunctions = FakeProvider.createFunctions fakeProviderId
 
-    {
-        baseCore with
+    FakeProvider.create {
+        baseFunctions with
             GetDiffSummary =
-                fun context -> async {
+                Implemented(fun _ context -> async {
                     let mutable canceled = false
                     let mutable step = 0
 
@@ -38,17 +38,11 @@ let private createLongOperationCore () : CoreVersionControl =
                         return OperationResult.canceled $"The fake operation stopped after {step} steps."
                     else
                         return OperationResult.succeeded { Entries = [||] }
-                }
+                })
+            ConflictResolution = FakeProvider.createFinalConflictResolution ()
+            Synchronization = FakeProvider.createFinalSynchronization ()
+            ObjectMaterialization = FakeProvider.createFinalObjectMaterialization ()
     }
-
-let private createFakeFactory () : ProviderFactory =
-    FakeProvider.createFactory fakeProviderId (fun descriptor ->
-        {
-            WorkspaceSession.createCoreOnly descriptor (createLongOperationCore ()) with
-                ConflictResolution = Some(FakeProvider.createFinalConflictResolution ())
-                Synchronization = Some(FakeProvider.createFinalSynchronization ())
-                ObjectMaterialization = Some(FakeProvider.createFinalObjectMaterialization ())
-        })
 
 let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
     match result with
@@ -56,19 +50,19 @@ let private expectSucceeded (operationName: string) (result: OperationResult<'T>
     | PartiallySucceeded _ -> failtest $"{operationName} unexpectedly returned partial success."
     | Failed failure -> failtest $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
 
-let private openFakeSession (factory: ProviderFactory) (context: OperationContext) =
+let private openFakeRepository (provider: IVersionControl) (context: OperationContext) =
     async {
         let! bindResult =
-            factory.Bind
-                {
-                    RepositoryRoot = "/fake/workspace"
-                    Location = FakeProvider.fakeLocation factory.Id
-                }
-                context
+            executed (
+                provider.Bind
+                    {
+                        RepositoryRoot = "/fake/workspace"
+                        Location = FakeProvider.fakeLocation fakeProviderId
+                    }
+                    context
+            )
 
-        let binding = expectSucceeded "bind" bindResult
-        let! openResult = factory.Open binding context
-        return expectSucceeded "open session" openResult
+        return expectSucceeded "bind" bindResult
     }
 
 let private findRepositoryRoot () =
@@ -87,54 +81,39 @@ let portableConsumerTests =
     testList "PortableConsumer" [
         testCaseAsync "a .NET consumer awaits one core operation through the Async carrier"
         <| async {
-            let factory = createFakeFactory ()
+            let provider = createFakeProvider ()
             let context = OperationContext.detached "portable-open"
 
-            let! session = openFakeSession factory context
-            let! statusResult = session.Core.GetStatus context
+            let! repository = openFakeRepository provider context
+            let! statusResult = executed (provider.GetStatus repository context)
             let status = expectSucceeded "get status" statusResult
 
-            Expect.equal status.RepositoryVersion "fake-token-1" "The fake session returns its workspace version."
+            Expect.equal status.RepositoryVersion "fake-token-1" "The fake provider returns its workspace version."
         }
 
-        testCaseAsync "a portable opened session returns every final SPI value through optional service results"
+        testCaseAsync "a portable provider returns every final SPI value through its group results"
         <| async {
-            let factory = createFakeFactory ()
+            let provider = createFakeProvider ()
             let context = OperationContext.detached "portable-final-spi"
-            let! session = openFakeSession factory context
+            let! repository = openFakeRepository provider context
 
-            let conflicts =
-                match session.ConflictResolution with
-                | Some service -> service
-                | None -> failtest "Expected the portable conflict-resolution service."
-
-            let! summaryResult = conflicts.GetActiveSession context
+            let! summaryResult = executed (provider.ConflictResolution.GetActiveSession repository context)
             let summary = expectSucceeded "get active conflict session" summaryResult
             let conflict = summary |> Option.defaultWith (fun () -> failtest "Expected an active portable conflict session.")
             Expect.equal conflict.Items[0].CombinedPreview (Some(TextPreview "combined preview")) "Combined preview comes from the conflict result."
 
-            let synchronization =
-                match session.Synchronization with
-                | Some service -> service
-                | None -> failtest "Expected the portable synchronization service."
-
-            let! stateResult = synchronization.Refresh context
+            let! stateResult = executed (provider.Synchronization.Refresh repository context)
             let state = expectSucceeded "refresh synchronization" stateResult
             Expect.equal (state.TargetRef |> Option.map _.Name) (Some "fake-target") "Target ref comes from the refresh result."
 
-            let objects =
-                match session.ObjectMaterialization with
-                | Some service -> service
-                | None -> failtest "Expected the portable object-materialization service."
-
-            let! objectsResult = objects.ListObjects context
+            let! objectsResult = executed (provider.ObjectMaterialization.ListObjects repository context)
             let objectState = expectSucceeded "list objects" objectsResult |> Array.exactlyOne
             Expect.isTrue objectState.IsLocallyAvailable "Local availability comes from the object-list result."
         }
 
         testCaseAsync "cancellation reaches and stops a fake long operation in .NET"
         <| async {
-            let factory = createFakeFactory ()
+            let provider = createFakeProvider ()
             let source = OperationCancellation.Source()
             let mutable lastCompleted = 0.0
 
@@ -149,8 +128,8 @@ let portableConsumerTests =
                             source.Cancel()
                     | None -> ())
 
-            let! session = openFakeSession factory context
-            let! diffResult = session.Core.GetDiffSummary context
+            let! repository = openFakeRepository provider context
+            let! diffResult = executed (provider.GetDiffSummary repository context)
 
             match diffResult with
             | Failed failure ->
@@ -165,15 +144,15 @@ let portableConsumerTests =
 
         testCaseAsync "progress callbacks flow through the operation context in .NET"
         <| async {
-            let factory = createFakeFactory ()
+            let provider = createFakeProvider ()
             let progressPhases = ResizeArray<string>()
 
             let context =
                 OperationContext.create "portable-progress" OperationCancellation.none (fun progress ->
                     progressPhases.Add progress.PhaseCode)
 
-            let! session = openFakeSession factory context
-            let! diffResult = session.Core.GetDiffSummary context
+            let! repository = openFakeRepository provider context
+            let! diffResult = executed (provider.GetDiffSummary repository context)
             expectSucceeded "get diff summary" diffResult |> ignore
 
             Expect.equal progressPhases.Count 50 "Every step reported progress."

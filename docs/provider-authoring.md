@@ -8,7 +8,7 @@ Hosts that spawn git beside the library can use `GitExecution.resolvedEnvironmen
 
 `ProviderFactory` is the provider entry point. A host holds one factory per `ProviderId`.
 
-- `Probe` is read-only detection. It must not throw, create a binding, or claim a root it does not own.
+- `Probe` is read-only detection. It must not throw or claim a root it does not own.
 - `VerifyLocation` checks explicit access intents against a repository location.
 - `Initialize` creates provider state in place and preserves existing user files.
 - `Clone` requires a missing or empty destination.
@@ -17,9 +17,8 @@ Hosts that spawn git beside the library can use `GitExecution.resolvedEnvironmen
   ignores the ref. Use `target_ref_unsupported` for the unsupported case.
 - A clone canceled before it completes rolls back and returns `Canceled`, and a pre-existing empty target stays empty. A clone that finished before the cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`.
 - A clone whose rollback cannot remove the target returns `Failed` with `StateChanged = true` and `remove_clone_target` (category `Canceled` when the user canceled).
-- `Adopt` derives a binding from an existing provider-owned workspace without cloning. Return an `Unsupported` failure if the provider cannot do that safely.
 - `Bind` attaches or retargets an existing local workspace without cloning.
-- `Open` creates one session for one persisted binding.
+- `Open` creates one session.
 - `CheckDependencies` reports installed, missing, and incompatible components.
 - `InstallDependency` performs only remediation the provider genuinely supports. Unsupported installation is a structured failure.
 
@@ -83,7 +82,7 @@ lifetime. The provider binds each handle and continuation to the owner that open
 checks that owner before serving a request. A provider reports `source_changed` when either
 pinned source changes.
 
-Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Adopt`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root. `operation_not_supported` remains the provider's own code for an operation it implements but cannot perform for the given input.
+Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root.
 
 ## Conflict sessions
 
@@ -167,7 +166,7 @@ Use the codes of `ProgressPhaseCodes` for the steps that other providers report 
 
 The start of a step names an activity, and a meter measures a transfer. Meters keep the codes of their provider, for example `lakefs-download` and `lakefs-upload` for lakeFS, and their messages describe the measurement. `Synchronization.compose` reports no events of its own. Each provider reports its steps from its own Refresh, Update and Publish, and a Synchronize carries the events of the steps it runs.
 
-Messages, details, progress text, bindings, and repository URLs must not contain secrets. Resolve credentials from the binding's `ConnectionProfileId`, scope them to the operation, and pass provider output through the redaction guard before returning it.
+Messages, details, progress text, and repository URLs must not contain secrets. Resolve credentials from the `ConnectionProfileId`, scope them to the operation, and pass provider output through the redaction guard before returning it.
 
 ## Storage settings reseed
 
@@ -200,8 +199,6 @@ Git's `SetPathPolicy` reports the path and `.gitattributes` in `AffectedPaths`, 
 ## Compatibility
 
 The published records are intentionally small. Add new capability as a new optional service record instead of adding required members to an existing published record. Provider-specific mechanics stay behind the SPI. A host should not need provider-specific parsing to resolve, adopt, open, or operate a workspace.
-
-`ServiceAvailability` is the exception to the rule about published records: a new optional service adds a required field to it, and that is a deliberate breaking change so a consumer's availability report can never be silently incomplete.
 
 `OperationContext` is the second exception. It is an observation record that the host builds, and it has the field `ReportOutput`. Code that builds the record as a literal has to set `ReportOutput = None`. Code that calls `OperationContext.create`, `createWithOutput` or `detached`, and a provider that only reads the context, compile as before. A provider that makes external calls, such as subprocesses or HTTP requests, reports their output only when `context.ReportOutput` is `Some`, and it redacts every line first, as the [consuming guide](consuming.md#raw-output-of-subprocesses) describes. A provider that continues work after the caller canceled keeps the output callback of the original context and replaces only its cancellation, so the follow-up calls reach the same log.
 

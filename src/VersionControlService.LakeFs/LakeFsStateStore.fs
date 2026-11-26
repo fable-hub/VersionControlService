@@ -421,28 +421,60 @@ let create
     : Result<ResolvedState, OperationFailure> =
     createForProvisioning options workspaceRoot BindProvisioning
 
+/// Finds the state entry that records the folder and returns its id. The search skips an entry whose manifest
+/// it cannot read. Of several entries for one folder the newest counts, by the
+/// modification time of its state.json.
+let findByFolder
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (folder: string)
+    : Result<string, OperationFailure> =
+    if String.IsNullOrWhiteSpace options.StateRoot then
+        Error(failure "provider_state_root_invalid" "The lakeFS provider state root is required.")
+    else
+        let stateRoot = normalize options.StateRoot
+        let folderPath = physicalPath folder
+
+        let stateIds =
+            if NodeFileSystem.existsSync stateRoot then
+                NodeFileSystem.readdirSync stateRoot
+                |> Array.filter (fun name -> stateIdPattern.IsMatch name)
+            else
+                [||]
+
+        let newest =
+            stateIds
+            |> Array.choose (fun stateId ->
+                let path = manifestPath (stateDirectory stateRoot stateId)
+
+                match loadManifest path with
+                | Ok manifest when
+                    String.Equals(
+                        folderPath,
+                        physicalPath manifest.WorkspaceRoot,
+                        pathComparison options.PathCaseSensitivity
+                    )
+                    ->
+                    Some(stateId, (NodeFileSystem.statSync path).mtimeMs)
+                | _ -> None)
+            |> Array.sortByDescending snd
+            |> Array.tryHead
+
+        match newest with
+        | Some(stateId, _) -> Ok stateId
+        | None ->
+            Error(failure "provider_state_missing" "No external lakeFS provider state records this folder.")
+
 let resolve
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
     (workspaceRoot: string)
-    (providerStateRef: string option)
+    (stateId: string)
     : Result<ResolvedState, OperationFailure> =
     if String.IsNullOrWhiteSpace options.StateRoot then
         Error(failure "provider_state_root_invalid" "The lakeFS provider state root is required.")
     else
-        match providerStateRef with
-        | None ->
-            Error(
-                failure
-                    "provider_state_ref_missing"
-                    "The workspace binding does not contain a lakeFS provider state reference."
-            )
-        | Some stateId when not (stateIdPattern.IsMatch stateId) ->
-            Error(
-                failure
-                    "provider_state_ref_invalid"
-                    "The workspace binding contains an invalid lakeFS provider state reference."
-            )
-        | Some stateId ->
+        if not (stateIdPattern.IsMatch stateId) then
+            Error(failure "provider_state_ref_invalid" "The lakeFS provider state reference is invalid.")
+        else
             let stateRoot = normalize options.StateRoot
             let directory = stateDirectory stateRoot stateId
 

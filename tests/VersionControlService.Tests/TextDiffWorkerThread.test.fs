@@ -266,7 +266,7 @@ Vitest.describe (
             fun () ->
                 withWorkerPool "default" (ResizeArray()) (fun pool _ _ -> promise {
                     let! opened =
-                        TextDiffTestSupport.openUntilReady (pool.Service(owner ())) openRequest (OperationContext.detached "open")
+                        TextDiffTestSupport.openUntilReady (pool.Service(owner ())).Open openRequest (OperationContext.detached "open")
 
                     match opened with
                     | OpenDiffResult.Opened _ -> ()
@@ -280,7 +280,7 @@ Vitest.describe (
             fun () ->
                 withWorkerPool "default" (ResizeArray()) (fun pool _ transports -> promise {
                     let service = pool.Service(owner ())
-                    let! opened = TextDiffTestSupport.openUntilReady service openRequest (OperationContext.detached "open")
+                    let! opened = TextDiffTestSupport.openUntilReady service.Open openRequest (OperationContext.detached "open")
 
                     match opened with
                     | OpenDiffResult.Opened(handle, _, _, _, _) ->
@@ -403,7 +403,7 @@ Vitest.describe (
                     let changed = { request with Continuation = Some continuation; Storage = DiffStoragePolicy.MemoryOnly 1048576L }
 
                     let! opened =
-                        TextDiffTestSupport.openUntilReady service changed (OperationContext.detached "storage-change-continue")
+                        TextDiffTestSupport.openUntilReady service.Open changed (OperationContext.detached "storage-change-continue")
 
                     match opened with
                     | OpenDiffResult.Opened(_, _, _, _, storage) -> Vitest.expect(storage).toEqual DiffStorage.OnDisk

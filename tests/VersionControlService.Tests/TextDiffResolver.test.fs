@@ -9,6 +9,7 @@ open VersionControlService.Git.TextDiff
 open VersionControlService.Git.TextDiff.TextDiffSourceResolver
 open VersionControlService.Git.TextDiff.TextDiffPreparation
 open VersionControlService.Git.TextDiff.TextDiffInProcessTransport
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
@@ -220,49 +221,33 @@ let private openRequest (value: string) : OpenDiffRequest = {
     Storage = DiffStoragePolicy.PreferDisk(0L, 67108864L)
 }
 
-let private gitProviderId =
-    match ProviderId.tryCreate "git" with
-    | Ok providerId -> providerId
-    | Error message -> failwith message
+let private openRepository (textDiff: GitTextDiffService.GitTextDiffOptions option) (repository: string) = promise {
+    let provider = GitProvider.create { GitProviderOptions.defaults with TextDiff = textDiff }
 
-let private bindingFor (repository: string) : WorkspaceBinding =
-    let location: RepositoryLocation = {
-        ProviderId = gitProviderId
-        DisplayName = None
-        ProviderLocation = repository
-        ConnectionProfileId = None
-    }
+    let! result =
+        executed (
+            provider.Open
+                { RepositoryRoot = repository; ConnectionProfileId = None }
+                (OperationContext.detached "open-repository")
+        )
+        |> Async.StartAsPromise
 
-    {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = gitProviderId
-        RepositoryRoot = repository
-        ProviderStateRef = None
-        Location = location
-        ConnectionProfileId = None
-    }
+    match result with
+    | Succeeded outcome -> return provider, outcome.Value
+    | other -> return failwith $"Expected the repository to open, got %A{other}"
+}
 
-let private sessionWith (textDiff: GitTextDiffService.GitTextDiffOptions option) (repository: string) =
-    GitWorkspaceSession.createSessionWithOptions
-        { Hooks = GitWorkspaceSession.GitSessionHooks.none; TextDiff = textDiff }
-        GitCredentialStrategy.anonymous
-        GitCredentialStrategy.anonymousIdentity
-        RevisionPolicyStrategy.automatic
-        (bindingFor repository)
-
-let private textDiffOf (session: WorkspaceSession) =
-    match session.TextDiff with
-    | Some service -> service
-    | None -> failwith "The session has no text diff service."
-
-let private openDiff (session: WorkspaceSession) (value: string) = promise {
+let private openDiff (provider: IVersionControl) (repo: Repository) (value: string) = promise {
     return!
-        (textDiffOf session).Open (openRequest value) (OperationContext.detached "open-diff")
+        executed (provider.TextDiff.Open repo (openRequest value) (OperationContext.detached "open-diff"))
         |> Async.StartAsPromise
 }
 
-let private openDiffReady (session: WorkspaceSession) (value: string) =
-    TextDiffTestSupport.openUntilReady (textDiffOf session) (openRequest value) (OperationContext.detached "open-diff")
+let private openDiffReady (provider: IVersionControl) (repo: Repository) (value: string) =
+    TextDiffTestSupport.openUntilReady
+        (fun request context -> executed (provider.TextDiff.Open repo request context))
+        (openRequest value)
+        (OperationContext.detached "open-diff")
 
 let private expectOpenResult (expected: OpenDiffResult) (result: OperationResult<Resumable<OpenDiffResult>>) =
     match result with
@@ -635,18 +620,18 @@ Vitest.describe (
                             supervisor
                     )
 
-                let session =
-                    sessionWith (Some { Pool = (fun () -> Promise.lift (Some pool)); WindowOwnerOf = fun _ -> "window-1" }) repository
+                let! provider, repo =
+                    openRepository (Some { Pool = (fun () -> Promise.lift (Some pool)); WindowOwnerOf = fun _ -> "window-1" }) repository
                 let mutable failure = None
 
                 try
-                    let! modified = openDiffReady session "a.txt"
+                    let! modified = openDiffReady provider repo "a.txt"
 
                     match modified with
                     | OpenDiffResult.Opened _ -> ()
                     | other -> failwith $"Expected an opened diff, got %A{other}"
 
-                    let! lfs = openDiff session "data.bin"
+                    let! lfs = openDiff provider repo "data.bin"
 
                     expectOpenResult
                         (OpenDiffResult.NotDiffable(DiffBlocker.LocalContentUnavailable(DiffSide.Previous, Some lfsOid)))
@@ -663,13 +648,13 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "fails Open with diff_worker_failed in a Git session without a pool",
+            "fails Open with diff_worker_failed for a Git provider without a pool",
             TestOptions(timeout = 60000),
             fun () -> promise {
                 let! repository = newRepository ()
                 do! commitFile repository "a.txt" "one\n"
-                let session = sessionWith None repository
-                let! result = openDiff session "a.txt"
+                let! provider, repo = openRepository None repository
+                let! result = openDiff provider repo "a.txt"
 
                 match result with
                 | Failed failure -> Vitest.expect(failure.Code).toBe TextDiffFailureCodes.WorkerFailed

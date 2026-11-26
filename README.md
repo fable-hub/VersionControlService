@@ -201,19 +201,16 @@ let lakeFsFactory =
     LakeFs.createFactory lakeFsOptions LakeFsCredentials.unconfigured
 ```
 
-The host persists `WorkspaceBinding` values. An explicit binding wins over probing. Without a binding, the host asks the `Probe` of each provider it has and decides itself. The host decides whether to call `Adopt` and when to save the returned binding.
-
 ## Public contract
 
 Every opened session has `CoreVersionControl`. Optional services are present only when the provider supports them, so feature discovery is an `Option.isSome` check. Operations return `Succeeded`, `PartiallySucceeded`, or `Failed` with structured state-change, recovery, affected-path, and revision evidence.
 
-Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Adopt`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root.
+Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root.
 
 See:
 
 - [Consuming the library](docs/consuming.md)
 - [Provider authoring](docs/provider-authoring.md)
-- [Workspace bindings](docs/workspace-bindings.md)
 - [Conformance profiles](docs/conformance-profiles.md)
 - [Verification matrix](docs/verification/version-control-matrix.md)
 

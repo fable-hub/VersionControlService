@@ -69,21 +69,39 @@ type SynchronizeRequest = {
     PublishLocalRevisions: bool
 }
 
+/// The synchronization functions of a provider, one entry for each.
+type SynchronizationFunctions = {
+    Refresh: Entry<Repository -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+    PreviewUpdate: Entry<Repository -> OperationContext -> Async<OperationResult<UpdatePreview>>>
+    Update: Entry<Repository -> UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+    Publish: Entry<Repository -> PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+    Synchronize: Entry<Repository -> SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+}
+
 /// Synchronization expressed as intent; providers own the mechanics.
-type SynchronizationService = {
+type ISynchronization =
     /// Observe target state without changing workspace content.
-    Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>
+    abstract Refresh: repository: Repository -> context: OperationContext -> Async<CallResult<SynchronizationState>>
+
     /// Return changed/overlapping paths, data-loss risk, and whether a conflict session would be created.
-    PreviewUpdate: OperationContext -> Async<OperationResult<UpdatePreview>>
+    abstract PreviewUpdate: repository: Repository -> context: OperationContext -> Async<CallResult<UpdatePreview>>
+
     /// Incorporate the target into the provider workspace.
-    Update: UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
+    abstract Update:
+        repository: Repository -> request: UpdateRequest -> context: OperationContext -> Async<CallResult<SynchronizationState>>
+
     /// Make workspace revisions visible on the configured target.
-    Publish: PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
+    abstract Publish:
+        repository: Repository -> request: PublishRequest -> context: OperationContext -> Async<CallResult<SynchronizationState>>
+
     /// The refresh, the update the workspace needs and the publish of its revisions
     /// run as one operation under the provider's mutation lock. See
     /// Synchronization.compose for the contract.
-    Synchronize: SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
-}
+    abstract Synchronize:
+        repository: Repository ->
+        request: SynchronizeRequest ->
+        context: OperationContext ->
+            Async<CallResult<SynchronizationState>>
 
 /// Codes the composition produces. Providers keep their own codes for their steps.
 module SynchronizationCodes =

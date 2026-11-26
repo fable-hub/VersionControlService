@@ -1,7 +1,7 @@
 # Consuming the library
 
 A host that puts version control over a local workspace uses a factory for each provider
-it supports. For each workspace it also needs a binding and an opened session. This page
+it supports. For each workspace it also needs an opened session. This page
 builds those in order.
 
 Writing a provider is a different job, covered in [provider authoring](provider-authoring.md).
@@ -11,9 +11,8 @@ Writing a provider is a different job, covered in [provider authoring](provider-
 The library stores nothing of its own. There is no settings store, no credential store, no
 UI state, and no registry of known workspaces. The host keeps:
 
-- the bindings, one for each workspace root it manages
 - the credentials, behind a strategy the factory calls when it needs one
-- the choice to adopt a workspace a probe found, and the choice to retry after a failure
+- the choice to retry after a failure
 - the workspace version it last showed the user, which it passes back on the next mutation
 
 The library owns provider mechanics. Nothing in a host should parse provider output, read
@@ -52,7 +51,7 @@ the semantics of the host's filesystem.
 
 `Git.createFactory` uses the anonymous credential strategy, which covers public HTTPS,
 an SSH agent, and local paths. A host holding tokens passes its own strategy. It receives
-the host of the remote git will contact and the connection profile from the binding:
+the host of the remote git will contact and the connection profile:
 
 ```fsharp
 module GitCredentials = VersionControlService.Git.GitCredentialStrategy
@@ -71,7 +70,7 @@ let gitFactory = Git.createFactoryWithCredentials Git.GitSessionHooks.none crede
 ```
 
 Returning `None` means anonymous. Secrets stay inside the strategy and never reach a
-binding, a message, or progress output.
+message or progress output.
 
 Git also wants an identity to attribute revisions to.
 `Git.createFactoryWithCredentialsAndIdentity` takes a `GitIdentityStrategy` alongside the
@@ -160,13 +159,11 @@ let connection: VersionControlService.LakeFs.LakeFsTypes.LakeFsConnection = {
 }
 ```
 
-Secrets belong here, behind the strategy, and never in the location or the binding.
+Secrets belong here, behind the strategy, and never in the location.
 
 ## Creating a workspace
 
-Four factory operations produce a binding, and none of them needs an opened session. Three are
-here, and `Adopt` belongs to the next section. Each one returns the binding for the host to
-persist, after which `Open` works exactly as in the next section.
+Three factory operations create a workspace, and none of them needs an opened session.
 
 `TargetRef` asks the provider to check out an exact ref. A provider returns an `Unsupported` failure
 for a ref it cannot check out (the Git provider refuses every `TargetRef`), and a `Validation`
@@ -225,9 +222,6 @@ let! result = factory.Initialize { TargetPath = targetPath; Location = Some loca
 let! result = factory.Bind { RepositoryRoot = workspaceRoot; Location = location } context
 ```
 
-`Adopt` is the fourth, and it is for a workspace the provider already owns. The next section
-uses it, and it is the one a provider is most likely to refuse.
-
 ## Checking the provider can run
 
 A provider that shells out to external tools cannot work until those tools are installed.
@@ -278,8 +272,7 @@ install as the exception and the message as the normal path.
 
 ## Opening a workspace
 
-A binding the host already stored names the provider that owns the directory. Without
-one, the host asks the `Probe` of each provider it has and decides itself.
+The host asks the `Probe` of each provider it has and decides itself.
 
 ```fsharp
 let openBinding (factory: ProviderFactory) binding context = async {
@@ -296,19 +289,6 @@ let openBinding (factory: ProviderFactory) binding context = async {
     | Failed failure -> return Error failure
 }
 ```
-
-`Adopt` is allowed to refuse. A provider that cannot derive a binding it can verify answers
-with the `Unsupported` category, and the code differs by provider: lakeFS reports
-`operation_not_supported` and Git reports `adoption_unsupported` for a workspace whose
-metadata it cannot parse. Branch on the category, because the two providers reach similar
-behavior through different mechanisms. The built-in lakeFS factory always refuses, even
-though it probes the `.lakefs_ref.yaml` marker and reports a candidate, so a probed lakeFS
-workspace never adopts. Fall back to `Bind` with a location the user supplies, or to `Clone`
-into a fresh directory.
-
-Persist the binding `Adopt` returned, keyed by the normalized workspace root, and give it
-back unchanged on the next open. Details are in
-[workspace bindings](workspace-bindings.md).
 
 `Close` returns `Async<unit>`, so await it when the host releases the session:
 `do! session.Close()`. A session owns locks, clients, and caches that outlive the call
@@ -399,9 +379,6 @@ let describe (session: WorkspaceSession) (context: OperationContext) = async {
         return Ok(changedCount, services.Synchronization, webUrl)
 }
 ```
-
-`WorkspaceSession.availability` returns a `ServiceAvailability` record with one boolean
-per service, which is easier to hand to a view model than eight options.
 
 `ObjectMaterialization.Materialize` and `Dematerialize` take an array of paths, so one call
 serves a single file and a folder. A call with many paths is faster than one call per path.
@@ -1501,7 +1478,6 @@ Two files in this repository are worth copying from.
 that builds against the packed packages, and `samples/ExternalProvider/Provider.fs` is a
 compiling core-only provider.
 
-Related reading: [workspace bindings](workspace-bindings.md) for binding
-persistence, and [provider authoring](provider-authoring.md) for the revision path policy
+Related reading: [provider authoring](provider-authoring.md) for the revision path policy
 a host hands to a factory (`RevisionPolicyStrategy`) and for the storage settings reseed
 recipe.
