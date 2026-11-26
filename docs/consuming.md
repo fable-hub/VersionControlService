@@ -1639,7 +1639,7 @@ that Node can run directly. If Fable does not write a package file, add
 ```console
 npm install simple-git
 dotnet new tool-manifest
-dotnet tool install fable --version 5.5.0
+dotnet tool install fable --version 5.26.0
 dotnet tool run fable YourApp.fsproj --outDir output
 node output/<your-entry-file>.js
 ```
@@ -1653,7 +1653,7 @@ node output/app.cjs
 ```
 
 Fable is a dotnet tool, so a consumer needs its own manifest. Pin the version, because this
-guide describes 5.5.0, which is what `.config/dotnet-tools.json` pins here. CI runs
+guide describes 5.26.0, which is what `.config/dotnet-tools.json` pins here. CI runs
 `dotnet tool restore` before any target that compiles with it, which is why the command works
 in this repository without the install step. Fable names each output file after its source
 file, so the entry point is the compiled name of your entry `.fs` file.

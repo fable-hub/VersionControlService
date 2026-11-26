@@ -10,7 +10,6 @@ let private usage =
         "  test focused <test-file> <filter>           One compiled test file, selecting tests by name"
         "  test consumer                               The Fable consumer suite over the abstractions"
         "  test textdiff                               The shared text-diff engine cases in Fable and Vitest"
-        "  test textdiff-swate-fable                   The engine cases and the text-diff test files compiled with Fable 5.0.0-alpha.21"
         "  test lakefs                                 The live lakeFS matrix against a pinned container"
         "  pack --version=<v> --output=<dir>           Pack the six coordinated packages into a local feed"
         "  release nuget [--dry-run]                   Pack and verify the latest changelog version, then push to NuGet"
@@ -44,7 +43,6 @@ let main args =
     match argv with
     | "test" :: "run" :: _ -> Test.Run.all () |> asExitCode
     | "test" :: "consumer" :: _ -> Test.Run.fableConsumer () |> asExitCode
-    | "test" :: "textdiff-swate-fable" :: _ -> target Test.TextDiffSwateFable
     | "test" :: "textdiff" :: _ -> target Test.TextDiff
     | "test" :: "watch" :: _ ->
         Test.Watch()
@@ -96,7 +94,7 @@ let main args =
             Pack.Local version feed None |> ignore
             Verify.PackageGraph feed version
             Consumer.Compile version feed cache output
-            Consumer.BundleWithOldestFable version feed cache output
+            Consumer.BundleAsCommonJs output
         )
     | [] ->
         Console.WriteLine usage

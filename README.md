@@ -129,7 +129,7 @@ Fable compiles the program to JavaScript modules that Node can run directly. Sta
 ```console
 npm install simple-git
 dotnet new tool-manifest
-dotnet tool install fable --version 5.5.0
+dotnet tool install fable --version 5.26.0
 dotnet tool run fable QuickStart.fsproj --outDir output
 node output/Program.js
 ```

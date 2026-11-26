@@ -1,4 +1,4 @@
-// This config bundles the oldest-Fable consumer and checks its CommonJS interop at load time.
+// This config bundles the consumer and checks its CommonJS interop at load time.
 import path from "node:path";
 
 const input = process.env.VCS_CONSUMER_BUNDLE_INPUT;

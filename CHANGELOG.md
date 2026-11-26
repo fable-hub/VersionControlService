@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+-   The library is built and tested with Fable 5.26.0, and the package check no longer compiles the consumer with Fable 5.0.0-alpha.21.
+
 ## 0.5.0 - 2026-11-19
 
 ### Added
