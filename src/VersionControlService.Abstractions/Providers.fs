@@ -65,7 +65,7 @@ module WorkspaceSession =
     }
 
 /// Provider entry point: probing, verification, provisioning, binding, and opening
-/// per-workspace sessions. Registered per provider ID in an injected catalog.
+/// per-workspace sessions.
 type ProviderFactory = {
     Id: ProviderId
     /// Probes a directory for provider ownership. Must not throw; failures are ProbeFailed.

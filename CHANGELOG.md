@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `WorkspaceSession.withFallbackServices` and `ProviderFactory.withFallbackServices` are removed, together with the stand-in services that filled absent optional services.
 -   `FallbackServiceCodes` and its `FallbackServiceCodes.ServiceUnavailable` code (`service_unavailable`) are removed, because only the stand-in services reported it.
 -   `DiffBlocker.ProviderUnsupported` is removed, because only the stand-in text diff service returned it. A match on `DiffBlocker` has to drop the case.
+-   `ProviderResolver.ProviderCatalog`, `ProviderResolver.tryCreateCatalog`, `ProviderResolver.factories` and `ProviderResolver.tryGetFactory` are removed. A host keeps its provider factories itself.
+-   `ProviderResolver.resolve` is removed, together with `ProviderResolver.ResolutionRequest`, `ProviderResolver.ResolutionReport`, `ProviderResolver.WorkspaceResolution` with its cases `Bound`, `ProbedWorkspace`, `AmbiguousWorkspace` and `UnmanagedWorkspace`, and `ProviderResolver.DetectionCandidate`. A host asks the `Probe` of each provider it has and decides itself which provider owns a folder. `ProviderResolver.normalizePath` and `PathCaseSensitivity` stay.
 
 ### Fixed
 

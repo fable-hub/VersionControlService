@@ -1,4 +1,4 @@
-# Workspace bindings and resolution
+# Workspace bindings
 
 The host owns binding persistence. VersionControlService does not keep an application settings database and does not write a generic binding file into managed workspaces.
 
@@ -18,21 +18,18 @@ Do not serialize access keys, tokens, passwords, credential-bearing URLs, proces
 
 HTTP and HTTPS drop all userinfo and SSH keeps the user name with its password removed. The provider keeps the location the caller gave wherever it reaches the repository.
 
-## Resolution order
-
-Create a catalog with `ProviderResolver.tryCreateCatalog`. Duplicate provider IDs are rejected.
+## Lookup order
 
 For each workspace request:
 
-1. Look up the host-persisted binding by normalized workspace root.
-2. Pass that binding to `ProviderResolver.resolve`. An explicit binding selects its registered factory, and probes are not consulted.
-3. Without a binding, inspect the resolution report. One nearest owning root is a candidate, equal-depth candidates are ambiguous, and no candidates means unmanaged.
-4. If the user or host policy accepts a unique candidate, call that factory's `Adopt` method.
-5. Persist the returned binding in the host store, then call `Open`.
+1. Look up the host-persisted binding by normalized workspace root. A binding selects the factory of its provider, and no probe runs.
+2. Without a binding, the host asks the `Probe` of each provider it has and decides itself.
+3. If the user or host policy accepts a workspace that a probe found, call that factory's `Adopt` method.
+4. Persist the returned binding in the host store, then call `Open`.
 
-Probing is a hint. It must not mutate provider or host state. Ambiguity requires an explicit provider choice. Registration order is not a tie-breaker.
+Probing is a hint. It must not mutate provider or host state.
 
-The host supplies `CaseSensitive` or `CaseInsensitive` path comparison to match its filesystem. Resolution normalizes separators and trailing separators for root comparison, but it preserves case and Unicode spelling.
+The lakeFS provider options take `CaseSensitive` or `CaseInsensitive` path comparison to match the filesystem. `ProviderResolver.normalizePath` normalizes separators and trailing separators for root comparison, but it preserves case and Unicode spelling.
 
 ## Adoption and initialization
 

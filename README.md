@@ -180,7 +180,7 @@ The host supplies `accessKeyId` and `secretAccessKey`. The location then uses `W
 
 ## Compose providers
 
-Factories are ordinary values. Create them with host-owned configuration, then build an immutable catalog at the application composition root.
+Factories are ordinary values. Create them with host-owned configuration at the application composition root.
 
 ```fsharp
 open VersionControlService.Abstractions
@@ -189,7 +189,6 @@ module Git = VersionControlService.Git.GitWorkspaceSession
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFs = VersionControlService.LakeFs.LakeFsWorkspaceSession
-module Resolver = VersionControlService.Abstractions.ProviderResolver
 
 let gitFactory = Git.createFactory Git.GitSessionHooks.none
 
@@ -200,13 +199,9 @@ let lakeFsOptions: LakeFsOptions.LakeFsProviderOptions = {
 
 let lakeFsFactory =
     LakeFs.createFactory lakeFsOptions LakeFsCredentials.unconfigured
-
-let catalog =
-    Resolver.tryCreateCatalog [ gitFactory; lakeFsFactory ]
-    |> Result.defaultWith invalidOp
 ```
 
-The host persists `WorkspaceBinding` values. An explicit binding wins over probing. Without a binding, `ProviderResolver.resolve` reports one candidate, an ambiguity, or an unmanaged workspace. The host decides whether to call `Adopt` and when to save the returned binding.
+The host persists `WorkspaceBinding` values. An explicit binding wins over probing. Without a binding, the host asks the `Probe` of each provider it has and decides itself. The host decides whether to call `Adopt` and when to save the returned binding.
 
 ## Public contract
 
@@ -218,7 +213,7 @@ See:
 
 - [Consuming the library](docs/consuming.md)
 - [Provider authoring](docs/provider-authoring.md)
-- [Workspace bindings and resolution](docs/workspace-bindings.md)
+- [Workspace bindings](docs/workspace-bindings.md)
 - [Conformance profiles](docs/conformance-profiles.md)
 - [Verification matrix](docs/verification/version-control-matrix.md)
 

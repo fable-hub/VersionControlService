@@ -6,7 +6,7 @@ Hosts that spawn git beside the library can use `GitExecution.resolvedEnvironmen
 
 ## Factory lifecycle
 
-`ProviderFactory` is the provider entry point. Register one factory per `ProviderId` in a host-created `ProviderCatalog`.
+`ProviderFactory` is the provider entry point. A host holds one factory per `ProviderId`.
 
 - `Probe` is read-only detection. It must not throw, create a binding, or claim a root it does not own.
 - `VerifyLocation` checks explicit access intents against a repository location.

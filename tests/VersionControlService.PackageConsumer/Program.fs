@@ -10,7 +10,6 @@ module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOption
 module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
-module ProviderResolver = VersionControlService.Abstractions.ProviderResolver
 
 [<Import("tmpdir", "node:os")>]
 let private temporaryDirectory () : string = jsNative
@@ -69,10 +68,10 @@ let main _ =
         LakeFsWorkspaceSession.createFactory lakeFsOptions LakeFsCredentials.unconfigured
 
     let operation =
-        match ProviderResolver.tryCreateCatalog [ gitFactory; lakeFsFactory ] with
-        | Ok catalog when ProviderResolver.factories catalog |> Array.length = 2 -> runGitOperation gitFactory
-        | Ok _
-        | Error _ -> async.Return false
+        if ProviderId.value gitFactory.Id = "git" && ProviderId.value lakeFsFactory.Id = "lakefs" then
+            runGitOperation gitFactory
+        else
+            async.Return false
 
 #if FABLE_COMPILER
     Async.StartImmediate(async {

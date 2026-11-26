@@ -1,9 +1,8 @@
 # Consuming the library
 
-A host that puts version control over a local workspace needs four things from this
-library: a factory for each provider it supports, a catalog holding those factories, a
-binding for the workspace, and an opened session. This page builds those four in order, and
-then covers the two ways to handle services a provider does not have.
+A host that puts version control over a local workspace uses a factory for each provider
+it supports. For each workspace it also needs a binding and an opened session. This page
+builds those in order.
 
 Writing a provider is a different job, covered in [provider authoring](provider-authoring.md).
 
@@ -22,8 +21,7 @@ provider configuration files, build provider command lines, or reimplement provi
 
 ## The composition root
 
-Factories are ordinary values. Build them once, at startup, with host-owned
-configuration, then put them in an immutable catalog.
+Factories are ordinary values. Build them once, at startup, with host-owned configuration.
 
 ```fsharp
 open VersionControlService.Abstractions
@@ -32,7 +30,6 @@ module Git = VersionControlService.Git.GitWorkspaceSession
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 module LakeFs = VersionControlService.LakeFs.LakeFsWorkspaceSession
-module Resolver = VersionControlService.Abstractions.ProviderResolver
 
 let gitFactory = Git.createFactory Git.GitSessionHooks.none
 
@@ -44,15 +41,10 @@ let lakeFsOptions: LakeFsOptions.LakeFsProviderOptions = {
 
 let lakeFsFactory =
     LakeFs.createFactory lakeFsOptions LakeFsCredentials.unconfigured
-
-let catalog =
-    Resolver.tryCreateCatalog [ gitFactory; lakeFsFactory ]
-    |> Result.defaultWith invalidOp
 ```
 
-`tryCreateCatalog` rejects duplicate provider IDs. `StateRoot` is where the lakeFS
-provider keeps its own state, and it has to sit outside every managed workspace.
-`PathCaseSensitivity` is how that provider compares local paths, which is how it checks
+`StateRoot` is where the lakeFS provider keeps its own state, and it has to sit outside
+every managed workspace. `PathCaseSensitivity` is how that provider compares local paths, which is how it checks
 that a state directory really sits under `StateRoot` and not inside a workspace. Pass
 the semantics of the host's filesystem.
 
@@ -286,17 +278,10 @@ install as the exception and the message as the normal path.
 
 ## Opening a workspace
 
-Resolution answers one question: which provider owns this directory. A binding the host
-already stored answers it directly. Without one, the resolver asks every registered
-factory to probe.
+A binding the host already stored names the provider that owns the directory. Without
+one, the host asks the `Probe` of each provider it has and decides itself.
 
 ```fsharp
-/// What the host has to decide for itself, because the library cannot.
-type OpenFailure =
-    | Unmanaged
-    | Ambiguous of Resolver.DetectionCandidate[]
-    | ProviderFailed of OperationFailure
-
 let openBinding (factory: ProviderFactory) binding context = async {
     let! opened = factory.Open binding context
 
@@ -308,69 +293,9 @@ let openBinding (factory: ProviderFactory) binding context = async {
         // before returning the session.
         reportOpenWarning failure
         return Ok outcome.Value
-    | Failed failure -> return Error(ProviderFailed failure)
+    | Failed failure -> return Error failure
 }
-
-let openWorkspace
-    (catalog: Resolver.ProviderCatalog)
-    (storedBinding: WorkspaceBinding option)
-    (workspaceRoot: string)
-    (context: OperationContext)
-    =
-    async {
-        let! report =
-            Resolver.resolve catalog {
-                WorkspacePath = workspaceRoot
-                ExplicitBinding = storedBinding
-                // Decides whether a detected root owns this path. CaseSensitive on Linux.
-                PathCaseSensitivity = CaseInsensitive
-            }
-
-        match report.Resolution with
-        | Resolver.Bound(binding, factory) ->
-            let! session = openBinding factory binding context
-            return session |> Result.map (fun session -> session, binding)
-
-        | Resolver.ProbedWorkspace(factory, candidate) ->
-            // A probe is a hint. Adoption is the explicit step that produces a binding,
-            // and the host decides whether to take it.
-            let! adopted =
-                factory.Adopt
-                    {
-                        WorkspaceRoot = candidate.Root
-                        ConnectionProfileId = None
-                    }
-                    context
-
-            match adopted with
-            | Failed failure -> return Error(ProviderFailed failure)
-            | Succeeded outcome
-            | PartiallySucceeded(outcome, _) ->
-                let binding = outcome.Value
-                let! session = openBinding factory binding context
-                return session |> Result.map (fun session -> session, binding)
-
-        | Resolver.AmbiguousWorkspace candidates -> return Error(Ambiguous candidates)
-        | Resolver.UnmanagedWorkspace -> return Error Unmanaged
-    }
 ```
-
-The four resolutions and what a host does with each:
-
-| Resolution | Meaning | What the host does |
-|---|---|---|
-| `Bound` | The stored binding named a registered provider, so the resolver ran no probes. | Open it. |
-| `ProbedWorkspace` | One provider owns the nearest root. | Ask the user, call `Adopt`, persist the binding, open. `Adopt` may answer `Unsupported`. |
-| `AmbiguousWorkspace` | Several providers claim the same root. | Ask which one. Registration order is not a tie-breaker. |
-| `UnmanagedWorkspace` | No provider claims it, or the stored binding named a provider the catalog does not hold. | Read the diagnostics before treating it as a fresh directory. Then offer `Initialize` or `Clone`. |
-
-A probe never breaks resolution, and neither does a binding the catalog cannot serve. Both
-become data in `report.Diagnostics`. A probe contributes its own failure when it returns
-`ProbeFailed`, `probe_exception` when it throws, `probe_invalid` when it reports an invalid
-workspace, and `probe_root_outside_workspace` when it claims a root that does not own the
-path. The binding path contributes `provider_not_registered` when a stored binding names a
-provider the catalog does not hold. Only the `ProbeFailed` entry carries a provider's own
-code, so treat that one by its category.
 
 `Adopt` is allowed to refuse. A provider that cannot derive a binding it can verify answers
 with the `Unsupported` category, and the code differs by provider: lakeFS reports
@@ -381,15 +306,9 @@ though it probes the `.lakefs_ref.yaml` marker and reports a candidate, so a pro
 workspace never adopts. Fall back to `Bind` with a location the user supplies, or to `Clone`
 into a fresh directory.
 
-The `provider_not_registered` case is the one to handle first. A workspace whose provider
-was dropped from the catalog resolves as `UnmanagedWorkspace` carrying that diagnostic,
-and it is still a managed workspace holding someone's history. A host that offers
-`Initialize` on it without reading the diagnostics is offering to initialize over a
-repository.
-
 Persist the binding `Adopt` returned, keyed by the normalized workspace root, and give it
 back unchanged on the next open. Details are in
-[workspace bindings and resolution](workspace-bindings.md).
+[workspace bindings](workspace-bindings.md).
 
 `Close` returns `Async<unit>`, so await it when the host releases the session:
 `do! session.Close()`. A session owns locks, clients, and caches that outlive the call
@@ -1582,7 +1501,7 @@ Two files in this repository are worth copying from.
 that builds against the packed packages, and `samples/ExternalProvider/Provider.fs` is a
 compiling core-only provider.
 
-Related reading: [workspace bindings and resolution](workspace-bindings.md) for binding
+Related reading: [workspace bindings](workspace-bindings.md) for binding
 persistence, and [provider authoring](provider-authoring.md) for the revision path policy
 a host hands to a factory (`RevisionPolicyStrategy`) and for the storage settings reseed
 recipe.
