@@ -1,6 +1,6 @@
 # VersionControlService
 
-VersionControlService defines portable version-control workspace contracts for Fable and .NET. The built-in Git and lakeFS providers target Fable/Node and implement the same `ProviderFactory` and `WorkspaceSession` contracts. Hosts compose the providers they need and keep application concerns such as settings, UI state, and credential storage outside the library.
+VersionControlService defines portable version-control workspace contracts for Fable and .NET. The built-in Git and lakeFS providers target Fable/Node and implement the same `IVersionControl` interface. Hosts compose the providers they need and keep application concerns such as settings, UI state, and credential storage outside the library.
 
 ## Install
 
@@ -12,29 +12,31 @@ dotnet add package VersionControlService
 
 The umbrella package is dependency-only and carries the public abstractions, the text diff engine, the Node runtime, the Git provider, and the lakeFS provider at one coordinated version. An external provider that does not need the built-in implementations can reference `VersionControlService.Abstractions` alone.
 
-The Git and lakeFS providers run on Fable and Node. They need the `simple-git` npm package, and the Git provider needs git 2.42 or newer on the path. Git LFS is optional and only the large-object services use it. lakeFS needs no local tool. [Consuming the library](docs/consuming.md) lists what to install.
+The Git and lakeFS providers run on Fable and Node. They need the `simple-git` npm package, and the Git provider needs git 2.42 or newer on the path. Git LFS is optional and only the large-object functions use it. lakeFS needs no local tool. [Consuming the library](docs/consuming.md) lists what to install.
 
 ## Quick start
 
 This example clones a Git repository, commits the changed files, pulls and pushes. Git calls those steps clone, commit, pull and push. The abstraction calls them `Clone`, `CreateRevision`, `Update` and `Publish`.
 
-Every operation takes an `OperationContext` and returns `Async<OperationResult<'T>>`. The `valueOf` helper below unwraps a result and throws on anything other than `Succeeded`, which is enough for a first run. A real host reads the failure category and recovery action, as [reading a result](docs/consuming.md#reading-a-result) shows. Save the example as `Program.fs` in a console project named `QuickStart.fsproj` that references the package.
+Every operation except `Probe` and `Close` takes an `OperationContext` and returns `Async<CallResult<'T>>`. A `CallResult` is `Executed` with the `OperationResult<'T>` of the provider, or `NoOp` with a reason when the provider does not have the function. The `valueOf` helper below unwraps a call and throws on anything other than a `Succeeded` result, which is enough for a first run. A real host reads the failure category and recovery action, as [reading a result](docs/consuming.md#reading-a-result) shows. Save the example as `Program.fs` in a console project named `QuickStart.fsproj` that references the package.
 
 ```fsharp
 module QuickStart
 
 open VersionControlService.Abstractions
 
-module Git = VersionControlService.Git.GitWorkspaceSession
+module GitProvider = VersionControlService.Git.GitProvider
+module GitProviderOptions = VersionControlService.Git.GitProviderOptions
 
-/// Returns the payload and throws on a failure or a partial success.
-let valueOf (result: OperationResult<'T>) : 'T =
-    match result with
-    | Succeeded outcome -> outcome.Value
-    | PartiallySucceeded(_, failure)
-    | Failed failure -> failwith $"{failure.Code}: {failure.Message}"
+/// Returns the payload and throws on a failure, a partial success or a missing function.
+let valueOf (call: CallResult<'T>) : 'T =
+    match call with
+    | Executed(Succeeded outcome) -> outcome.Value
+    | Executed(PartiallySucceeded(_, failure))
+    | Executed(Failed failure) -> failwith $"{failure.Code}: {failure.Message}"
+    | NoOp reason -> failwith reason
 
-let factory = Git.createFactory Git.GitSessionHooks.none
+let provider = GitProvider.create GitProviderOptions.defaults
 
 let location: RepositoryLocation = {
     ProviderId = ProviderId.tryCreate WellKnownProviderIds.Git |> Result.defaultWith invalidOp
@@ -47,10 +49,10 @@ let quickStart (targetPath: string) =
     async {
         let context = OperationContext.detached "quick-start"
 
-        // Clone into a missing or empty directory. The binding is what a host stores
-        // and passes to Open the next time.
+        // Clone into a missing or empty directory. The result is the opened repository,
+        // which every later call takes as its first argument.
         let! cloned =
-            factory.Clone
+            provider.Clone
                 {
                     Location = location
                     TargetPath = targetPath
@@ -59,24 +61,24 @@ let quickStart (targetPath: string) =
                 }
                 context
 
-        let! opened = factory.Open (valueOf cloned) context
-        let session = valueOf opened
+        let repository = valueOf cloned
 
         let readVersion () =
             async {
-                let! status = session.Core.GetStatus context
+                let! status = provider.GetStatus repository context
                 return (valueOf status).RepositoryVersion
             }
 
         // Edit files under targetPath, then read the status.
-        let! status = session.Core.GetStatus context
+        let! status = provider.GetStatus repository context
         let status = valueOf status
 
         // Commit exactly the changed paths. The version guards against a workspace
         // that changed since the status was read.
         if status.Changes.Length > 0 then
             let! revision =
-                session.Core.CreateRevision
+                provider.CreateRevision
+                    repository
                     {
                         Message = "Update results"
                         Paths = status.Changes |> Array.map (fun change -> change.Path)
@@ -86,18 +88,23 @@ let quickStart (targetPath: string) =
 
             printfn "Created revision %s" (RevisionId.value (valueOf revision))
 
-        match session.Synchronization with
-        | Some sync ->
-            // Pull. Every mutation moves the version, so read it again each time.
-            let! version = readVersion ()
-            let! updated = sync.Update { ExpectedRepositoryVersion = version } context
+        // Pull. Every mutation moves the version, so read it again each time.
+        let! version = readVersion ()
+
+        let! updated =
+            provider.Synchronization.Update repository { ExpectedRepositoryVersion = version } context
+
+        match updated with
+        | NoOp reason -> printfn "This provider does not update: %s" reason
+        | Executed _ ->
             printfn "After update: %A" (valueOf updated).Relationship
 
             // Push.
             let! version = readVersion ()
 
             let! published =
-                sync.Publish
+                provider.Synchronization.Publish
+                    repository
                     {
                         ExpectedRepositoryVersion = version
                         ExpectedTargetRevision = None
@@ -105,9 +112,8 @@ let quickStart (targetPath: string) =
                     context
 
             printfn "After publish: %A" (valueOf published).Relationship
-        | None -> printfn "This provider has no synchronization service."
 
-        do! session.Close()
+        do! provider.Close repository
     }
 
 [<EntryPoint>]
@@ -116,11 +122,11 @@ let main _ =
     0
 ```
 
-Each mutation carries the `RepositoryVersion` of the status the caller last read. A workspace that changed in between rejects the call with a `Concurrency` failure. The Git provider does not return the new version after a mutation, so the example reads the status again before each one. `Synchronization` is optional on a session, which is why the example matches on it.
+Each mutation carries the `RepositoryVersion` of the status the caller last read. A workspace that changed in between rejects the call with a `Concurrency` failure. The Git provider does not return the new version after a mutation, so the example reads the status again before each one. The example matches the update on `NoOp` to show the answer of a provider that does not have the function. The Git provider has every function.
 
 `Synchronization.Synchronize` runs the pull and the push as one operation. It refuses when the pull would overwrite local changes or open a conflict session, and [synchronizing](docs/consuming.md#synchronizing) shows the refusals a host handles.
 
-`Git.createFactory` uses anonymous credentials. Public HTTPS remotes and local paths work with them, and SSH works through the user's SSH agent. `CreateRevision` takes the author from the repository's `user.name` and `user.email` and fails with `identity_missing` when git has none. `Git.createFactoryWithCredentials` takes a credential strategy for tokens, and `Git.createFactoryWithCredentialsAndIdentity` also takes an identity strategy. [Credentials](docs/consuming.md#credentials) describes both.
+`GitProviderOptions.defaults` uses anonymous credentials. Public HTTPS remotes and local paths work with them, and SSH works through the user's SSH agent. `CreateRevision` takes the author from the repository's `user.name` and `user.email` and fails with `identity_missing` when git has none. The `Credentials` field of `GitProviderOptions` takes a credential strategy for tokens, and `RevisionIdentity` takes an identity strategy. [Credentials](docs/consuming.md#credentials) describes both.
 
 ### Run it
 
@@ -141,15 +147,15 @@ Bundling remains an option for a host that needs one file. Install Rollup with `
 
 | Git | VersionControlService |
 |---|---|
-| `git clone` | `ProviderFactory.Clone` |
-| `git init` | `ProviderFactory.Initialize` |
-| `git remote add origin` | `ProviderFactory.Bind` |
-| `git status` | `Core.GetStatus` |
-| `git add` and `git commit` | `Core.CreateRevision` |
-| `git branch` | `Core.ListRefs` and `Core.CreateRef` |
-| `git checkout <branch>` | `Core.PreflightSwitchRef`, then `Core.SwitchRef` |
-| `git restore` | `Core.RestorePaths` |
-| `git diff --stat` | `Core.GetDiffSummary` |
+| `git clone` | `Clone` |
+| `git init` | `Initialize` |
+| `git remote add origin` | `Bind` |
+| `git status` | `GetStatus` |
+| `git add` and `git commit` | `CreateRevision` |
+| `git branch` | `ListRefs` and `CreateRef` |
+| `git checkout <branch>` | `PreflightSwitchRef`, then `SwitchRef` |
+| `git restore` | `RestorePaths` |
+| `git diff --stat` | `GetDiffSummary` |
 | `git fetch` | `Synchronization.Refresh` |
 | `git pull` | `Synchronization.Update` |
 | `git push` | `Synchronization.Publish` |
@@ -157,55 +163,62 @@ Bundling remains an option for a host that needs one file. Install Rollup with `
 
 ### lakeFS
 
-A lakeFS session answers the same calls. Only the factory and the location change. `LakeFsWorkspaceSession.createFactory` takes a `LakeFsProviderOptions` record and a credential strategy. `StateRoot` is a directory outside every workspace where the provider keeps its state, and `PathCaseSensitivity` matches the host's filesystem.
+A lakeFS provider answers the same calls where it has them, and answers `NoOp` for the rest. Only the provider and the location change. `LakeFsProvider.create` takes a `LakeFsProviderOptions` record. `StateRoot` is a directory outside every workspace where the provider keeps its state, `PathCaseSensitivity` matches the host's filesystem, `Hooks` sets test seams and `Credentials` resolves a connection profile to a lakeFS connection.
 
 ```fsharp
-module LakeFs = VersionControlService.LakeFs.LakeFsWorkspaceSession
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsProvider = VersionControlService.LakeFs.LakeFsProvider
+module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
 
-let lakeFsFactory =
-    LakeFs.createFactory
+let lakeFsProvider =
+    LakeFsProvider.create
         {
             StateRoot = "/var/lib/my-app/lakefs-state"
             PathCaseSensitivity = CaseSensitive
+            Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+            Credentials =
+                LakeFsCredentials.fixedConnection {
+                    Endpoint = "http://localhost:8000"
+                    AccessKeyId = accessKeyId
+                    SecretAccessKey = secretAccessKey
+                }
         }
-        (LakeFsCredentials.fixedConnection {
-            Endpoint = "http://localhost:8000"
-            AccessKeyId = accessKeyId
-            SecretAccessKey = secretAccessKey
-        })
 ```
 
 The host supplies `accessKeyId` and `secretAccessKey`. The location then uses `WellKnownProviderIds.LakeFs` and a `ProviderLocation` such as `lakefs://study-archive/main`.
 
 ## Compose providers
 
-Factories are ordinary values. Create them with host-owned configuration at the application composition root.
+Providers are ordinary values. Create them with host-owned configuration at the application composition root.
 
 ```fsharp
 open VersionControlService.Abstractions
 
-module Git = VersionControlService.Git.GitWorkspaceSession
+module GitProvider = VersionControlService.Git.GitProvider
+module GitProviderOptions = VersionControlService.Git.GitProviderOptions
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsOptions = VersionControlService.LakeFs.LakeFsProviderOptions
-module LakeFs = VersionControlService.LakeFs.LakeFsWorkspaceSession
+module LakeFsProvider = VersionControlService.LakeFs.LakeFsProvider
 
-let gitFactory = Git.createFactory Git.GitSessionHooks.none
+let gitProvider = GitProvider.create GitProviderOptions.defaults
 
 let lakeFsOptions: LakeFsOptions.LakeFsProviderOptions = {
     StateRoot = applicationStateDirectory
     PathCaseSensitivity = CaseInsensitive
+    Hooks = LakeFsOptions.LakeFsSessionHooks.none
+    Credentials = LakeFsCredentials.unconfigured
 }
 
-let lakeFsFactory =
-    LakeFs.createFactory lakeFsOptions LakeFsCredentials.unconfigured
+let lakeFsProvider = LakeFsProvider.create lakeFsOptions
 ```
+
+The host asks the `Probe` of each provider it has and decides itself which provider owns a folder. It then gives the folder to `Open` of that provider.
 
 ## Public contract
 
-Every opened session has `CoreVersionControl`. Optional services are present only when the provider supports them, so feature discovery is an `Option.isSome` check. Operations return `Succeeded`, `PartiallySucceeded`, or `Failed` with structured state-change, recovery, affected-path, and revision evidence.
+A provider is an `IVersionControl`. Its functions are members of the interface or of one of eight group interfaces, and every call returns a `CallResult`. A provider that does not have a function answers `NoOp` with the reason, so a call never throws for that. A host that wants to know before it calls subscribes with `Subscribe.single` for one function or `Subscribe.all` for the list of everything the provider has. Operations return `Succeeded`, `PartiallySucceeded`, or `Failed` with structured state-change, recovery, affected-path, and revision evidence.
 
-Everything outside an opened session (`Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Bind`, `CheckDependencies`, `InstallDependency`), repository locations and credentials stay provider-specific at the composition root.
+`Open`, `Clone`, `Initialize` and `Bind` return the opened `Repository`, and every function on a repository takes it as its first argument. `Probe`, `VerifyLocation`, `Initialize`, `Clone`, `Open`, `Bind`, `CheckDependencies` and `InstallDependency` need no opened repository. Repository locations and credentials stay provider-specific at the composition root.
 
 See:
 

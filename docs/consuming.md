@@ -1,7 +1,7 @@
 # Consuming the library
 
-A host that puts version control over a local workspace uses a factory for each provider
-it supports. For each workspace it also needs an opened session. This page
+A host that puts version control over a local workspace creates a provider for each system
+it supports. For each workspace it also needs an opened repository. This page
 builds those in order.
 
 Writing a provider is a different job, covered in [provider authoring](provider-authoring.md).
@@ -11,47 +11,55 @@ Writing a provider is a different job, covered in [provider authoring](provider-
 The library stores nothing of its own. There is no settings store, no credential store, no
 UI state, and no registry of known workspaces. The host keeps:
 
-- the credentials, behind a strategy the factory calls when it needs one
+- the choice of provider for each folder, and the `StateRoot` folder in which the lakeFS provider keeps its state
+- the credentials, behind a strategy the provider calls when it needs one
 - the choice to retry after a failure
-- the workspace version it last showed the user, which it passes back on the next mutation
+- the repository version it last showed the user, which it passes back on the next mutation
 
 The library owns provider mechanics. Nothing in a host should parse provider output, read
 provider configuration files, build provider command lines, or reimplement provider rules.
 
 ## The composition root
 
-Factories are ordinary values. Build them once, at startup, with host-owned configuration.
+Providers are ordinary values. Build them once, at startup, with host-owned configuration.
 
 ```fsharp
 open VersionControlService.Abstractions
 
-module Git = VersionControlService.Git.GitWorkspaceSession
+module GitProvider = VersionControlService.Git.GitProvider
+module GitProviderOptions = VersionControlService.Git.GitProviderOptions
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsOptions = VersionControlService.LakeFs.LakeFsProviderOptions
-module LakeFs = VersionControlService.LakeFs.LakeFsWorkspaceSession
+module LakeFsProvider = VersionControlService.LakeFs.LakeFsProvider
 
-let gitFactory = Git.createFactory Git.GitSessionHooks.none
+let gitProvider = GitProvider.create GitProviderOptions.defaults
 
 let lakeFsOptions: LakeFsOptions.LakeFsProviderOptions = {
     StateRoot = applicationStateDirectory
     // The host's own filesystem semantics. CaseSensitive on Linux.
     PathCaseSensitivity = CaseInsensitive
+    Hooks = LakeFsOptions.LakeFsSessionHooks.none
+    Credentials = LakeFsCredentials.unconfigured
 }
 
-let lakeFsFactory =
-    LakeFs.createFactory lakeFsOptions LakeFsCredentials.unconfigured
+let lakeFsProvider = LakeFsProvider.create lakeFsOptions
 ```
+
+Each `create` takes one options record and returns an `IVersionControl`. `GitProviderOptions.defaults`
+sets no hooks, anonymous credentials and identity, the automatic revision policy and no text diff
+worker. `Hooks` holds test seams, and `none` sets no hook.
 
 `StateRoot` is where the lakeFS provider keeps its own state, and it has to sit outside
 every managed workspace. `PathCaseSensitivity` is how that provider compares local paths, which is how it checks
-that a state directory really sits under `StateRoot` and not inside a workspace. Pass
+that a state directory really sits under `StateRoot` and not inside a workspace, and how it
+decides whether two folders that differ in case are one folder when it finds the state of a folder. Pass
 the semantics of the host's filesystem.
 
 ### Credentials
 
-`Git.createFactory` uses the anonymous credential strategy, which covers public HTTPS,
-an SSH agent, and local paths. A host holding tokens passes its own strategy. It receives
-the host of the remote git will contact and the connection profile:
+`GitProviderOptions.defaults` uses the anonymous credential strategy, which covers public HTTPS,
+an SSH agent, and local paths. A host holding tokens passes its own strategy in the `Credentials`
+field. It receives the host of the remote git will contact and the connection profile:
 
 ```fsharp
 module GitCredentials = VersionControlService.Git.GitCredentialStrategy
@@ -66,15 +74,15 @@ let credentials: GitCredentials.GitCredentialStrategy = {
             }
 }
 
-let gitFactory = Git.createFactoryWithCredentials Git.GitSessionHooks.none credentials
+let gitProvider = GitProvider.create { GitProviderOptions.defaults with Credentials = credentials }
 ```
 
 Returning `None` means anonymous. Secrets stay inside the strategy and never reach a
 message or progress output.
 
 Git also wants an identity to attribute revisions to.
-`Git.createFactoryWithCredentialsAndIdentity` takes a `GitIdentityStrategy` alongside the
-credentials, and its `ResolveIdentity` runs for each operation that may create a revision.
+The `RevisionIdentity` field takes a `GitIdentityStrategy`, and its `ResolveIdentity` runs
+for each operation that may create a revision.
 Returning `None` falls back to the repository's configured `user.name` and `user.email`.
 When the strategy gives nothing and the repository has no complete identity either, the
 revision fails before it mutates anything, with the validation code `identity_missing` and
@@ -84,8 +92,8 @@ needs either the strategy or a path that walks the user through configuring git.
 lakeFS resolves a whole connection, endpoint plus access keys, from the profile:
 
 ```fsharp
-let lakeFsFactory =
-    LakeFs.createFactory lakeFsOptions (LakeFsCredentials.fixedConnection connection)
+let lakeFsProvider =
+    LakeFsProvider.create { lakeFsOptions with Credentials = LakeFsCredentials.fixedConnection connection }
 ```
 
 `LakeFsCredentials.unconfigured` refuses every profile and is the right default until
@@ -94,7 +102,7 @@ the user has configured one.
 ### Choosing the git executable
 
 The Git provider runs the `git` found on the PATH unless the host selects another one. A
-host that ships its own git, or lets the user pick one, installs a provider once at
+host that ships its own git, or lets the user pick one, installs a selection function once at
 startup:
 
 ```fsharp
@@ -104,16 +112,16 @@ module GitExecution = VersionControlService.Git.GitExecution
 GitExecution.setGitExecutableProvider (fun () -> settings.GitExecutablePath)
 ```
 
-One selection serves every factory in the process, and no factory needs rebuilding when it
+One selection serves every Git provider in the process, and no provider needs rebuilding when it
 changes. simple-git captures its binary and environment when an operation creates its
 instance, so for simple-git a changed setting applies from the next operation. Process
-requests and the Git LFS adapter ask the provider at each start. The text diff supervisor
+requests and the Git LFS adapter ask the function at each start. The text diff supervisor
 asks it each time it launches git. For all of them a changed setting applies from the next
-start. The provider must not throw. `None` or a blank string means the
+start. The function must not throw. `None` or a blank string means the
 git found on the PATH. An explicit selection has to be the absolute path of a file, because
 only the dependency check validates it. Its directory goes first in the PATH of the git
 child processes, so a git-lfs installed beside it is found. A test that installs a
-provider restores automatic discovery with `GitExecution.resetGitExecutableProvider ()`.
+function restores automatic discovery with `GitExecution.resetGitExecutableProvider ()`.
 
 `CheckDependencies` uses the same selection, resolved once for the whole check. A
 selection that names no usable file makes every component report `Installed = false`,
@@ -163,7 +171,10 @@ Secrets belong here, behind the strategy, and never in the location.
 
 ## Creating a workspace
 
-Three factory operations create a workspace, and none of them needs an opened session.
+`Clone`, `Initialize` and `Bind` create a workspace, and none of them needs an opened repository.
+Each one returns the opened repository, so the other functions work at once. `Open` opens a folder
+that already exists (see "Opening a workspace"). The lakeFS provider runs the first open of the
+folder as part of each of the three, so the repository it returns has its workspace branch and its objects.
 
 `TargetRef` asks the provider to check out an exact ref. A provider returns an `Unsupported` failure
 for a ref it cannot check out (the Git provider refuses every `TargetRef`), and a `Validation`
@@ -172,9 +183,9 @@ failure (`target_ref_mismatch`) for a ref that contradicts the location. It neve
 `Clone` wants a destination that is missing or empty:
 
 ```fsharp
-let cloneWorkspace (factory: ProviderFactory) location targetPath (context: OperationContext) = async {
-    let! result =
-        factory.Clone
+let cloneWorkspace (provider: IVersionControl) location targetPath (context: OperationContext) = async {
+    let! call =
+        provider.Clone
             {
                 Location = location
                 TargetPath = targetPath
@@ -185,24 +196,21 @@ let cloneWorkspace (factory: ProviderFactory) location targetPath (context: Oper
             }
             context
 
-    match result with
-    | Succeeded outcome -> return Ok outcome.Value
-    | PartiallySucceeded(_, failure) ->
+    match call with
+    | NoOp reason -> return Error reason
+    | Executed(Succeeded outcome) -> return Ok outcome.Value
+    | Executed(PartiallySucceeded(_, failure)) ->
         let recoveryCode =
             failure.RecoveryAction
             |> Option.map (fun action -> action.Code)
             |> Option.defaultValue "none"
 
-        return
-            Error {
-                failure with
-                    Message = $"The clone finished with a problem ({failure.Code}). Recovery: {recoveryCode}."
-            }
-    | Failed failure -> return Error failure
+        return Error $"The clone finished with a problem ({failure.Code}). Recovery: {recoveryCode}."
+    | Executed(Failed failure) -> return Error failure.Message
 }
 ```
 
-A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized. The download is `git lfs fetch` followed by `git lfs checkout`. A cancel stops the fetch and rolls the clone back. A cancel that arrives during the checkout waits for the checkout to end, and the clone succeeds. A fetch that fails without a cancel still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. When the checkout fails and a `.git/index.lock` is present, or when Git names the lock in its failure text, the recovery is `remove_index_lock` instead of `retry_materialization`. Remove the lock once no git process runs, then materialize again.
+A clone canceled before it completes rolls back and fails as `Canceled`. A pre-existing empty target is cleaned by removing its entries, so entries another program adds to that folder during the clone are removed too. A clone that finished before cancellation took effect succeeds. A download failure that is not a cancellation returns `PartiallySucceeded` with `retry_materialization`, so the workspace exists and its large objects are not materialized. The result still holds the opened repository in `outcome.Value`. The download is `git lfs fetch` followed by `git lfs checkout`. A cancel stops the fetch and rolls the clone back. A cancel that arrives during the checkout waits for the checkout to end, and the clone succeeds. A fetch that fails without a cancel still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. When the checkout fails and a `.git/index.lock` is present, or when Git names the lock in its failure text, the recovery is `remove_index_lock` instead of `retry_materialization`. Remove the lock once no git process runs, then materialize again.
 
 A clone whose rollback cannot remove the target returns `Failed` with `StateChanged = true` and the recovery code `remove_clone_target`, with category `Canceled` when the user canceled. Ask the user to clear the target folder before retrying.
 
@@ -212,14 +220,14 @@ Git accepts `None`, so a Git workspace can start with no target and get one thro
 later. lakeFS requires one and answers `Validation` with `location_required` without it:
 
 ```fsharp
-let! result = factory.Initialize { TargetPath = targetPath; Location = Some location } context
+let! result = provider.Initialize { TargetPath = targetPath; Location = Some location } context
 ```
 
 `Bind` attaches or retargets a local workspace without cloning, which is the answer to
 `publish_target_missing`:
 
 ```fsharp
-let! result = factory.Bind { RepositoryRoot = workspaceRoot; Location = location } context
+let! result = provider.Bind { RepositoryRoot = workspaceRoot; Location = location } context
 ```
 
 ## Checking the provider can run
@@ -228,19 +236,20 @@ A provider that shells out to external tools cannot work until those tools are i
 Ask before the user hits a failure in the middle of a save. The Git provider reports on git
 itself, on Git LFS, and on whether the LFS filter is configured.
 
-Only git is required. Git LFS is optional, and the services that use it (object
+Only git is required. Git LFS is optional, and the functions that use it (object
 materialization, storage policy and maintenance) report their own dependency status when it
 is absent. A host that treats a missing `git-lfs` as fatal refuses workspaces that would
 have worked, so separate the two:
 
 ```fsharp
-let checkTools (factory: ProviderFactory) (context: OperationContext) = async {
-    let! result = factory.CheckDependencies context
+let checkTools (provider: IVersionControl) (context: OperationContext) = async {
+    let! call = provider.CheckDependencies context
 
-    match result with
-    | Failed failure -> return Error failure.Message
-    | Succeeded outcome
-    | PartiallySucceeded(outcome, _) ->
+    match call with
+    | NoOp reason -> return Error reason
+    | Executed(Failed failure) -> return Error failure.Message
+    | Executed(Succeeded outcome)
+    | Executed(PartiallySucceeded(outcome, _)) ->
         let unusable (status: DependencyStatus) =
             not status.Installed || not status.Compatible
 
@@ -267,56 +276,109 @@ is set up. Show the remediation text for a degraded component and let the user c
 `InstallDependency` takes a component name and attempts the remediation the provider
 supports. Git supports only `git-lfs-configuration` and answers anything else
 with a structured `Unsupported` failure, so a host shows the `Remediation` text for git
-and Git LFS themselves and offers a button only for the filter. Treat a successful
+and Git LFS themselves and offers a button only for the filter. lakeFS needs no local tool, so its `InstallDependency` answers `NoOp`. Treat a successful
 install as the exception and the message as the normal path.
 
 ## Opening a workspace
 
-The host asks the `Probe` of each provider it has and decides itself.
+The host asks the `Probe` of each provider it has and decides itself. `Probe` takes a folder and
+changes nothing, so asking every provider is safe. It answers `Detected` with the root it found,
+`NotDetected`, `Invalid` or `ProbeFailed`. The answer is a hint, and the host's own choice of provider
+wins. The Git provider detects a folder that has a `.git` entry, and the lakeFS provider detects a
+folder that its provider state records.
 
 ```fsharp
-let openBinding (factory: ProviderFactory) binding context = async {
-    let! opened = factory.Open binding context
+let openFolder
+    (provider: IVersionControl)
+    (folder: string)
+    (connectionProfileId: string option)
+    (context: OperationContext)
+    =
+    async {
+        let! call =
+            provider.Open
+                {
+                    RepositoryRoot = folder
+                    ConnectionProfileId = connectionProfileId
+                }
+                context
 
-    match opened with
-    | Succeeded outcome -> return Ok outcome.Value
-    | PartiallySucceeded(outcome, failure) ->
-        // The session is usable and something went wrong opening it. A host that keeps
-        // this short is dropping a recovery action, so report the failure somewhere
-        // before returning the session.
-        reportOpenWarning failure
-        return Ok outcome.Value
-    | Failed failure -> return Error failure
-}
+        match call with
+        | NoOp reason -> return Error reason
+        | Executed(Succeeded outcome) -> return Ok outcome.Value
+        | Executed(PartiallySucceeded(outcome, failure)) ->
+            // The repository is usable and something went wrong opening it. A host that keeps
+            // this short is dropping a recovery action, so report the failure somewhere
+            // before returning the repository.
+            reportOpenWarning failure
+            return Ok outcome.Value
+        | Executed(Failed failure) -> return Error failure.Message
+    }
 ```
 
-`Close` returns `Async<unit>`, so await it when the host releases the session:
-`do! session.Close()`. A session owns locks, clients, and caches that outlive the call
-that created it.
+`Open` takes the folder and an optional connection profile, and nothing else. The provider finds
+the repository root from the folder and reports the root it found in `Descriptor.RepositoryRoot` of the
+opened repository. The Git provider takes that root from Git, and Git resolves links, so the reported
+root can be spelled differently from the folder. A host that keeps its own table of opened repositories
+keys it by the folder it passed to `Open`. It compares folders with `ProviderResolver.normalizePath`,
+which normalizes separators and trailing separators and keeps case and Unicode spelling. Whether two
+folders that differ in case are one folder depends on the filesystem, so the host applies the
+`PathCaseSensitivity` that it also gives to the lakeFS options.
+
+`Open` can refuse. Git fails with the category `Unsupported` and the code `adoption_unsupported` for a
+folder whose repository metadata it cannot parse. lakeFS fails with `provider_state_missing` for a
+folder that none of its provider state records, and with `first_open_incomplete` when the first open
+of the folder did not finish, which means the folder has to be initialized or bound again, or deleted and cloned again. Branch on the
+category, because the two providers reach similar behavior through different mechanisms. A host that
+cannot open a folder falls back to `Bind` with a location the user supplies, or to `Clone` into a
+fresh directory.
+
+An opened repository belongs to the provider that opened it. Give it only to that provider. Another
+provider answers `repository_of_another_provider` with the category `Validation`. Nothing routes a
+repository to the provider that owns it. `Close` returns `Async<unit>`, so await it when the host
+releases the repository: `do! provider.Close repository`. A repository owns locks, clients, and
+caches that outlive the call that created it, and `Close` of another provider's repository throws an
+`ArgumentException`, because its result has no failure to carry. Do not reuse a repository for a different
+connection profile. Several repositories can exist at once, also over one folder, and each has its own
+state. Mutation safety comes from repository-version and conflict-handle checks, which is why no global
+singleton state is needed.
+
+A `RepositoryLocation` carries no credentials. The providers drop the userinfo of the location they
+record in `Descriptor.Location`: HTTP and HTTPS lose all userinfo and SSH keeps the user name with its
+password removed. The provider reaches the repository with the location the caller gave. The credentials
+come from the connection profile through the strategy of the provider.
 
 ## Reading a result
 
-Every operation returns `OperationResult<'T>` with three cases.
+Every function except `Probe` and `Close` returns `CallResult<'T>`. `Executed` holds the `OperationResult<'T>` of the
+provider, and `NoOp` means the provider does not have the function, with the reason. An `OperationResult<'T>` has
+three cases.
 
 ```fsharp
-match result with
-| Succeeded outcome ->
-    // outcome.Value is the payload. outcome.Effect says whether work happened.
-    match outcome.Effect with
-    | Performed -> showRevision outcome.ResultingRevision
-    | Unchanged reason -> showNothingToDo reason
+match call with
+| NoOp reason -> showUnavailable reason
+| Executed result ->
+    match result with
+    | Succeeded outcome ->
+        // outcome.Value is the payload. outcome.Effect says whether work happened.
+        match outcome.Effect with
+        | Performed -> showRevision outcome.ResultingRevision
+        | Unchanged reason -> showNothingToDo reason
 
-| PartiallySucceeded(outcome, failure) ->
-    // State changed before a later step failed. The contract obliges the provider to
-    // attach a recovery action here, and the field stays an option on the type.
-    showRecovery failure.RecoveryAction
+    | PartiallySucceeded(outcome, failure) ->
+        // State changed before a later step failed. The contract obliges the provider to
+        // attach a recovery action here, and the field stays an option on the type.
+        showRecovery failure.RecoveryAction
 
-| Failed failure ->
-    match failure.Category with
-    | Concurrency -> refreshAndRetry ()
-    | Authentication -> askForCredentials ()
-    | _ -> showMessage failure.Message
+    | Failed failure ->
+        match failure.Category with
+        | Concurrency -> refreshAndRetry ()
+        | Authentication -> askForCredentials ()
+        | _ -> showMessage failure.Message
 ```
+
+`Unchanged` is a success. The provider ran the call and found nothing to do, and the reason says why.
+`NoOp` means the provider ran nothing at all, because it does not have the function.
 
 `Category` is a closed set a host can branch on. `Code` is an open string a provider extends,
 so treat an unknown code as its category. `StateChanged` says whether provider state may have
@@ -336,48 +398,70 @@ operation has no publication meaning at all, so it is not a claim that anything 
 
 `ResultingRepositoryVersion` is optional and a provider may leave it `None`. The built-in Git
 provider never sets it, and lakeFS does, so do not build a host around it. Two payloads carry
-a workspace version: `Core.GetStatus` and `SwitchRef`, which both return a `RepositoryStatus`.
+a repository version: `GetStatus` and `SwitchRef`, which both return a `RepositoryStatus`.
 The synchronization operations return a `SynchronizationState`, which has revisions and a
-target but no workspace version, so call `Core.GetStatus` after a synchronize to get the token
+target but no repository version, so call `GetStatus` after a synchronize to get the token
 for the next mutation. The token is opaque either way, so do not parse it or compare it for
 ordering.
 
-## Optional services
+## Functions a provider does not have
 
-Every session has `Descriptor`, `Core` and `Close`. The eight services are `option`, and a
-provider leaves one absent when it has nothing to offer there. Feature discovery is an
-`Option.isSome` check.
+Every provider has `Probe` and `Close`. Every other function is a member of `IVersionControl` or of one of
+its eight groups: `Synchronization`, `ConflictResolution`, `TextDiff`, `History`, `RepositoryBrowser`,
+`ObjectMaterialization`, `StoragePolicy` and `Maintenance`. A provider says for each of them whether it has
+the function. A function it does not have runs nothing and answers `NoOp` with a reason of one plain sentence.
+The call never throws for that. The lakeFS provider has no text diff and no history, for example, and
+every call of those answers `NoOp`. A provider that has a function can still refuse one input, and that
+refusal is a `Failed` result inside `Executed`.
 
-The host checks presence and enables the matching part of its interface. Someone using a
+The host reads the answer and enables the matching part of its interface. Someone using a
 provider without synchronization never sees a publish button.
 
-```fsharp
-let describe (session: WorkspaceSession) (context: OperationContext) = async {
-    let services = WorkspaceSession.availability session
+A host that wants to know before it calls subscribes. `Subscribe.single` takes a function that selects one
+entry of the list and returns that function with its own signature and its direct result, which is the
+`OperationResult` without the `CallResult` around it. It returns `Error` with the reason when the provider
+does not have the function. `Subscribe.all` returns the whole `ProviderFunctions` list, in which every
+`Entry` is `Implemented` with the function or `Missing` with the reason. Subscribing only looks into the
+list. It runs no check and calls no function. Both fail with an `Error` for a provider that was not
+built from a function list.
 
-    let! status = session.Core.GetStatus context
+```fsharp
+let describe (provider: IVersionControl) (repository: Repository) (context: OperationContext) = async {
+    let hasSynchronization =
+        match Subscribe.all provider with
+        | Ok functions ->
+            match functions.Synchronization.Synchronize with
+            | Implemented _ -> true
+            | Missing _ -> false
+        | Error _ -> false
+
+    let! status = provider.GetStatus repository context
 
     match status with
-    | Failed failure -> return Error(failure.Category, failure.Code, failure.Message)
-    | Succeeded outcome
-    | PartiallySucceeded(outcome, _) ->
+    | NoOp reason -> return Error reason
+    | Executed(Failed failure) -> return Error failure.Message
+    | Executed(Succeeded outcome)
+    | Executed(PartiallySucceeded(outcome, _)) ->
         let changedCount = outcome.Value.Changes.Length
 
-        let! webUrl =
-            match session.RepositoryBrowser with
-            | Some browser -> async {
-                let! result = browser.GetRepositoryWebUrl context
+        let! webUrl = async {
+            let! call = provider.RepositoryBrowser.GetRepositoryWebUrl repository context
 
-                return
-                    match result with
-                    | Succeeded outcome -> outcome.Value
-                    | PartiallySucceeded(outcome, _) -> outcome.Value
-                    | Failed _ -> None
-              }
-            | None -> async.Return None
+            return
+                match call with
+                | Executed(Succeeded outcome) -> outcome.Value
+                | Executed(PartiallySucceeded(outcome, _)) -> outcome.Value
+                | Executed(Failed _)
+                | NoOp _ -> None
+        }
 
-        return Ok(changedCount, services.Synchronization, webUrl)
+        return Ok(changedCount, hasSynchronization, webUrl)
 }
+
+let publishFunction (provider: IVersionControl) =
+    match Subscribe.single (fun functions -> functions.Synchronization.Publish) provider with
+    | Ok publish -> Some publish
+    | Error reason -> None
 ```
 
 `ObjectMaterialization.Materialize` and `Dematerialize` take an array of paths, so one call
@@ -385,8 +469,8 @@ serves a single file and a folder. A call with many paths is faster than one cal
 
 ## Paged text diffs
 
-`TextDiff` is an optional service on `WorkspaceSession`. Read it from `session.TextDiff`
-before opening a diff. Every `OpenDiffRequest` names what it compares in `Comparison`.
+`TextDiff` is a group of the interface, `provider.TextDiff`, and a provider that has no text diff
+answers `NoOp` to every call of it. Every `OpenDiffRequest` names what it compares in `Comparison`.
 `DiffComparison.WorkingFile` compares the working file with its version in the last revision.
 `DiffComparison.Revision id` compares the version in that revision with the version in its
 first parent. A root commit has no parent, so its previous side is absent. A revision
@@ -395,54 +479,52 @@ The revision must be a full lower-case object id. A ref name or a short id fails
 `diff_read_failed`. `PreviousPath` names the path of the previous side when the file was
 renamed. `Open` pins the source identities for the returned handle.
 
-The Git provider supplies a working service only when the host passes a worker pool. The
-functions that take no `GitSessionOptions` (`GitWorkspaceSession.createFactory`,
-`createFactoryWithCredentials`, `createSession`, `createSessionWithCredentials` and the
-other credential variants) leave `session.TextDiff` as `None`. Only
-`createFactoryWithOptions` and `createSessionWithOptions` with `GitTextDiffOptions` in
-`GitSessionOptions.TextDiff` create a session with a working text diff. Options without
-`TextDiff` produce a service whose `Open` fails with `diff_worker_failed`. See
-[hosting in Node or Electron](#hosting-in-node-or-electron).
+The Git provider has the text diff functions in every case, but its `Open` works only when the host
+passes a worker pool in `GitProviderOptions.TextDiff`. Without a pool, `Open` fails with
+`diff_worker_failed`. See [hosting in Node or Electron](#hosting-in-node-or-electron).
 
 The examples use `valueOf` to keep result handling short. A real caller should match
-`Failed` and retain the `OperationFailure` fields it needs.
+`NoOp` and `Failed` and retain the reason and the `OperationFailure` fields it needs.
 
 ```fsharp
 module PagedTextDiffExample
 
 open VersionControlService.Abstractions
 
-let private valueOf (result: OperationResult<'T>) : 'T =
-    match result with
-    | Succeeded outcome -> outcome.Value
-    | PartiallySucceeded(outcome, _) -> outcome.Value
-    | Failed failure -> failwith failure.Message
+let private valueOf (call: CallResult<'T>) : 'T =
+    match call with
+    | Executed(Succeeded outcome) -> outcome.Value
+    | Executed(PartiallySucceeded(outcome, _)) -> outcome.Value
+    | Executed(Failed failure) -> failwith failure.Message
+    | NoOp reason -> failwith reason
 
 let rec private openReady
-    (service: TextDiffService)
+    (service: ITextDiff)
+    (repository: Repository)
     (request: OpenDiffRequest)
     (context: OperationContext)
     : Async<OpenDiffResult> = async {
-    let! result = service.Open request context
+    let! call = service.Open repository request context
 
-    match valueOf result with
+    match valueOf call with
     | Resumable.Ready opened -> return opened
     | Resumable.Scanning(_, continuation, _) ->
-        return! openReady service { request with Continuation = Some continuation } context
+        return! openReady service repository { request with Continuation = Some continuation } context
 }
 
 let rec private readPageReady
-    (service: TextDiffService)
+    (service: ITextDiff)
+    (repository: Repository)
     (handle: DiffHandle)
     (cursor: string)
     (context: OperationContext)
     : Async<DiffPage> = async {
-    let! result = service.ReadPage { Handle = handle; Cursor = cursor; Background = false } context
+    let! call = service.ReadPage repository { Handle = handle; Cursor = cursor; Background = false } context
 
-    match valueOf result with
+    match valueOf call with
     | Resumable.Ready page -> return page
     | Resumable.Scanning(_, continuation, _) ->
-        return! readPageReady service handle continuation context
+        return! readPageReady service repository handle continuation context
 }
 ```
 
@@ -452,7 +534,7 @@ page continuation as the `ReadPage` cursor. Later `ReadPage` continuations also 
 cursor.
 
 ```fsharp
-let openDiff (service: TextDiffService) (path: RepositoryPath) (context: OperationContext) = async {
+let openDiff (service: ITextDiff) (repository: Repository) (path: RepositoryPath) (context: OperationContext) = async {
     let request: OpenDiffRequest = {
         Path = path
         PreviousPath = None
@@ -465,7 +547,7 @@ let openDiff (service: TextDiffService) (path: RepositoryPath) (context: Operati
         Storage = DiffStoragePolicy.PreferDisk(1024L * 1024L * 1024L, 64L * 1024L * 1024L)
     }
 
-    let! opened = openReady service request context
+    let! opened = openReady service repository request context
 
     match opened with
     | OpenDiffResult.NotDiffable blocker -> return Error blocker
@@ -474,16 +556,22 @@ let openDiff (service: TextDiffService) (path: RepositoryPath) (context: Operati
             match first with
             | Resumable.Ready page -> async.Return page
             | Resumable.Scanning(_, continuation, _) ->
-                readPageReady service handle continuation context
+                readPageReady service repository handle continuation context
 
         return Ok(handle, previous, current, firstPage)
 }
 
-let readNextPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
+let readNextPage
+    (service: ITextDiff)
+    (repository: Repository)
+    (handle: DiffHandle)
+    (page: DiffPage)
+    (context: OperationContext)
+    = async {
     match page.NextCursor with
     | None -> return None
     | Some cursor ->
-        let! next = readPageReady service handle cursor context
+        let! next = readPageReady service repository handle cursor context
         return Some next
 }
 ```
@@ -512,16 +600,22 @@ regions, like a rewrite, with every line present. A full rewrite also produces u
 regions.
 
 ```fsharp
-let replayPage (service: TextDiffService) (handle: DiffHandle) (page: DiffPage) (context: OperationContext) = async {
-    let! result = service.ReplayPage { Handle = handle; PageId = page.PageId } context
-    return valueOf result
+let replayPage
+    (service: ITextDiff)
+    (repository: Repository)
+    (handle: DiffHandle)
+    (page: DiffPage)
+    (context: OperationContext)
+    = async {
+    let! call = service.ReplayPage repository { Handle = handle; PageId = page.PageId } context
+    return valueOf call
 }
 
-let sourceInfoAndClose (service: TextDiffService) (handle: DiffHandle) (context: OperationContext) = async {
-    let! sourceResult = service.GetSourceInfo { Handle = handle } context
-    let sources = valueOf sourceResult
-    let! closeResult = service.Close handle context
-    valueOf closeResult
+let sourceInfoAndClose (service: ITextDiff) (repository: Repository) (handle: DiffHandle) (context: OperationContext) = async {
+    let! sourceCall = service.GetSourceInfo repository { Handle = handle } context
+    let sources = valueOf sourceCall
+    let! closeCall = service.Close repository handle context
+    valueOf closeCall
     return sources
 }
 ```
@@ -535,16 +629,28 @@ reaches the end. Call `Close` when the view no longer needs the handle.
 still scanning, repeat the same request fields and set `Continuation` to the returned token.
 
 ```fsharp
-let rec private expandReady (service: TextDiffService) (request: ExpandRequest) (context: OperationContext) = async {
-    let! result = service.Expand request context
+let rec private expandReady
+    (service: ITextDiff)
+    (repository: Repository)
+    (request: ExpandRequest)
+    (context: OperationContext)
+    = async {
+    let! call = service.Expand repository request context
 
-    match valueOf result with
+    match valueOf call with
     | Resumable.Ready parts -> return parts
     | Resumable.Scanning(_, continuation, _) ->
-        return! expandReady service { request with Continuation = Some continuation } context
+        return! expandReady service repository { request with Continuation = Some continuation } context
 }
 
-let expandGap (service: TextDiffService) (handle: DiffHandle) (gap: EqualGap) (fromStart: bool) (context: OperationContext) =
+let expandGap
+    (service: ITextDiff)
+    (repository: Repository)
+    (handle: DiffHandle)
+    (gap: EqualGap)
+    (fromStart: bool)
+    (context: OperationContext)
+    =
     let request: ExpandRequest = {
         Handle = handle
         GapId = gap.GapId
@@ -553,7 +659,7 @@ let expandGap (service: TextDiffService) (handle: DiffHandle) (gap: EqualGap) (f
         Continuation = None
     }
 
-    expandReady service request context
+    expandReady service repository request context
 ```
 
 For a long line, `ReadLineRequest.OffsetUtf16` selects a slice. `Line` is the zero-based
@@ -567,22 +673,27 @@ when a ninth starts. A continuation for a dropped read answers `continuation_mis
 The caller then starts that read again without a continuation, as the sample does.
 
 ```fsharp
-let rec private readLineReady (service: TextDiffService) (request: ReadLineRequest) (context: OperationContext) = async {
-    let! result = service.ReadLine request context
+let rec private readLineReady
+    (service: ITextDiff)
+    (repository: Repository)
+    (request: ReadLineRequest)
+    (context: OperationContext)
+    = async {
+    let! call = service.ReadLine repository request context
 
-    match result with
-    | Failed failure when
+    match call with
+    | Executed(Failed failure) when
         failure.Code = TextDiffFailureCodes.ContinuationMismatch && request.Continuation.IsSome
         ->
-        return! readLineReady service { request with Continuation = None } context
+        return! readLineReady service repository { request with Continuation = None } context
     | _ ->
-        match valueOf result with
+        match valueOf call with
         | Resumable.Ready line -> return line
         | Resumable.Scanning(_, continuation, _) ->
-            return! readLineReady service { request with Continuation = Some continuation } context
+            return! readLineReady service repository { request with Continuation = Some continuation } context
 }
 
-let readFirstLineSlice (service: TextDiffService) (handle: DiffHandle) (context: OperationContext) = async {
+let readFirstLineSlice (service: ITextDiff) (repository: Repository) (handle: DiffHandle) (context: OperationContext) = async {
     let request: ReadLineRequest = {
         Handle = handle
         Side = DiffSide.Current
@@ -592,7 +703,7 @@ let readFirstLineSlice (service: TextDiffService) (handle: DiffHandle) (context:
         Continuation = None
     }
 
-    let! line = readLineReady service request context
+    let! line = readLineReady service repository request context
     let slice = line.Slice
     let nextOffset = slice.OffsetUtf16 + int64 slice.Text.Length
     return slice, nextOffset
@@ -677,7 +788,7 @@ match NodeWorkerThreads.parentPort with
 ```
 
 Create the supervisor and pool in the Node host. Pass a function that returns the pool
-through `GitSessionOptions` when creating the Git factory. `WindowOwnerOf` should return a
+in `GitProviderOptions.TextDiff` when creating the Git provider. `WindowOwnerOf` should return a
 stable id for the window that owns each call.
 
 ```fsharp
@@ -689,9 +800,10 @@ module DiffSupervisor = VersionControlService.Git.TextDiff.TextDiffSupervisor
 module DiffPool = VersionControlService.Git.TextDiff.TextDiffPool
 module DiffTransport = VersionControlService.Git.TextDiff.TextDiffTransport
 module GitDiffService = VersionControlService.Git.TextDiff.GitTextDiffService
-module GitSessions = VersionControlService.Git.GitWorkspaceSession
+module GitProvider = VersionControlService.Git.GitProvider
+module GitProviderOptions = VersionControlService.Git.GitProviderOptions
 
-let createGitFactory workerScriptPath credentials revisionIdentity revisionPolicy = async {
+let createGitProvider workerScriptPath credentials revisionIdentity revisionPolicy = async {
     let! supervisor =
         DiffSupervisor.create DiffSupervisor.TextDiffSupervisorOptions.defaults
         |> Async.AwaitPromise
@@ -707,13 +819,15 @@ let createGitFactory workerScriptPath credentials revisionIdentity revisionPolic
         Pool = fun () -> Promise.lift (Some pool)
         WindowOwnerOf = fun _ -> "main"
     }
-    let options: GitSessions.GitSessionOptions = {
-        Hooks = GitSessions.GitSessionHooks.none
-        TextDiff = Some textDiffOptions
+    let options = {
+        GitProviderOptions.defaults with
+            Credentials = credentials
+            RevisionIdentity = revisionIdentity
+            RevisionPolicy = revisionPolicy
+            TextDiff = Some textDiffOptions
     }
 
-    let factory = GitSessions.createFactoryWithOptions options credentials revisionIdentity revisionPolicy
-    return pool, factory
+    return pool, GitProvider.create options
 }
 
 let disposeDiffPool (pool: DiffPool.TextDiffPool) =
@@ -725,7 +839,7 @@ often held in memory, so a Linux host sets `TempRoot` to a per-user folder such 
 `$XDG_CACHE_HOME/<app>` (default `~/.cache/<app>`), and the supervisor creates its
 `text-diff` folder there for the current user only.
 
-The session calls `GitTextDiffOptions.Pool` on a diff `Open` until it returns a pool, and
+The opened repository calls `GitTextDiffOptions.Pool` on a diff `Open` until it returns a pool, and
 keeps the first pool it gets, so the function must return the same pool on every call. When
 it returns `None`, that `Open` fails with `diff_worker_failed` and the next `Open` asks again.
 A host that sets the pool up on demand returns `None` while the setup has failed and retries
@@ -837,6 +951,58 @@ drive in between. A failed page commit then fails the session with `diff_worker_
 the message of Node's error, and a failed write to a blob spool ends the read with
 `diff_read_failed`.
 
+## Reading the history
+
+`History.ListRevisions` returns the revisions that lead to the current one, newest first, in pages. A
+`ListRevisionsRequest` has a `Cursor` and a `Limit`. `Cursor` is `None` for the first page and the `NextCursor` of
+the page before for each later one. The provider clamps `Limit` to 1..200. A `RevisionPage` holds the `Revisions`
+and a `NextCursor`, which is `None` on the last page. A branch without a commit returns an empty page. A malformed cursor
+fails with `invalid_cursor` and the category `Validation`.
+
+A `RevisionEntry` holds the `Id`, the `ParentIds` (the first parent comes first, and a root revision has none), a
+one-line `Summary`, the `Message`, the `Committer`, an optional `Author`, the `Refs` that point at the revision and
+its `Publication`. A `RevisionSignature` has a `Name` and an optional `Email`. Its `At` is in seconds since the Unix epoch.
+The Git provider lists local and remote-tracking branches in `Refs`. `Publication` is `Published` when the revision
+is visible on the publication target and `LocalOnly` otherwise. The Git provider asks the remote-tracking branches
+of origin, so the answer is as old as the last contact with it.
+
+`History.GetRevisionChanges` takes a `RevisionId` and returns a `DiffSummary` of the objects that the revision
+changed against its first parent. A root revision reports every object as added. The Git provider accepts only a
+full object id and fails with `invalid_revision` and the category `Validation` for anything else. A full id that
+names no commit fails with `revision_not_found` and the category `NotFound`. The lakeFS provider has no history, so
+both functions answer `NoOp` there.
+
+```fsharp
+let readHistoryPage
+    (history: IHistory)
+    (repository: Repository)
+    (cursor: string option)
+    (context: OperationContext)
+    = async {
+    let request: ListRevisionsRequest = { Cursor = cursor; Limit = 50 }
+    let! call = history.ListRevisions repository request context
+
+    match call with
+    | NoOp reason -> return Error reason
+    | Executed(Failed failure) -> return Error failure.Message
+    | Executed(Succeeded outcome)
+    | Executed(PartiallySucceeded(outcome, _)) ->
+        // The host keeps NextCursor and passes it back to load the next page.
+        return Ok(outcome.Value.Revisions, outcome.Value.NextCursor)
+}
+
+let changedPaths (history: IHistory) (repository: Repository) (revision: RevisionId) (context: OperationContext) = async {
+    let! call = history.GetRevisionChanges repository revision context
+
+    match call with
+    | NoOp reason -> return Error reason
+    | Executed(Failed failure) -> return Error failure.Message
+    | Executed(Succeeded outcome)
+    | Executed(PartiallySucceeded(outcome, _)) ->
+        return Ok(outcome.Value.Entries |> Array.map (fun entry -> RepositoryPath.value entry.Path))
+}
+```
+
 ## Saving work
 
 Paths are exact repository-relative keys. `RepositoryPath.tryCreate` rejects an empty
@@ -858,10 +1024,11 @@ type SaveResult = {
 }
 
 let saveSelected
-    (session: WorkspaceSession)
+    (provider: IVersionControl)
+    (repository: Repository)
     (selected: string[])
     (message: string)
-    (expectedWorkspaceVersion: string)
+    (expectedRepositoryVersion: string)
     (context: OperationContext)
     =
     async {
@@ -872,27 +1039,30 @@ let saveSelected
             let names = rejected |> Array.map fst |> String.concat ", "
             return Error $"These are not repository-relative paths: {names}"
         else
-            let! result =
-                session.Core.CreateRevision
+            let! call =
+                provider.CreateRevision
+                    repository
                     {
                         Message = message
                         Paths = parsed |> Array.choose (snd >> Result.toOption)
-                        ExpectedRepositoryVersion = expectedWorkspaceVersion
+                        ExpectedRepositoryVersion = expectedRepositoryVersion
                     }
                     context
 
-            match result with
-            | Succeeded outcome ->
+            match call with
+            | NoOp reason -> return Error reason
+
+            | Executed(Succeeded outcome) ->
                 match outcome.Effect with
                 | Unchanged _ ->
-                    // Nothing needed committing, and the workspace version has not moved.
-                    return Ok { Revision = None; RepositoryVersion = Some expectedWorkspaceVersion }
+                    // Nothing needed committing, and the repository version has not moved.
+                    return Ok { Revision = None; RepositoryVersion = Some expectedRepositoryVersion }
                 | Performed ->
                     // CreateRevision is an OperationResult<RevisionId>, so the new revision is
                     // outcome.Value. ResultingRevision is optional metadata that a conforming
                     // provider may leave as None, so do not read the revision out of it.
                     //
-                    // The commit moved the workspace version, and ResultingRepositoryVersion is
+                    // The commit moved the repository version, and ResultingRepositoryVersion is
                     // None on Git. None here means the host re-reads the status before the
                     // next mutation. It does not mean the version is unchanged.
                     return
@@ -901,7 +1071,7 @@ let saveSelected
                             RepositoryVersion = outcome.ResultingRepositoryVersion
                         }
 
-            | PartiallySucceeded(_, failure) ->
+            | Executed(PartiallySucceeded(_, failure)) ->
                 let recovery =
                     failure.RecoveryAction
                     |> Option.map (fun action -> action.Code)
@@ -909,10 +1079,10 @@ let saveSelected
 
                 return Error $"Partly saved ({failure.Code}). Recovery: {recovery}."
 
-            | Failed failure when failure.Category = Concurrency ->
+            | Executed(Failed failure) when failure.Category = Concurrency ->
                 return Error "The workspace moved. Refresh the status and try again."
 
-            | Failed failure -> return Error failure.Message
+            | Executed(Failed failure) -> return Error failure.Message
     }
 ```
 
@@ -929,29 +1099,36 @@ whose name contains an asterisk.
 is safe. Ask first, because the switch itself will not negotiate. Git runs a plain
 `git checkout`, so git refuses a switch that would overwrite local changes and the provider
 returns `checkout_failed`. `SwitchRefRequest` carries only the target ref and the expected
-workspace version, so there is no way to say "switch anyway". Deal with the paths first.
+repository version, so there is no way to say "switch anyway". Deal with the paths first.
 
 ```fsharp
-let switchRef (session: WorkspaceSession) (request: SwitchRefRequest) (context: OperationContext) = async {
-    let! preflight = session.Core.PreflightSwitchRef request context
+let switchRef
+    (provider: IVersionControl)
+    (repository: Repository)
+    (request: SwitchRefRequest)
+    (context: OperationContext)
+    = async {
+    let! preflight = provider.PreflightSwitchRef repository request context
 
     match preflight with
-    | Failed failure -> return Error failure.Message
-    | Succeeded outcome
-    | PartiallySucceeded(outcome, _) ->
+    | NoOp reason -> return Error reason
+    | Executed(Failed failure) -> return Error failure.Message
+    | Executed(Succeeded outcome)
+    | Executed(PartiallySucceeded(outcome, _)) ->
         if not outcome.Value.IsSafe then
             // PathsAtRisk names the files that block the switch. The host commits them with
             // CreateRevision or throws them away with RestorePaths. Either one moves the
-            // workspace version, so re-read the status and build a fresh request. Resending
+            // repository version, so re-read the status and build a fresh request. Resending
             // this one fails. There is no flag that forces the switch.
             return Error(sprintf "%d paths block the switch" outcome.Value.PathsAtRisk.Length)
         else
-            let! switched = session.Core.SwitchRef request context
+            let! switched = provider.SwitchRef repository request context
 
             match switched with
-            | Succeeded outcome
-            | PartiallySucceeded(outcome, _) -> return Ok outcome.Value
-            | Failed failure -> return Error failure.Message
+            | NoOp reason -> return Error reason
+            | Executed(Succeeded outcome)
+            | Executed(PartiallySucceeded(outcome, _)) -> return Ok outcome.Value
+            | Executed(Failed failure) -> return Error failure.Message
 }
 ```
 
@@ -963,15 +1140,15 @@ refused, and it names the files to deal with first.
 `request.TargetRef` is a `ProviderRef`, and the place to get one is the `ProviderRef` field
 of a `LogicalRef` that `ListRefs` returned. It is opaque, so pass it back unchanged.
 
-The rest of `Core` follows the same shape. `ListRefs` and `CreateRef` cover the branch
+The other ref and status functions follow the same shape. `ListRefs` and `CreateRef` cover the branch
 list and branch creation, `RestorePaths` throws away local changes on exact paths, and
 `GetDiffSummary` gives per-path entries whose line counts are optional because an
 object-oriented provider cannot always compute them.
 
 ## Synchronizing
 
-`Synchronization` is optional, so a provider that has no remote leaves it absent. The
-service separates observing from mutating. `Refresh` observes the target and changes no
+A provider that has no remote has no `Synchronization` functions, and they answer `NoOp`. The
+group separates observing from mutating. `Refresh` observes the target and changes no
 workspace content. `PreviewUpdate` reports what an update would change. `Update` and
 `Publish` are the two mutations, and `Synchronize` runs a refresh, the update the
 workspace needs, and the publish of its revisions as one operation under the provider's
@@ -998,8 +1175,9 @@ clone or a custom refspec, the publish writes the upstream but it does not resol
 
 ```fsharp
 let synchronize
-    (session: WorkspaceSession)
-    (expectedWorkspaceVersion: string)
+    (provider: IVersionControl)
+    (repository: Repository)
+    (expectedRepositoryVersion: string)
     // The target the user was looking at when they decided. A target that moved since then
     // fails before anything mutates. It is required when acceptedConflictSession is true.
     (observedTarget: RevisionId option)
@@ -1010,50 +1188,49 @@ let synchronize
     (context: OperationContext)
     =
     async {
-        match session.Synchronization with
-        | None -> return Error "This provider has no synchronization service."
-        | Some synchronization ->
-            let! result =
-                synchronization.Synchronize
-                    {
-                        ExpectedRepositoryVersion = expectedWorkspaceVersion
-                        ExpectedTargetRevision = observedTarget
-                        AcceptUpdateRisks = acceptedConflictSession
-                        // Leave this true and let publish_target_missing tell you there is
-                        // nowhere to publish. Git publishes through origin when the branch has
-                        // no upstream, so a missing TargetRef does not mean publishing fails.
-                        PublishLocalRevisions = publishLocalRevisions
-                    }
-                    context
+        let! call =
+            provider.Synchronization.Synchronize
+                repository
+                {
+                    ExpectedRepositoryVersion = expectedRepositoryVersion
+                    ExpectedTargetRevision = observedTarget
+                    AcceptUpdateRisks = acceptedConflictSession
+                    // Leave this true and let publish_target_missing tell you there is
+                    // nowhere to publish. Git publishes through origin when the branch has
+                    // no upstream, so a missing TargetRef does not mean publishing fails.
+                    PublishLocalRevisions = publishLocalRevisions
+                }
+                context
 
-            match result with
-            | Succeeded outcome -> return Ok outcome.Value
-            | PartiallySucceeded(outcome, failure) ->
-                // A partial result is not a success. The recovery says what is left to do, and
-                // Publication says where the revisions are.
-                let recovery =
-                    failure.RecoveryAction
-                    |> Option.map (fun action -> action.Code)
-                    |> Option.defaultValue "none"
+        match call with
+        | NoOp reason -> return Error reason
+        | Executed(Succeeded outcome) -> return Ok outcome.Value
+        | Executed(PartiallySucceeded(outcome, failure)) ->
+            // A partial result is not a success. The recovery says what is left to do, and
+            // Publication says where the revisions are.
+            let recovery =
+                failure.RecoveryAction
+                |> Option.map (fun action -> action.Code)
+                |> Option.defaultValue "none"
 
-                match recovery, outcome.Publication with
-                | "retry_publish", Published ->
-                    return Error $"Published, but the branch does not track its remote branch yet ({failure.Code})."
-                | "retry_publish", _ ->
-                    return Error $"Updated, but not published ({failure.Code})."
-                | _ -> return Error $"Synchronization partially succeeded ({failure.Code}). Recovery: {recovery}."
-            | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldOverwriteLocalChanges ->
-                // AcceptUpdateRisks does not override this one. The user saves or discards
-                // the paths in AffectedPaths first.
-                return Error "Save or discard your changes to these files first."
-            | Failed failure when failure.Code = SynchronizationCodes.UpdateWouldCreateConflictSession ->
-                // Show the preview, then call again with acceptedConflictSession true and the
-                // target revision the failure reported in RevisionEvidence.
-                return Error "This update opens a conflict session. Ask the user to accept."
-            | Failed failure when failure.Code = "publish_target_missing" ->
-                // Nowhere to publish. Offer Bind to give the workspace a target.
-                return Error "This workspace has no publication target yet."
-            | Failed failure -> return Error failure.Message
+            match recovery, outcome.Publication with
+            | "retry_publish", Published ->
+                return Error $"Published, but the branch does not track its remote branch yet ({failure.Code})."
+            | "retry_publish", _ ->
+                return Error $"Updated, but not published ({failure.Code})."
+            | _ -> return Error $"Synchronization partially succeeded ({failure.Code}). Recovery: {recovery}."
+        | Executed(Failed failure) when failure.Code = SynchronizationCodes.UpdateWouldOverwriteLocalChanges ->
+            // AcceptUpdateRisks does not override this one. The user saves or discards
+            // the paths in AffectedPaths first.
+            return Error "Save or discard your changes to these files first."
+        | Executed(Failed failure) when failure.Code = SynchronizationCodes.UpdateWouldCreateConflictSession ->
+            // Show the preview, then call again with acceptedConflictSession true and the
+            // target revision the failure reported in RevisionEvidence.
+            return Error "This update opens a conflict session. Ask the user to accept."
+        | Executed(Failed failure) when failure.Code = "publish_target_missing" ->
+            // Nowhere to publish. Offer Bind to give the workspace a target.
+            return Error "This workspace has no publication target yet."
+        | Executed(Failed failure) -> return Error failure.Message
     }
 ```
 
@@ -1087,39 +1264,39 @@ Resolution is one path at a time, and each success rotates the handle:
 
 ```fsharp
 let resolvePath
-    (session: WorkspaceSession)
+    (provider: IVersionControl)
+    (repository: Repository)
     (handle: ConflictSessionHandle)
-    (expectedWorkspaceVersion: string)
+    (expectedRepositoryVersion: string)
     (path: RepositoryPath)
     (choice: ConflictResolution)
     (context: OperationContext)
     =
     async {
-        match session.ConflictResolution with
-        | None -> return Error "This provider has no conflict resolution service."
-        | Some conflicts ->
-            let! result =
-                conflicts.Resolve
-                    {
-                        Handle = handle
-                        ExpectedRepositoryVersion = expectedWorkspaceVersion
-                        Path = path
-                        Resolution = choice
-                    }
-                    context
+        let! call =
+            provider.ConflictResolution.Resolve
+                repository
+                {
+                    Handle = handle
+                    ExpectedRepositoryVersion = expectedRepositoryVersion
+                    Path = path
+                    Resolution = choice
+                }
+                context
 
-            match result with
-            | Succeeded outcome
-            | PartiallySucceeded(outcome, _) ->
-                // Keep RefreshedHandle. The one you passed in is now stale, so replaying an
-                // earlier choice fails. Nothing is redone silently.
-                return Ok(outcome.Value.RefreshedHandle, outcome.Value.RemainingItems)
-            | Failed failure -> return Error failure.Message
+        match call with
+        | NoOp reason -> return Error reason
+        | Executed(Succeeded outcome)
+        | Executed(PartiallySucceeded(outcome, _)) ->
+            // Keep RefreshedHandle. The one you passed in is now stale, so replaying an
+            // earlier choice fails. Nothing is redone silently.
+            return Ok(outcome.Value.RefreshedHandle, outcome.Value.RemainingItems)
+        | Executed(Failed failure) -> return Error failure.Message
     }
 ```
 
 `ConflictSessionHandle.Version` rotates after every successful nonterminal resolution and
-has a different lifetime from the workspace version, so carry both and never collapse
+has a different lifetime from the repository version, so carry both and never collapse
 them into one field. A stale, foreign, or closed handle is rejected before any provider
 state changes, with category `Concurrency`, code `precondition_failed`, and the
 `refresh_conflict_session` recovery. That recovery means: call `GetActiveSession` again
@@ -1172,7 +1349,7 @@ canceled operation comes back as a `Canceled` failure that describes what the
 cancellation left behind:
 
 ```fsharp
-| Failed failure when failure.Category = Canceled ->
+| Executed(Failed failure) when failure.Category = Canceled ->
     let recovery =
         failure.RecoveryAction
         |> Option.map (fun action -> action.Code)
@@ -1189,7 +1366,7 @@ and a host needs a path for it. The recovery codes a Git update can report are l
 
 The large-object download of an Update or a Synchronize (with `versioncontrolservice.lfs.materializelargeobjects` on) is `git lfs fetch` followed by `git lfs checkout`. A cancel kills only the fetch, and no checkout starts. The checkout is local and holds the index lock while it runs, so the provider never kills it. A cancel that arrives during the checkout takes effect when the checkout ends, and the call reports the work that finished, which is `Succeeded` when every file is checked out. A canceled fetch returns `PartiallySucceeded` with category `Canceled`, code `hydration_failed` and the recovery `retry_materialization`. A fetch that fails without a cancel, for example because the server lost one object, still runs the checkout, so the files whose objects arrived are checked out, and the result is the failure of the fetch. The provider never deletes a lock file. When the checkout fails and an `index.lock` exists, or when Git names the lock in its failure text, the partial result reports `remove_index_lock` instead. A failed fetch keeps `retry_materialization`, because the fetch takes no lock. With a held lock, git-lfs writes the files, prints `Error updating the Git index:` without Git's lock message and still exits with 0. The provider reads that text from the checkout and treats the run as a failed checkout. Every `git lfs checkout` of the provider runs to its end, because it holds the index lock. Besides the checkout of the download, these are the checkouts of `Materialize`, of the unmark in `StoragePolicy.SetPathPolicy`, of the local materialization of a picked conflict object and of `RestorePaths`. A cancel never kills a running checkout. `Materialize`, the unmark, the pick and `RestorePaths` look for the lock file through `git rev-parse --git-path index.lock` after the index error. When it exists, the unmark fails with `index_locked`, `Materialize` gets the recovery `remove_index_lock` on its failure, and the pick and `RestorePaths` return `PartiallySucceeded` with that recovery. Without a lock file the failure is plain. The unmark fails with `object_materialization_failed` and the text of git-lfs. A `Materialize` that changed at least one path returns `PartiallySucceeded` with `retry_materialization`, and one that changed no path returns `Failed` with no recovery action. The pick and `RestorePaths` keep `retry_materialization`. Git-lfs wrote the files in each case, so these failures have `StateChanged` set to `true`. Remove the lock once no git process runs, then retry the download. The retry finds the files with their content but with index entries that still hold the stat data of the pointers, so `git status` lists them as modified. `Materialize` repairs such an entry with `git add` when the file is a regular file with the size and the SHA-256 of its object and the entry has no staged change. The attributes must also still register the path with the lfs filter. The `git add` stages nothing, because the clean filter reproduces the committed pointer for that content (the file's content hashes to the pointer's object and the attributes route the path through the lfs filter). The repair changes the index, so the path counts as changed. `Materialize` lists the path in `AffectedPaths`, and the progress report of the path says the file is materialized. A held lock fails the repair with the lock failure, and any other modified file keeps the local-changes failure.
 
-The failures and recoveries of object materialization have the codes of the `ObjectMaterializationCodes` module, and a provider that supplies `ObjectMaterialization` uses them. The local-changes failure of `Materialize` and `Dematerialize` has the code `local_changes` (`ObjectMaterializationCodes.LocalChanges`) and the category `ProviderError`. It covers a path with local changes, for example an edited file. A call returns `local_changes` when every failed path was refused for local changes. The result is `Failed` when no path changed and `PartiallySucceeded` otherwise, with the failed paths in `AffectedPaths` and one `<path>: <message>` line per failed path in `Details`. A call with several paths and any other failed path has `batch_materialization_incomplete` (`BatchMaterializationIncomplete`) for `Materialize` and `batch_dematerialization_incomplete` (`BatchDematerializationIncomplete`) for `Dematerialize`. A call with one path fails with that path's own code and message, for example `lfs_backup_retained` when Git kept a backup file. A partial success has the recovery `retry_materialization` (`RetryMaterializationRecovery`) or `retry_dematerialization` (`RetryDematerializationRecovery`). Decide by the code. The message can change. For a call with several paths it starts with how many paths failed and then gives the message of the first failure that is neither a cancellation nor a refusal for local changes.
+The failures and recoveries of object materialization have the codes of the `ObjectMaterializationCodes` module, and a provider that has the object materialization functions uses them. The local-changes failure of `Materialize` and `Dematerialize` has the code `local_changes` (`ObjectMaterializationCodes.LocalChanges`) and the category `ProviderError`. It covers a path with local changes, for example an edited file. A call returns `local_changes` when every failed path was refused for local changes. The result is `Failed` when no path changed and `PartiallySucceeded` otherwise, with the failed paths in `AffectedPaths` and one `<path>: <message>` line per failed path in `Details`. A call with several paths and any other failed path has `batch_materialization_incomplete` (`BatchMaterializationIncomplete`) for `Materialize` and `batch_dematerialization_incomplete` (`BatchDematerializationIncomplete`) for `Dematerialize`. A call with one path fails with that path's own code and message, for example `lfs_backup_retained` when Git kept a backup file. A partial success has the recovery `retry_materialization` (`RetryMaterializationRecovery`) or `retry_dematerialization` (`RetryDematerializationRecovery`). Decide by the code. The message can change. For a call with several paths it starts with how many paths failed and then gives the message of the first failure that is neither a cancellation nor a refusal for local changes.
 
 The Git provider runs `git lfs ls-files -j` with no time limit, because that command prints nothing until it has listed every file. This applies to `ObjectMaterialization.ListObjects`, `Materialize` (including its download step) and `Dematerialize`. Each of them takes an `OperationContext`. Cancel the context to stop one that runs too long. The cancellation ends the git-lfs process and the operation returns a `Canceled` failure.
 
@@ -1232,7 +1409,7 @@ The lakeFS provider reports all six codes, each with a start event of this shape
 | --- | --- | --- |
 | `fetch` | Fetching online changes | the Refresh reads the target |
 | `merge` | Merging online changes | the update merges the target into the workspace branch |
-| `clone` | Preparing repository workspace | the clone creates the directory and the binding |
+| `clone` | Preparing repository workspace | the clone creates the directory and its provider state |
 | `download-objects` | Downloading objects | the first object of a batch downloads |
 | `upload-objects` | Uploading objects | the first object of a batch uploads |
 | `publish` | Publishing workspace revisions | the publish merges the workspace branch into the target |
@@ -1245,9 +1422,10 @@ files, reports no `download-objects`, and a selected revision that only deletes 
 open of a workspace form one batch each. The uploads of a selected revision and the uploads of the
 resolutions of a conflict session do the same.
 
-The lakeFS clone only provisions the directory and the binding. It reports `clone` and downloads nothing.
-Opening the binding creates the workspace branch and downloads the objects, so the `download-objects` event of
-a fresh workspace arrives with the `Open` call and no second `clone` event follows.
+The lakeFS clone provisions the directory and its provider state, and then runs the first open of the folder.
+It reports `clone` first. The first open creates the workspace branch and downloads the objects, so the
+`download-objects` event of a fresh workspace arrives with the `Clone` call. A later `Open` of the folder
+reports no step.
 
 A step start and a meter differ. The start announces an activity and carries the message that names it. A
 meter measures a transfer and carries numbers, and its message describes the measurement. Meters keep the
@@ -1458,7 +1636,7 @@ The Git provider shells out to the real tools on top of that. It requires Git 2.
 `merge-tree --write-tree` needs Git 2.38, and Git LFS 3.7 reads the index in `git lfs checkout`
 only with Git 2.42 or newer. With older Git it reads the HEAD tree, so a picked LFS conflict
 candidate stays a pointer. Git LFS 3.7 or newer is optional, and without it
-the object materialization, storage policy and maintenance services report their own
+the object materialization, storage policy and maintenance functions report their own
 dependency status while core Git work carries on. `CheckDependencies` reports all of that at
 runtime, which is why it is worth calling before the user gets far. lakeFS needs no local
 tool and talks to its server over HTTP.
@@ -1476,8 +1654,8 @@ folders then wins over `/usr/bin/git`.
 Two files in this repository are worth copying from.
 `tests/VersionControlService.PackageConsumer/Program.fs` is the smallest composition root
 that builds against the packed packages, and `samples/ExternalProvider/Provider.fs` is a
-compiling core-only provider.
+compiling read-only provider built from a function list.
 
 Related reading: [provider authoring](provider-authoring.md) for the revision path policy
-a host hands to a factory (`RevisionPolicyStrategy`) and for the storage settings reseed
+a host hands to a provider (`RevisionPolicyStrategy`) and for the storage settings reseed
 recipe.
