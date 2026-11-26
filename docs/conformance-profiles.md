@@ -11,7 +11,7 @@ The shared Vitest profiles exercise behavior through `ProviderFactory` and `Work
 | Conflict | rotating handles, candidate and supplied-content resolution, finalize/cancel, and destination races |
 | Provisioning | access verification, initialize, clone, bind, destination rules, and dependency reporting |
 | Operational | progress, cancellation, independent sessions, interrupted-mutation cleanup, and redaction |
-| Optional services | advertised services, diff content, materialization, storage policy, maintenance, and browser URLs |
+| Optional services | advertised services, diff content, materialization, storage policy, maintenance, browser URLs, and history |
 | Consumer workflow | selected save, pending publish, update/conflict flow, branch creation, discard, and optional controls |
 | Step events | one start event for each common step that a refresh, a synchronize or a clone runs, with no numbers and a redacted message that names the step, and no event for a step that did not run |
 | Output | a command entry with its own id for each external call, follow-up entries that share the id of their command and come after it, and redaction of every entry, including against the secrets of the harness |

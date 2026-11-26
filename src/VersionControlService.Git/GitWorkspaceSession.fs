@@ -12,6 +12,7 @@ module GitConflictSession = VersionControlService.Git.GitConflictSession
 module GitLfsObjects = VersionControlService.Git.GitLfsObjects
 module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module GitExecution = VersionControlService.Git.GitExecution
+module GitHistory = VersionControlService.Git.GitHistory
 module GitInternals = VersionControlService.Git.GitInternals
 module GitLfsExtensions = VersionControlService.Git.GitLfsExtensions
 module GitProvisioningService = VersionControlService.Git.GitProvisioningService
@@ -76,16 +77,6 @@ let private startDeadline (milliseconds: int) (onTimeout: unit -> unit) : unit -
 let private gitProviderId =
     match ProviderId.tryCreate "git" with
     | Ok providerId -> providerId
-    | Error message -> failwith message
-
-let private mkRevisionId (value: string) =
-    match RevisionId.tryCreate value with
-    | Ok revisionId -> revisionId
-    | Error message -> failwith message
-
-let private mkProviderRef (value: string) =
-    match ProviderRef.tryCreate value with
-    | Ok reference -> reference
     | Error message -> failwith message
 
 let private categoryOfKind (kind: GitFailureKind) =
@@ -1130,7 +1121,7 @@ let private tryConfiguredUpstream (state: SessionState) (context: OperationConte
                         RevisionRef = revisionRef
                         LogicalRef = {
                             Name = name
-                            ProviderRef = mkProviderRef $"git-remote:{name}"
+                            ProviderRef = GitInternals.mkProviderRef $"git-remote:{name}"
                             Kind = RemoteRef
                             IsCurrent = false
                         }
@@ -1142,7 +1133,7 @@ let private tryConfiguredUpstream (state: SessionState) (context: OperationConte
                         RevisionRef = revisionRef
                         LogicalRef = {
                             Name = name
-                            ProviderRef = mkProviderRef $"git-local:{name}"
+                            ProviderRef = GitInternals.mkProviderRef $"git-local:{name}"
                             Kind = LocalRef
                             IsCurrent = false
                         }
@@ -1584,7 +1575,7 @@ let private toWorkspaceStatus
 
         let workspaceRevision =
             match headRevision with
-            | Ok output when output.ExitCode = 0 -> Some(mkRevisionId (output.StdOut.Trim()))
+            | Ok output when output.ExitCode = 0 -> Some(GitInternals.mkRevisionId (output.StdOut.Trim()))
             | _ -> None
 
         let! upstreamResult = tryConfiguredUpstream state context
@@ -1602,7 +1593,7 @@ let private toWorkspaceStatus
 
         let targetRevision =
             match targetRevisionOutput with
-            | Ok output when output.ExitCode = 0 -> Some(mkRevisionId (output.StdOut.Trim()))
+            | Ok output when output.ExitCode = 0 -> Some(GitInternals.mkRevisionId (output.StdOut.Trim()))
             | _ -> None
 
         let relationship =
@@ -1624,7 +1615,7 @@ let private toWorkspaceStatus
                         |> Option.filter (fun current -> current <> "HEAD")
                         |> Option.map (fun current -> {
                             Name = current
-                            ProviderRef = mkProviderRef $"git-local:{current}"
+                            ProviderRef = GitInternals.mkProviderRef $"git-local:{current}"
                             Kind = LocalRef
                             IsCurrent = true
                         })
@@ -2206,7 +2197,7 @@ let private getMergeConflictSummary (state: SessionState) (context: OperationCon
                         (fun path -> readConflictCombinedPreview state path context)
                         (fun stage path ->
                             readConflictStagePointer state stageMemo (Result.toOption mediaDirectoryResult) stage path context)
-                        (Some(mkRevisionId mergeHeadValue))
+                        (Some(GitInternals.mkRevisionId mergeHeadValue))
                         unmergedPaths
 
                 match itemsResult with
@@ -2687,8 +2678,8 @@ let private listRefs (state: SessionState) (context: OperationContext) =
                     Name = branch.RefName
                     ProviderRef =
                         match branch.Kind with
-                        | GitBranchRefKind.Local -> mkProviderRef $"git-local:{branch.RefName}"
-                        | GitBranchRefKind.Remote -> mkProviderRef $"git-remote:{branch.RefName}"
+                        | GitBranchRefKind.Local -> GitInternals.mkProviderRef $"git-local:{branch.RefName}"
+                        | GitBranchRefKind.Remote -> GitInternals.mkProviderRef $"git-remote:{branch.RefName}"
                     Kind =
                         match branch.Kind with
                         | GitBranchRefKind.Local -> LocalRef
@@ -2725,7 +2716,7 @@ let private createRef (state: SessionState) (request: CreateRefRequest) (context
                 return
                     OperationResult.succeeded {
                         Name = request.Name
-                        ProviderRef = mkProviderRef $"git-local:{request.Name}"
+                        ProviderRef = GitInternals.mkProviderRef $"git-local:{request.Name}"
                         Kind = LocalRef
                         IsCurrent = true
                     }
@@ -2744,7 +2735,7 @@ let private createRef (state: SessionState) (request: CreateRefRequest) (context
                 return
                     OperationResult.succeeded {
                         Name = request.Name
-                        ProviderRef = mkProviderRef $"git-local:{request.Name}"
+                        ProviderRef = GitInternals.mkProviderRef $"git-local:{request.Name}"
                         Kind = LocalRef
                         IsCurrent = false
                     }
@@ -3551,9 +3542,9 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                 else
                     return
                         Ok {
-                            BaseRevision = baseRevision |> Option.map mkRevisionId
-                            WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                            TargetRevision = targetRevision |> Option.map mkRevisionId
+                            BaseRevision = baseRevision |> Option.map GitInternals.mkRevisionId
+                            WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                            TargetRevision = targetRevision |> Option.map GitInternals.mkRevisionId
                             TargetRef = upstream |> Option.map _.LogicalRef
                             LocalRevisionCount = None
                             TargetRevisionCount = None
@@ -4542,7 +4533,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                         RecoveryAction = Some refreshBeforePublishRecovery
                                                         RevisionEvidence =
                                                             observedTarget
-                                                            |> Option.map (fun observed -> [| "observed_target", mkRevisionId observed |])
+                                                            |> Option.map (fun observed -> [| "observed_target", GitInternals.mkRevisionId observed |])
                                                             |> Option.defaultValue [||]
                                                 }
                                         }
@@ -4766,15 +4757,15 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                             let targetEvidence verifiedRevision = [|
                                 yield!
                                     observedTarget
-                                    |> Option.map (fun revision -> "previous_target", mkRevisionId revision)
+                                    |> Option.map (fun revision -> "previous_target", GitInternals.mkRevisionId revision)
                                     |> Option.toList
                                 yield!
                                     observedTarget
-                                    |> Option.map (fun revision -> "expected_target", mkRevisionId revision)
+                                    |> Option.map (fun revision -> "expected_target", GitInternals.mkRevisionId revision)
                                     |> Option.toList
                                 yield!
                                     verifiedRevision
-                                    |> Option.map (fun revision -> "observed_target", mkRevisionId revision)
+                                    |> Option.map (fun revision -> "observed_target", GitInternals.mkRevisionId revision)
                                     |> Option.toList
                             |]
 
@@ -4782,7 +4773,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                 yield! targetEvidence verifiedRevision
                                 yield!
                                     workspaceRevision
-                                    |> Option.map (fun revision -> "published_revision", mkRevisionId revision)
+                                    |> Option.map (fun revision -> "published_revision", GitInternals.mkRevisionId revision)
                                     |> Option.toList
                             |]
 
@@ -4819,8 +4810,8 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 
                             let fallbackState verifiedRevision relationship = {
                                 BaseRevision = None
-                                WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                                TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                TargetRevision = verifiedRevision |> Option.map GitInternals.mkRevisionId
                                 TargetRef = None
                                 LocalRevisionCount = None
                                 TargetRevisionCount = None
@@ -4881,9 +4872,9 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         | Ok syncState when publishedRefIsSynchronizationTarget syncState remoteName branch ->
                                             {
                                                 syncState with
-                                                    BaseRevision = workspaceRevision |> Option.map mkRevisionId
-                                                    WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                                                    TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                                    BaseRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                                    WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                                    TargetRevision = verifiedRevision |> Option.map GitInternals.mkRevisionId
                                                     RemoteChangedPaths = None
                                                     Relationship = UpToDate
                                             },
@@ -4915,7 +4906,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                 OperationOutcome.performed exactState with
                                                     AffectedPaths = affectedPaths
                                                     Publication = Published
-                                                    ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                                    ResultingRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
                                             }
                                             {
                                                 failureWithEvidence with
@@ -4973,9 +4964,9 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         if publishedRefIsSynchronizationTarget syncState remoteName branch then
                                             {
                                                 syncState with
-                                                    BaseRevision = workspaceRevision |> Option.map mkRevisionId
-                                                    WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
-                                                    TargetRevision = verifiedRevision |> Option.map mkRevisionId
+                                                    BaseRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                                    WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                                    TargetRevision = verifiedRevision |> Option.map GitInternals.mkRevisionId
                                                     RemoteChangedPaths = None
                                                     Relationship = UpToDate
                                             }
@@ -4986,7 +4977,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         OperationOutcome.performed resultingState with
                                             AffectedPaths = affectedPaths
                                             Publication = Published
-                                            ResultingRevision = workspaceRevision |> Option.map mkRevisionId
+                                            ResultingRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
                                     }
 
                                     match trackingFailure with
@@ -5121,7 +5112,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                 StateChanged = true
                                                 Retryable = true
                                                 RecoveryAction = Some refreshBeforePublishRecovery
-                                                RevisionEvidence = [| "observed_target", mkRevisionId observed |]
+                                                RevisionEvidence = [| "observed_target", GitInternals.mkRevisionId observed |]
                                         }
                 }
 
@@ -5141,7 +5132,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                         |> Option.toList
                                     yield!
                                         observedTarget
-                                        |> Option.map (fun observed -> "observed_target", mkRevisionId observed)
+                                        |> Option.map (fun observed -> "observed_target", GitInternals.mkRevisionId observed)
                                         |> Option.toList
                                 |]
                         }
@@ -5350,7 +5341,7 @@ let private cleanupCommittedConflict
             | Some failure -> return Failed failure
             | None ->
                 state.ConflictSession <- None
-                return OperationResult.succeeded (Some(mkRevisionId committedRevision))
+                return OperationResult.succeeded (Some(GitInternals.mkRevisionId committedRevision))
     }
 
 let private withSerializedConflictMutation
@@ -6079,11 +6070,11 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                                     "precondition_failed"
                                                                                     "The destination advanced between the finalize pre-check and verification." with
                                                                                     RevisionEvidence = [|
-                                                                                        "expected_destination", mkRevisionId expectedHeadValue
+                                                                                        "expected_destination", GitInternals.mkRevisionId expectedHeadValue
                                                                                         yield!
                                                                                             observedHead
                                                                                             |> Option.map (fun value ->
-                                                                                                "observed_destination", mkRevisionId value)
+                                                                                                "observed_destination", GitInternals.mkRevisionId value)
                                                                                             |> Option.toList
                                                                                     |]
                                                                                     RecoveryAction =
@@ -6365,6 +6356,14 @@ let private createSessionWithTextDiff
                         state.ConnectionProfileId
                 )
             RepositoryBrowser = Some(createBrowser state)
+            History =
+                Some(
+                    GitHistory.create
+                        (fun arguments environment context ->
+                            runGitEnv state.Hooks state.RepoPath arguments None environment context)
+                        checkGitExit
+                        parseNameStatusZ
+                )
     }
 
 let createSessionWithCredentialsIdentityAndPolicy

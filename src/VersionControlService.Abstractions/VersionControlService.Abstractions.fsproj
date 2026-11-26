@@ -19,6 +19,7 @@
     <Compile Include="StoragePolicy.fs" />
     <Compile Include="StorageMaintenance.fs" />
     <Compile Include="RepositoryBrowser.fs" />
+    <Compile Include="History.fs" />
     <Compile Include="Providers.fs" />
     <Compile Include="ProviderResolution.fs" />
   </ItemGroup>

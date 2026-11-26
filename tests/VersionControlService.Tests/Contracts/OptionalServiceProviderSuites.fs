@@ -143,6 +143,33 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     let! urlResult = run (browser.GetRepositoryWebUrl(ctx "web-url"))
                     expectValue "repository web url" urlResult |> ignore
                 }
+
+            if harness.ExpectedServices |> List.contains "history" then
+                profileTest "history starts at the current revision and lists its changes"
+                <| fun () -> promise {
+                    let! workspace = harness.CreateWorkspace()
+
+                    let history =
+                        match workspace.Session.History with
+                        | Some service -> service
+                        | None -> failwith "The harness advertises history but the session lacks it."
+
+                    let! status = getStatus workspace
+
+                    let current =
+                        match status.Synchronization |> Option.bind _.WorkspaceRevision with
+                        | Some revision -> revision
+                        | None -> failwith "Expected the workspace to report its current revision."
+
+                    let! pageResult = run (history.ListRevisions { Cursor = None; Limit = 10 } (ctx "list-revisions"))
+                    let page = expectValue "list revisions" pageResult
+                    Vitest.expect(page.Revisions.Length > 0).toBe (true)
+                    Vitest.expect(page.Revisions[0].Id = current).toBe (true)
+
+                    let! changesResult = run (history.GetRevisionChanges current (ctx "revision-changes"))
+                    let changes = expectValue "get revision changes" changesResult
+                    Vitest.expect(changes.Entries.Length > 0).toBe (true)
+                }
     )
 
     // Vitest defers describe callbacks to the collection phase, so expose the

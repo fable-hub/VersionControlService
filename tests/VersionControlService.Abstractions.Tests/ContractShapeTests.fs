@@ -219,6 +219,11 @@ module FakeProvider =
         GetRepositoryWebUrl = fun _ -> async { return OperationResult.succeeded None }
     }
 
+    let createHistory () : HistoryService = {
+        ListRevisions = fun _ _ -> async { return unsupported "ListRevisions" }
+        GetRevisionChanges = fun _ _ -> async { return unsupported "GetRevisionChanges" }
+    }
+
     let createBinding (id: ProviderId) (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = id
@@ -307,6 +312,8 @@ let private discoverFeatures (session: WorkspaceSession) = [
         "maintenance"
     if session.RepositoryBrowser.IsSome then
         "browser"
+    if session.History.IsSome then
+        "history"
 ]
 
 let private openSession (factory: ProviderFactory) =
@@ -495,6 +502,7 @@ let contractShapeTests =
                 StoragePolicy = false
                 Maintenance = false
                 RepositoryBrowser = false
+                History = false
             }
             let twoAvailable = { noneAvailable with ConflictResolution = true; RepositoryBrowser = true }
 
@@ -515,4 +523,12 @@ let contractShapeTests =
             Expect.isTrue
                 (WorkspaceSession.availability withObjects).ObjectMaterialization
                 "A supplied object materialization service is reported."
+
+        testCase "availability reports the history service only when the provider supplies it"
+        <| fun () ->
+            let coreOnly = WorkspaceSession.createCoreOnly availabilityDescriptor (FakeProvider.createCore ())
+            let withHistory = { coreOnly with History = Some(FakeProvider.createHistory ()) }
+
+            Expect.isFalse (WorkspaceSession.availability coreOnly).History "A core-only session has no history."
+            Expect.isTrue (WorkspaceSession.availability withHistory).History "A supplied history service is reported."
     ]

@@ -403,6 +403,7 @@ let createGitHarness () : ProviderTestHarness =
             "storage-policy"
             "maintenance"
             "browser"
+            "history"
         ]
         CreateLocation =
             fun () -> promise {

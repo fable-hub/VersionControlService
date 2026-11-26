@@ -17,6 +17,7 @@ type WorkspaceSession = {
     StoragePolicy: StoragePolicyService option
     Maintenance: StorageMaintenanceService option
     RepositoryBrowser: RepositoryBrowserService option
+    History: HistoryService option
     /// Releases session-owned resources (locks, clients, caches).
     Close: unit -> Async<unit>
 }
@@ -30,6 +31,7 @@ type ServiceAvailability = {
     StoragePolicy: bool
     Maintenance: bool
     RepositoryBrowser: bool
+    History: bool
 }
 
 module WorkspaceSession =
@@ -43,6 +45,7 @@ module WorkspaceSession =
         StoragePolicy = session.StoragePolicy.IsSome
         Maintenance = session.Maintenance.IsSome
         RepositoryBrowser = session.RepositoryBrowser.IsSome
+        History = session.History.IsSome
     }
 
     /// A core-only session: every optional service absent. Providers add the
@@ -57,6 +60,7 @@ module WorkspaceSession =
         StoragePolicy = None
         Maintenance = None
         RepositoryBrowser = None
+        History = None
         Close = fun () -> async.Return()
     }
 

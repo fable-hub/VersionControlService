@@ -383,6 +383,7 @@ Vitest.describe (
                     StoragePolicy = false
                     Maintenance = false
                     RepositoryBrowser = false
+                    History = false
                 }
 
                 Vitest.expect(availability).toEqual (expected)

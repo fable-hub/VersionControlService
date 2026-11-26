@@ -37,6 +37,7 @@
     <Compile Include="GitLfsExtensions.fs" />
     <Compile Include="GitSelectedRevision.fs" />
     <Compile Include="TextDiff\GitTextDiffService.fs" />
+    <Compile Include="GitHistory.fs" />
     <Compile Include="GitWorkspaceSession.fs" />
   </ItemGroup>
   <ItemGroup>

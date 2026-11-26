@@ -194,6 +194,8 @@ module SuiteHelpers =
                 "maintenance"
             if session.RepositoryBrowser.IsSome then
                 "browser"
+            if session.History.IsSome then
+                "history"
         ]
         |> List.sort
 

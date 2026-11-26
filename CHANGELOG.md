@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 -   `DiffComparison.Revision` compares the version in a revision with the version in its first parent. The comparison does not read the working tree. The Git provider accepts only a full object id as the revision.
+-   `HistoryService` is a new optional service. `ListRevisions` returns the revisions that lead to the current one, newest first, in pages, and `GetRevisionChanges` returns the objects that a revision changed against its first parent. The Git provider supplies it and lakeFS leaves it out. The new public types of the history are `ListRevisionsRequest`, `RevisionPage`, `RevisionEntry` and `RevisionSignature`. `ListRevisions` fails with the new code `invalid_cursor` for a malformed cursor, and `GetRevisionChanges` fails with the new code `revision_not_found` for a full object id that names no commit.
 
 ### Changed
 
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `OperationEffect.NoOp` is renamed to `OperationEffect.Unchanged`. Its `reason` field stays, and a match on `OperationEffect` has to use the new case name.
 -   `OperationOutcome.noOp` is renamed to `OperationOutcome.unchanged`. Its signature and behavior stay.
 -   `OperationResult.noOp` is renamed to `OperationResult.unchanged`. Its signature and behavior stay.
+-   `WorkspaceSession` and `ServiceAvailability` have a new field `History`, so record literals have to set it. `WorkspaceSession.createCoreOnly` sets it to `None`.
 -   `OpenDiffRequest` has a new required field `Comparison`, so record literals have to set it. `DiffComparison.WorkingFile` keeps the earlier behavior.
 -   A committed side of a text diff reports its revision in `DiffSourceInfo.Revision`, also when its content is a Git LFS object. Such a side used to report none.
 

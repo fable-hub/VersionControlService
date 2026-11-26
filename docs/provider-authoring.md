@@ -70,6 +70,7 @@ Optional services advertise real capability:
 | `StoragePolicy` | literal-path policy and host-facing settings |
 | `Maintenance` | prune and deduplicate local storage, and report whether deduplication can work |
 | `RepositoryBrowser` | a credential-free repository URL |
+| `History` | the revisions that lead to the current one, newest first, and the objects a revision changed against its first parent |
 
 Providers leave an unsupported service as `None`. Do not add a service whose methods are required stubs that always return `Unsupported`.
 
