@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `FallbackServiceCodes` and its `FallbackServiceCodes.ServiceUnavailable` code (`service_unavailable`) are removed, because only the stand-in services reported it.
 -   `DiffBlocker.ProviderUnsupported` is removed, because only the stand-in text diff service returned it. A match on `DiffBlocker` has to drop the case.
 
+### Fixed
+
+-   With `versioncontrolservice.lfs.materializelargeobjects` on, a Git `Update` or `Synchronize` that has nothing to merge but turns pointer files into their large content now reports the effect `Performed` and lists the downloaded paths in `AffectedPaths`. Before, it returned the effect `NoOp` (now `Unchanged`) and no path. This holds when the download fails after it wrote some files. An update that has no pointer left to download stays `Unchanged`.
+
 ## 0.5.0 - 2026-11-19
 
 ### Added

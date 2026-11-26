@@ -3907,8 +3907,35 @@ let private downloadLargeObjects
             | Error failure -> return! failedWith { failure with Code = "hydration_failed" } run.CheckoutFailed
     }
 
+/// The repository-relative paths of the large files whose working tree file is still a pointer.
+/// A failed listing gives None, so it never reads as "no pointer is left".
+let private readPointerPaths (state: SessionState) (context: OperationContext) : Async<Set<string> option> =
+    async {
+        // The listings are an internal measurement, so an update reports the same steps as before. A cancel
+        // does not stop them: the checkout before them runs to its end after a cancel, and its work is reported.
+        let silent =
+            { context with
+                ReportProgress = ignore
+                Cancellation = OperationCancellation.none }
+
+        let! listing = Async.AwaitPromise(GitLfsService.readLsFilesByRelativePath state.RepoPath silent)
+
+        return
+            match listing with
+            | Ok files ->
+                files
+                |> Seq.filter (fun file -> not file.Value.checkout)
+                |> Seq.map _.Key
+                |> Set.ofSeq
+                |> Some
+            | Error _ -> None
+    }
+
 /// Without anything to merge, an update still downloads the large objects of the checkout
 /// when the setting is on, so a workspace cloned or switched without them can be completed.
+/// When the download turns pointer files into their content, the outcome has the effect
+/// `Performed` and lists those paths in `AffectedPaths`, also when the download fails
+/// afterwards. A download that changes no file leaves the outcome as it was given.
 let private downloadLargeObjectsWithoutUpdate
     (state: SessionState)
     (outcome: OperationOutcome<SynchronizationState>)
@@ -3925,11 +3952,33 @@ let private downloadLargeObjectsWithoutUpdate
             | Error failure -> return Failed failure
             | Ok false -> return Succeeded outcome
             | Ok true ->
+                let! pointersBefore = readPointerPaths state context
                 let! downloaded = downloadLargeObjects state outcome.Value.TargetRef operation context
 
+                let! reported =
+                    match pointersBefore with
+                    | Some before when not before.IsEmpty ->
+                        async {
+                            let! pointersAfter = readPointerPaths state context
+
+                            let changed =
+                                match pointersAfter with
+                                | Some after -> Set.difference before after
+                                | None -> Set.empty
+
+                            return
+                                if changed.IsEmpty then
+                                    outcome
+                                else
+                                    { outcome with
+                                        Effect = Performed
+                                        AffectedPaths = Array.distinct (Array.append outcome.AffectedPaths (Set.toArray changed)) }
+                        }
+                    | _ -> async { return outcome }
+
                 match downloaded with
-                | Ok() -> return Succeeded outcome
-                | Error(failure, recovery) -> return OperationResult.partiallySucceeded outcome failure recovery
+                | Ok() -> return Succeeded reported
+                | Error(failure, recovery) -> return OperationResult.partiallySucceeded reported failure recovery
         | _ -> return Succeeded outcome
     }
 

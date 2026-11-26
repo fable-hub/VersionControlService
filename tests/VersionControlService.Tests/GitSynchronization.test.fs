@@ -5924,11 +5924,34 @@ Vitest.describe (
                     Vitest.expect((pointer = Some unhydratedLfsContent)).toBe false
 
                     let! _ = setMaterializeLargeObjects workPath true
-                    let! result = synchronizeWithoutPublish session "lfs-up-to-date-download"
-                    expectSucceeded "synchronize without anything to merge" result |> ignore
+                    let reports = ResizeArray<OperationProgress>()
+
+                    let! result =
+                        synchronizeWithoutPublishIn
+                            session
+                            (OperationContext.create "lfs-up-to-date-download" OperationCancellation.none reports.Add)
+
+                    Vitest.expect(reports |> Seq.exists (fun report -> report.PhaseCode = "lfs-list-transfer")).toBe false
+                    let outcome = expectSucceededOutcome "synchronize without anything to merge" result
+
+                    match outcome.Effect with
+                    | Performed -> ()
+                    | Unchanged _ -> failwith "Expected the download of large objects to be reported as Performed."
+
+                    Vitest.expect(outcome.AffectedPaths).toContain "large.bin"
 
                     let! content = tryReadUtf8FileAsync (join [| workPath; "large.bin" |])
                     Vitest.expect(content).toEqual (Some unhydratedLfsContent)
+
+                    // Nothing is left to download now, so the next synchronize changes nothing.
+                    let! secondResult = synchronizeWithoutPublish session "lfs-up-to-date-nothing-left"
+                    let secondOutcome = expectSucceededOutcome "synchronize with nothing left to download" secondResult
+
+                    match secondOutcome.Effect with
+                    | Unchanged _ -> ()
+                    | Performed -> failwith "Expected a synchronize without a pointer left to stay Unchanged."
+
+                    Vitest.expect(secondOutcome.AffectedPaths).toEqual [||]
                     do! removeDirectoryAsync root
                 with error ->
                     do! removeDirectoryAsync root
@@ -6098,7 +6121,13 @@ Vitest.describe (
                         (syncService session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context
                         |> Async.StartAsPromise
 
-                    expectSucceeded "update that is canceled during the checkout" updateResult |> ignore
+                    let outcome = expectSucceededOutcome "update that is canceled during the checkout" updateResult
+
+                    match outcome.Effect with
+                    | Performed -> ()
+                    | Unchanged _ -> failwith "Expected the finished checkout to be reported as Performed."
+
+                    Vitest.expect(outcome.AffectedPaths).toContain "large.bin"
                     Vitest.expect(source.IsCancellationRequested).toBe true
                     Vitest.expect(checkoutSawCancellation).toBe false
                     let! lockExists = pathExistsAsync (join [| workPath; ".git"; "index.lock" |])
@@ -6653,7 +6682,13 @@ Vitest.describe (
                     let! result = synchronizeWithoutPublish session "lfs-hydration-lost-object"
 
                     match result with
-                    | PartiallySucceeded(_, failure) ->
+                    | PartiallySucceeded(outcome, failure) ->
+                        // The file whose object arrived was written, so the partial result reports it.
+                        match outcome.Effect with
+                        | Performed -> ()
+                        | Unchanged _ -> failwith "Expected the written file to be reported as Performed."
+
+                        Vitest.expect(outcome.AffectedPaths).toEqual [| "a.bin" |]
                         Vitest.expect(failure.Code).toBe "hydration_failed"
                         Vitest.expect(failure.RecoveryAction |> Option.map _.Code).toEqual (Some "retry_materialization")
                     | Failed failure -> failwith $"Expected a partial result, received {failure.Code}."
