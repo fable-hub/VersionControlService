@@ -210,9 +210,9 @@ module FakeProvider =
                             WouldCreateConflictSession = false
                         }
                 }
-            Update = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
-            Publish = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
-            Synchronize = fun _ _ -> async { return OperationResult.noOp (Some "no target configured") state }
+            Update = fun _ _ -> async { return OperationResult.unchanged (Some "no target configured") state }
+            Publish = fun _ _ -> async { return OperationResult.unchanged (Some "no target configured") state }
+            Synchronize = fun _ _ -> async { return OperationResult.unchanged (Some "no target configured") state }
         }
 
     let createBrowser () : RepositoryBrowserService = {

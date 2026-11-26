@@ -123,7 +123,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(changePaths afterStatus).toEqual ([| "extra.txt" |])
             }
 
-            profileTest "selecting unchanged paths is a NoOp"
+            profileTest "selecting unchanged paths is Unchanged"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
                 let! status = getStatus workspace
@@ -136,10 +136,10 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Paths = [| mkPath "base.txt" |]
                                 ExpectedWorkspaceVersion = status.WorkspaceVersion
                             }
-                            (ctx "noop-revision")
+                            (ctx "unchanged-revision")
                     )
 
-                expectNoOp "unchanged selected revision" revisionResult |> ignore
+                expectUnchanged "unchanged selected revision" revisionResult |> ignore
             }
 
             profileTest "creates refs with explicit create-only and create-and-switch behavior"

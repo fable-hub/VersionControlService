@@ -115,7 +115,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             context
                     )
 
-                expectNoOp "synchronize of an up-to-date workspace" result |> ignore
+                expectUnchanged "synchronize of an up-to-date workspace" result |> ignore
                 expectStepStarts [| ProgressPhaseCodes.Refresh |] reports
             }
 

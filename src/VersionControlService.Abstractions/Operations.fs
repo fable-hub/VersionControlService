@@ -222,7 +222,7 @@ type OperationWarning = {
 /// Whether an operation changed provider state or was semantically unnecessary.
 type OperationEffect =
     | Performed
-    | NoOp of reason: string option
+    | Unchanged of reason: string option
 
 /// Whether the operation's result is visible on the configured publication target.
 type PublicationState =
@@ -289,9 +289,9 @@ module OperationOutcome =
         Publication = PublicationNotApplicable
     }
 
-    let noOp (reason: string option) (value: 'T) : OperationOutcome<'T> = {
+    let unchanged (reason: string option) (value: 'T) : OperationOutcome<'T> = {
         Value = value
-        Effect = NoOp reason
+        Effect = Unchanged reason
         Warnings = [||]
         AffectedPaths = [||]
         ResultingRevision = None
@@ -329,8 +329,8 @@ module OperationResult =
     let succeeded (value: 'T) : OperationResult<'T> =
         Succeeded(OperationOutcome.performed value)
 
-    let noOp (reason: string option) (value: 'T) : OperationResult<'T> =
-        Succeeded(OperationOutcome.noOp reason value)
+    let unchanged (reason: string option) (value: 'T) : OperationResult<'T> =
+        Succeeded(OperationOutcome.unchanged reason value)
 
     let failed (failure: OperationFailure) : OperationResult<'T> = Failed failure
 

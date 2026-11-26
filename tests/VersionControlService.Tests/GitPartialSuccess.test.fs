@@ -3952,7 +3952,7 @@ Vitest.describe (
                         let! result =
                             batch.Materialize
                                 ([| "data/a.bin"; "data/b.bin" |] |> Array.map repositoryPath)
-                                (ctx "batch-materialize-noop")
+                                (ctx "batch-materialize-unchanged")
                             |> Async.StartAsPromise
 
                         match result with
@@ -3960,7 +3960,7 @@ Vitest.describe (
                             Vitest.expect(outcome.Effect = Performed).toBe false
                             Vitest.expect(outcome.AffectedPaths.Length).toBe 0
                         | PartiallySucceeded _
-                        | Failed _ -> failwith "Expected a no-op for files that are already materialized."
+                        | Failed _ -> failwith "Expected Unchanged for files that are already materialized."
 
                         do! removeDirectoryAsync root
                     with error ->

@@ -3314,8 +3314,8 @@ Vitest.describe (
                     match missingResult with
                     | Succeeded outcome ->
                         match outcome.Effect with
-                        | NoOp _ -> ()
-                        | Performed -> failwith "Cleaning an already-absent branch must be a NoOp."
+                        | Unchanged _ -> ()
+                        | Performed -> failwith "Cleaning an already-absent branch must be Unchanged."
                     | PartiallySucceeded(_, failure)
                     | Failed failure -> failwith $"Absent-branch cleanup failed: {failure.Message}"
 
@@ -3521,7 +3521,7 @@ Vitest.describe (
             (fun harness -> promise {
                 let! workspace = harness.CreateWorkspace()
                 let! status = getStatus workspace
-                let reports, context = capture "step-events-update-noop"
+                let reports, context = capture "step-events-update-unchanged"
 
                 let! result =
                     run (
@@ -3532,7 +3532,7 @@ Vitest.describe (
                             context
                     )
 
-                expectNoOp "update of an up-to-date workspace" result |> ignore
+                expectUnchanged "update of an up-to-date workspace" result |> ignore
                 Vitest.expect(reports.Count).toBe 0
             })
 
@@ -3681,7 +3681,7 @@ Vitest.describe (
                 Vitest.expect(stepStarts reports).toEqual [| publishStart |]
 
                 let! secondReports, secondResult = publish "step-events-publish-again"
-                expectNoOp "publish without local revisions" secondResult |> ignore
+                expectUnchanged "publish without local revisions" secondResult |> ignore
                 Vitest.expect(secondReports.Count).toBe 0
             })
 

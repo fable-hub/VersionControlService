@@ -71,12 +71,12 @@ let operationResultTests =
             | Some report -> report [| entry |]
             | None -> failtest "Expected an output callback."
 
-        testCase "noOp keeps its reason"
+        testCase "unchanged keeps its reason"
         <| fun () ->
-            match OperationResult.noOp (Some "already up to date") "value" with
-            | Succeeded outcome -> Expect.equal outcome.Effect (NoOp(Some "already up to date")) "NoOp reason kept."
+            match OperationResult.unchanged (Some "already up to date") "value" with
+            | Succeeded outcome -> Expect.equal outcome.Effect (Unchanged(Some "already up to date")) "Unchanged reason kept."
             | PartiallySucceeded _
-            | Failed _ -> failtest "Expected Succeeded NoOp."
+            | Failed _ -> failtest "Expected Succeeded Unchanged."
 
         testCase "failure carries stable category, extensible code, retry guidance, state, and recovery"
         <| fun () ->

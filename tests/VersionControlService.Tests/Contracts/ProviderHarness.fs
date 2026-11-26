@@ -125,19 +125,19 @@ module SuiteHelpers =
     let expectValue (operationName: string) (result: OperationResult<'T>) : 'T =
         (expectOutcome operationName result).Value
 
-    let expectNoOp (operationName: string) (result: OperationResult<'T>) : 'T =
+    let expectUnchanged (operationName: string) (result: OperationResult<'T>) : 'T =
         let outcome = expectOutcome operationName result
 
         match outcome.Effect with
-        | NoOp _ -> outcome.Value
-        | Performed -> failwith $"{operationName} was expected to be a NoOp but reported Performed."
+        | Unchanged _ -> outcome.Value
+        | Performed -> failwith $"{operationName} was expected to be Unchanged but reported Performed."
 
     let expectPerformed (operationName: string) (result: OperationResult<'T>) : OperationOutcome<'T> =
         let outcome = expectOutcome operationName result
 
         match outcome.Effect with
         | Performed -> outcome
-        | NoOp reason -> failwith $"{operationName} was unexpectedly a NoOp ({reason})."
+        | Unchanged reason -> failwith $"{operationName} was unexpectedly Unchanged ({reason})."
 
     let expectFailure (operationName: string) (result: OperationResult<'T>) : OperationFailure =
         match result with
@@ -738,7 +738,7 @@ module FakeHarness =
                                         Some(path, localContent))
 
                             if selectedChanges.Length = 0 then
-                                return OperationResult.noOp (Some "The selected paths are unchanged.") (mkRevisionId headId)
+                                return OperationResult.unchanged (Some "The selected paths are unchanged.") (mkRevisionId headId)
                             else
                                 let newFiles =
                                     selectedChanges
@@ -862,10 +862,10 @@ module FakeHarness =
                 match target |> Option.map RevisionId.value with
                 | None ->
                     return
-                        OperationResult.noOp (Some "No target is configured.") (synchronizationState workspace)
+                        OperationResult.unchanged (Some "No target is configured.") (synchronizationState workspace)
                 | Some targetRevision when targetRevision = workspace.BaseRevisionId ->
                     return
-                        OperationResult.noOp
+                        OperationResult.unchanged
                             (Some "The workspace is already up to date.")
                             (synchronizationState workspace)
                 | Some targetRevision ->
@@ -1012,7 +1012,7 @@ module FakeHarness =
                     match observedTarget with
                     | Some target when target = localHead ->
                         return
-                            OperationResult.noOp
+                            OperationResult.unchanged
                                 (Some "The target already has every local revision.")
                                 (synchronizationState workspace)
                     | _ ->

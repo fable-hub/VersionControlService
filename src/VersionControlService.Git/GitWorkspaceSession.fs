@@ -3681,7 +3681,7 @@ let private refresh (state: SessionState) (context: OperationContext) =
             | Error failure -> return Failed failure
             | Ok syncState ->
                 return
-                    OperationResult.noOp
+                    OperationResult.unchanged
                         (Some "The configured target is a local ref and does not require fetching.")
                         syncState
         | Ok(Some upstream) ->
@@ -3724,7 +3724,7 @@ let private refresh (state: SessionState) (context: OperationContext) =
 
             match stateResult with
             | Error failure -> return Failed failure
-            | Ok syncState -> return OperationResult.noOp (Some "No target is configured.") syncState
+            | Ok syncState -> return OperationResult.unchanged (Some "No target is configured.") syncState
     }
 
 let private previewRefreshedState (state: SessionState) (context: OperationContext) (syncState: SynchronizationState) =
@@ -3945,10 +3945,10 @@ let private updateFromState
             return!
                 downloadLargeObjectsWithoutUpdate
                     state
-                    (OperationOutcome.noOp (Some "The workspace is already up to date.") syncState)
+                    (OperationOutcome.unchanged (Some "The workspace is already up to date.") syncState)
                     "update"
                     context
-        | NoTarget -> return OperationResult.noOp (Some "The workspace is already up to date.") syncState
+        | NoTarget -> return OperationResult.unchanged (Some "The workspace is already up to date.") syncState
         | _ ->
             let targetReference =
                 syncState.TargetRevision |> Option.map RevisionId.value |> Option.get
@@ -4448,7 +4448,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                         | Error failure -> return Failed failure
                         | Ok syncState ->
                             return
-                                OperationResult.noOp (Some "The target already has every local revision.") syncState
+                                OperationResult.unchanged (Some "The target already has every local revision.") syncState
                     else
                         let reportLfsProgress (progress: GitProgressDto) =
                             context.ReportProgress {
@@ -6281,7 +6281,7 @@ let private createSessionWithTextDiff
                                     // The composition skips Update when there is nothing to merge, so a
                                     // synchronization that neither updated nor published downloads here.
                                     match result with
-                                    | Succeeded({ Effect = NoOp _ } as outcome) when not request.PublishLocalRevisions ->
+                                    | Succeeded({ Effect = Unchanged _ } as outcome) when not request.PublishLocalRevisions ->
                                         return! downloadLargeObjectsWithoutUpdate state outcome "synchronization" context
                                     | _ -> return result
                                 })

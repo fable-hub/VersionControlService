@@ -133,7 +133,7 @@ type SynchronizationSteps = {
     Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Previews an update to the pinned target without reading the target again.
     PreviewUpdate: SynchronizationState -> OperationContext -> Async<OperationResult<UpdatePreview>>
-    /// Applies exactly the pinned target revision. NoOp when there is nothing to apply.
+    /// Applies exactly the pinned target revision. Unchanged when there is nothing to apply.
     Update: SynchronizationState -> OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Publishes the workspace. The provider derives the expected publication target
     /// from the pinned state when its publication target is the synchronization
@@ -328,7 +328,7 @@ module Synchronization =
                                             | _ ->
                                                 return
                                                     Succeeded {
-                                                        OperationOutcome.noOp
+                                                        OperationOutcome.unchanged
                                                             (Some "The workspace already has every target revision.")
                                                             state1 with
                                                                 Warnings = refreshWarnings
@@ -376,7 +376,7 @@ module Synchronization =
                                                                 if updated || publishOutcome.Effect = Performed then
                                                                     Performed
                                                                 else
-                                                                    NoOp(Some "The workspace and the target are already synchronized.")
+                                                                    Unchanged(Some "The workspace and the target are already synchronized.")
                                                             Warnings =
                                                                 Array.append
                                                                     refreshWarnings

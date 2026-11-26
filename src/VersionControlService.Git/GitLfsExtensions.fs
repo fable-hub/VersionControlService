@@ -427,7 +427,7 @@ let internal batchDematerializeAction = {
     }
 }
 
-let private batchNoOpReason = "Every path is already in the requested state."
+let private batchUnchangedReason = "Every path is already in the requested state."
 
 /// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
 /// them in AffectedPaths and Details. It takes its message, category and retry flag from the first failure
@@ -455,7 +455,7 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
 
     if failed.Length = 0 then
         if changed.Length = 0 then
-            OperationResult.noOp (Some batchNoOpReason) ()
+            OperationResult.unchanged (Some batchUnchangedReason) ()
         else
             Succeeded {
                 OperationOutcome.performed () with
@@ -533,7 +533,7 @@ let private runBatch
     (context: OperationContext)
     : Async<OperationResult<unit>> =
     if paths.Length = 0 then
-        async { return OperationResult.noOp (Some batchNoOpReason) () }
+        async { return OperationResult.unchanged (Some batchUnchangedReason) () }
     else
         serialize (fun () ->
             async {

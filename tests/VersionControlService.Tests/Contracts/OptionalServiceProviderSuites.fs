@@ -59,10 +59,10 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         | None -> failwith "The harness advertises materialization but the session lacks it."
 
                     let! materializeResult = run (materialization.Materialize [||] (ctx "materialize-none"))
-                    expectNoOp "materialize of no paths" materializeResult |> ignore
+                    expectUnchanged "materialize of no paths" materializeResult |> ignore
 
                     let! dematerializeResult = run (materialization.Dematerialize [||] (ctx "dematerialize-none"))
-                    expectNoOp "dematerialize of no paths" dematerializeResult |> ignore
+                    expectUnchanged "dematerialize of no paths" dematerializeResult |> ignore
                 }
 
             if harness.ExpectedServices |> List.contains "storage-policy" then

@@ -58,7 +58,7 @@ let private performed value warnings affected publication = {
         Publication = publication
 }
 
-let private noOp value = OperationResult.noOp (Some "no-op") value
+let private unchanged value = OperationResult.unchanged (Some "unchanged") value
 
 let private recordingSteps
     (log: ResizeArray<string>)
@@ -235,7 +235,7 @@ let synchronizationComposeTests =
                         (fun value -> OperationResult.succeeded value)
 
                 let outcome = expectSucceeded (run steps (request false false None) None)
-                Expect.equal outcome.Effect (NoOp(Some "The workspace already has every target revision.")) "No update effect."
+                Expect.equal outcome.Effect (Unchanged(Some "The workspace already has every target revision.")) "No update effect."
                 assertSequence log [| "active"; "refresh" |]
 
         testCase "diverged and unknown relationships reach preview and update"
@@ -434,9 +434,9 @@ let synchronizationComposeTests =
                         cancellation.Cancel()
                         return OperationResult.succeeded (state UpToDate None)
                     }
-                PreviewUpdate = fun _ _ -> async { return failwith "No-op cancellation must skip preview." }
-                Update = fun _ _ -> async { return failwith "No-op cancellation must skip update." }
-                Publish = fun _ _ -> async { return failwith "No-op cancellation must skip publish." }
+                PreviewUpdate = fun _ _ -> async { return failwith "A cancellation after an unchanged refresh must skip preview." }
+                Update = fun _ _ -> async { return failwith "A cancellation after an unchanged refresh must skip update." }
+                Publish = fun _ _ -> async { return failwith "A cancellation after an unchanged refresh must skip publish." }
             }
 
             let observedFailure = expectFailure (run steps (request false false None) (Some cancellation))
@@ -462,7 +462,7 @@ let synchronizationComposeTests =
             Expect.equal (outcome.Warnings |> Array.map _.Code) [| "update" |] "Update warning is preserved."
             assertSequence log [| "active"; "refresh"; "preview"; "update" |]
 
-        testCase "publish disabled with no update is a no-op"
+        testCase "publish disabled with no update is unchanged"
         <| fun () ->
             let log = ResizeArray<string>()
             let steps, _, _ =
@@ -475,12 +475,12 @@ let synchronizationComposeTests =
                     (fun _ -> failwith "Publish must not run.")
 
             let outcome = expectSucceeded (run steps (request false false None) None)
-            Expect.isTrue (match outcome.Effect with NoOp _ -> true | Performed -> false) "No update is a no-op."
-            Expect.equal (outcome.Warnings |> Array.map _.Code) [| "refresh" |] "Refresh warning reaches the no-op."
-            Expect.equal outcome.Publication PublicationNotApplicable "Up-to-date no-op has no publication."
+            Expect.isTrue (match outcome.Effect with Unchanged _ -> true | Performed -> false) "No update is unchanged."
+            Expect.equal (outcome.Warnings |> Array.map _.Code) [| "refresh" |] "Refresh warning reaches the unchanged outcome."
+            Expect.equal outcome.Publication PublicationNotApplicable "Up-to-date unchanged outcome has no publication."
             assertSequence log [| "active"; "refresh" |]
 
-        testCase "update-only local-ahead no-op reports local-only publication"
+        testCase "update-only local-ahead unchanged outcome reports local-only publication"
         <| fun () ->
             let log = ResizeArray<string>()
             let target = state LocalAhead (Some(revision "target"))
@@ -517,7 +517,7 @@ let synchronizationComposeTests =
             Expect.equal outcome.AffectedPaths [| "same.txt"; "update.txt"; "publish.txt" |] "Affected paths are distinct and ordered."
             assertSequence log [| "active"; "refresh"; "preview"; "update"; "publish" |]
 
-        testCase "publish no-op with no update remains a no-op"
+        testCase "publish unchanged outcome with no update remains unchanged"
         <| fun () ->
             let log = ResizeArray<string>()
             let state0 = state UpToDate None
@@ -528,10 +528,10 @@ let synchronizationComposeTests =
                     (OperationResult.succeeded state0)
                     (fun _ -> failwith "Preview must not run.")
                     (fun _ -> failwith "Update must not run.")
-                    (fun value -> OperationResult.noOp (Some "provider no-op") value)
+                    (fun value -> OperationResult.unchanged (Some "provider unchanged") value)
 
             let outcome = expectSucceeded (run steps (request false true None) None)
-            Expect.equal outcome.Effect (NoOp(Some "The workspace and the target are already synchronized.")) "No-op reason is composed."
+            Expect.equal outcome.Effect (Unchanged(Some "The workspace and the target are already synchronized.")) "Unchanged reason is composed."
             assertSequence log [| "active"; "refresh"; "publish" |]
 
         testCase "a publish failure after update becomes local-only partial with retry recovery"

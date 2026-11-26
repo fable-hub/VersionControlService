@@ -1118,7 +1118,7 @@ let private applyLfsPlanToTemporaryIndex
 /// 1. validate and resolve the current branch/HEAD;
 /// 2. seed a temporary index from HEAD (or empty for an unborn branch);
 /// 3. `git add` the literal selection into the temporary index over NUL stdin;
-/// 4. NoOp when the resulting tree equals HEAD's tree;
+/// 4. Unchanged when the resulting tree equals HEAD's tree;
 /// 5. `commit-tree`, then compare-and-swap `update-ref` with the expected old head;
 /// 6. reconcile only the committed paths in the real index.
 let createRevision
@@ -1344,7 +1344,7 @@ let createRevision
                                                     match RevisionId.tryCreate head with
                                                     | Ok revisionId ->
                                                         return
-                                                            OperationResult.noOp
+                                                            OperationResult.unchanged
                                                                 (Some "The selected paths are unchanged.")
                                                                 revisionId
                                                     | Error errorMessage -> return failwith errorMessage

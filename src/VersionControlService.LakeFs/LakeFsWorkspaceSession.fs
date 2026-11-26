@@ -868,7 +868,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                 state.Index.WorkspaceRevision |> Option.defaultValue "none"
 
                             return
-                                OperationResult.noOp
+                                OperationResult.unchanged
                                     (Some "The selected paths are unchanged.")
                                     (mkRevisionId currentRevision)
                         else
@@ -1906,7 +1906,7 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
     async {
         if Some head = state.Index.BaseRevision then
             return
-                OperationResult.noOp
+                OperationResult.unchanged
                     (Some "The workspace is already up to date.")
                     (synchronizationState state (Some head))
         else
@@ -2228,7 +2228,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                         }
                 elif state.Index.WorkspaceRevision = Some head then
                     return
-                        OperationResult.noOp
+                        OperationResult.unchanged
                             (Some "The target already has every local revision.")
                             (synchronizationState state (Some head))
                 else
@@ -3485,7 +3485,7 @@ let private cleanupOwnedWorkspaceBranchFromStateDirectory
         | Ok location ->
             match LakeFsIndex.load stateDirectory with
             | LakeFsIndex.Missing ->
-                return OperationResult.noOp (Some "No lakeFS workspace index remains to clean up.") ()
+                return OperationResult.unchanged (Some "No lakeFS workspace index remains to clean up.") ()
             | LakeFsIndex.Corrupt message ->
                 return Failed(OperationFailure.createRedacted ProviderError "workspace_index_corrupt" message)
             | LakeFsIndex.Loaded index ->
@@ -3544,7 +3544,7 @@ let private cleanupOwnedWorkspaceBranchFromStateDirectory
                             match initialHead with
                             | Error failure when failure.Category = NotFound ->
                                 return
-                                    OperationResult.noOp
+                                    OperationResult.unchanged
                                         (Some "The owned lakeFS workspace branch is already absent.")
                                         ()
                             | Error failure -> return Failed failure
@@ -3572,7 +3572,7 @@ let private cleanupOwnedWorkspaceBranchFromStateDirectory
                                 match finalHead with
                                 | Error failure when failure.Category = NotFound ->
                                     return
-                                        OperationResult.noOp
+                                        OperationResult.unchanged
                                             (Some "The owned lakeFS workspace branch is already absent.")
                                             ()
                                 | Error failure -> return Failed failure

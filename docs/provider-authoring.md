@@ -178,7 +178,7 @@ let reseedStorageSettings
     (context: OperationContext)
     = async {
         match session.StoragePolicy with
-        | None -> return OperationResult.noOp (Some "storage policy unavailable") ()
+        | None -> return OperationResult.unchanged (Some "storage policy unavailable") ()
         | Some policy ->
             return!
                 policy.SetSettings

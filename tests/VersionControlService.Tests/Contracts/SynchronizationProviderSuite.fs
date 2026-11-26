@@ -6,7 +6,7 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
-/// Synchronization profile: refresh/preview/update/publish, up-to-date no-ops,
+/// Synchronization profile: refresh/preview/update/publish, up-to-date unchanged results,
 /// divergence, structural stale-target reporting, recoverable publish failure, retry.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
     let profileName = $"{harness.Name} / synchronization profile"
@@ -77,7 +77,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(localBase).toEqual (Some "local base change\n")
             }
 
-            profileTest "an up-to-date update is a NoOp"
+            profileTest "an up-to-date update is Unchanged"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
                 let! status = getStatus workspace
@@ -86,10 +86,10 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Update
                             { ExpectedWorkspaceVersion = status.WorkspaceVersion }
-                            (ctx "noop-update")
+                            (ctx "unchanged-update")
                     )
 
-                expectNoOp "up-to-date update" updateResult |> ignore
+                expectUnchanged "up-to-date update" updateResult |> ignore
             }
 
             profileTest "update incorporates non-conflicting target changes"
@@ -120,7 +120,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(incoming).toEqual (Some "incoming content\n")
             }
 
-            profileTest "publish makes local revisions visible on the target and repeats as NoOp"
+            profileTest "publish makes local revisions visible on the target and repeats as Unchanged"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
                 do! workspace.WriteFile "published.txt" "published content\n"
@@ -171,7 +171,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! linkedContent = linked.ReadFile "published.txt"
                 Vitest.expect(linkedContent).toEqual (Some "published content\n")
 
-                // Publishing again with nothing new is a NoOp.
+                // Publishing again with nothing new is Unchanged.
                 let! repeatStatus = getStatus workspace
 
                 let! repeatPublish =
@@ -184,7 +184,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             (ctx "repeat-publish")
                     )
 
-                expectNoOp "repeat publish" repeatPublish |> ignore
+                expectUnchanged "repeat publish" repeatPublish |> ignore
             }
 
             profileTest "a failed publish is recoverable and retry succeeds"
@@ -305,10 +305,10 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(evidenceRoles.Length >= 2).toBe (true)
             }
 
-            profileTest "synchronize with nothing to do is a NoOp and leaves the target alone"
+            profileTest "synchronize with nothing to do is Unchanged and leaves the target alone"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
-                let! beforeResult = run ((syncService workspace.Session).Refresh(ctx "sync-noop-before"))
+                let! beforeResult = run ((syncService workspace.Session).Refresh(ctx "sync-unchanged-before"))
                 let before = expectValue "initial refresh" beforeResult
                 let! status = getStatus workspace
 
@@ -321,11 +321,11 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
                             }
-                            (ctx "synchronize-noop")
+                            (ctx "synchronize-unchanged")
                     )
 
-                expectNoOp "synchronize no-op" result |> ignore
-                let! afterResult = run ((syncService workspace.Session).Refresh(ctx "sync-noop-after"))
+                expectUnchanged "synchronize unchanged" result |> ignore
+                let! afterResult = run ((syncService workspace.Session).Refresh(ctx "sync-unchanged-after"))
                 let after = expectValue "final refresh" afterResult
                 Vitest.expect(after.TargetRevision).toEqual (before.TargetRevision)
             }

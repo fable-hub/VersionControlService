@@ -405,7 +405,7 @@ match result with
     // outcome.Value is the payload. outcome.Effect says whether work happened.
     match outcome.Effect with
     | Performed -> showRevision outcome.ResultingRevision
-    | NoOp reason -> showNothingToDo reason
+    | Unchanged reason -> showNothingToDo reason
 
 | PartiallySucceeded(outcome, failure) ->
     // State changed before a later step failed. The contract obliges the provider to
@@ -979,7 +979,7 @@ let saveSelected
             match result with
             | Succeeded outcome ->
                 match outcome.Effect with
-                | NoOp _ ->
+                | Unchanged _ ->
                     // Nothing needed committing, and the workspace version has not moved.
                     return Ok { Revision = None; WorkspaceVersion = Some expectedWorkspaceVersion }
                 | Performed ->

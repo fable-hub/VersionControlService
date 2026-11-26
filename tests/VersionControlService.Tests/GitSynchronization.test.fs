@@ -1072,7 +1072,7 @@ Vitest.describe (
     "Git / synchronization revision identity",
     fun () ->
         Vitest.test (
-            "up-to-date update without revision identity remains a NoOp",
+            "up-to-date update without revision identity remains Unchanged",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root, workPath, barePath, _ = createSyncFixture GitWorkspaceSession.GitSessionHooks.none
@@ -1101,17 +1101,17 @@ Vitest.describe (
                     let! updateResult =
                         (syncService session).Update
                             { ExpectedWorkspaceVersion = status.WorkspaceVersion }
-                            (ctx "revision-identity-noop-update")
+                            (ctx "revision-identity-unchanged-update")
                         |> Async.StartAsPromise
 
                     match updateResult with
                     | Succeeded outcome ->
                         match outcome.Effect with
-                        | NoOp _ -> ()
-                        | Performed -> failwith "Expected the up-to-date update to be a NoOp."
+                        | Unchanged _ -> ()
+                        | Performed -> failwith "Expected the up-to-date update to be Unchanged."
                     | PartiallySucceeded(_, failure)
                     | Failed failure ->
-                        failwith $"Expected a NoOp, received {failure.Category}/{failure.Code}."
+                        failwith $"Expected Unchanged, received {failure.Category}/{failure.Code}."
 
                     do! removeDirectoryAsync root
                 with error ->
@@ -8198,7 +8198,7 @@ Vitest.describe (
         )
 
         Vitest.test (
-            "an unborn branch synchronizes with a NoOp and no upstream",
+            "an unborn branch synchronizes with Unchanged and no upstream",
             TestOptions(timeout = 120000),
             fun () -> promise {
                 let! root = createTempDirectoryAsync ()
@@ -8230,8 +8230,8 @@ Vitest.describe (
                     let synchronized = expectSucceededOutcome "unborn branch synchronize" synchronizeResult
 
                     match synchronized.Effect with
-                    | NoOp _ -> ()
-                    | Performed -> failwith "Expected an unborn branch synchronize to return a NoOp."
+                    | Unchanged _ -> ()
+                    | Performed -> failwith "Expected an unborn branch synchronize to return Unchanged."
 
                     let! branch = runGitIn workPath [| "symbolic-ref"; "--short"; "HEAD" |]
                     let! mergeConfig =
@@ -8365,7 +8365,7 @@ Vitest.describe (
 
                     match outcome.Effect with
                     | Performed -> ()
-                    | NoOp _ -> failwith "Expected publish to perform the upstream setup."
+                    | Unchanged _ -> failwith "Expected publish to perform the upstream setup."
 
                     Vitest.expect(outcome.Publication).toEqual (Published)
                     Vitest.expect(outcome.AffectedPaths.Length).toBe 0
