@@ -72,7 +72,7 @@ Vitest.describe (
                     let! result =
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false

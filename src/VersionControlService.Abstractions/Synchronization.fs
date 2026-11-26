@@ -13,7 +13,7 @@ type RevisionRelationship =
 /// Counts are optional because object-oriented providers cannot always compute them.
 type SynchronizationState = {
     BaseRevision: RevisionId option
-    WorkspaceRevision: RevisionId option
+    LocalRevision: RevisionId option
     TargetRevision: RevisionId option
     /// Configured publication/update target, when the workspace has one.
     TargetRef: LogicalRef option
@@ -39,11 +39,11 @@ type UpdatePreview = {
 }
 
 type UpdateRequest = {
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 type PublishRequest = {
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     /// Consumer-observed target revision for the provider's client-side
     /// check-then-act-then-verify sequence. Never a server-side precondition.
     ExpectedTargetRevision: RevisionId option
@@ -56,7 +56,7 @@ type PublishRequest = {
 /// would touch, retries a preview that could not be computed, and binds a
 /// publication target the provider reports as missing.
 type SynchronizeRequest = {
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     /// The target revision the consumer observed when it made its decision. A target
     /// that has moved since fails with precondition_failed before any mutation.
     /// Required when AcceptUpdateRisks is set, so an acceptance never applies to a

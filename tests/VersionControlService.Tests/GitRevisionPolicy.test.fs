@@ -143,7 +143,7 @@ let private createGitFixtureWithHooks
                 strategy
 
         let adoptRequest: AdoptRequest = {
-            WorkspaceRoot = workPath
+            RepositoryRoot = workPath
             ConnectionProfileId = None
         }
 
@@ -195,7 +195,7 @@ let private createRevision
         let request: CreateRevisionRequest = {
             Message = message
             Paths = paths |> Array.map repositoryPath
-            ExpectedWorkspaceVersion = status.WorkspaceVersion
+            ExpectedRepositoryVersion = status.RepositoryVersion
         }
 
         return!
@@ -528,7 +528,7 @@ Vitest.describe (
                     let request: CreateRevisionRequest = {
                         Message = "test: count selected revision processes"
                         Paths = paths.ToArray() |> Array.map repositoryPath
-                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        ExpectedRepositoryVersion = status.RepositoryVersion
                     }
 
                     countGitProcesses <- true
@@ -1383,7 +1383,7 @@ Vitest.describe (
                         fixture.Session.Core.RestorePaths
                             {
                                 Paths = [| repositoryPath "data.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (context "m6-prune-restore")
                         |> Async.StartAsPromise

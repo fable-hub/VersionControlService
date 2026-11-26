@@ -157,7 +157,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     let! status = getStatus workspace
 
                     let current =
-                        match status.Synchronization |> Option.bind _.WorkspaceRevision with
+                        match status.Synchronization |> Option.bind _.LocalRevision with
                         | Some revision -> revision
                         | None -> failwith "Expected the workspace to report its current revision."
 

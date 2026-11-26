@@ -56,7 +56,7 @@ let private bindingFor
     |> Result.map (fun state -> {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = lakeFsProviderId
-        WorkspaceRoot = workspaceRoot
+        RepositoryRoot = workspaceRoot
         ProviderStateRef = Some state.StateId
         Location = {
             location with
@@ -241,7 +241,7 @@ let createFactory
                 match
                     bindingFor
                         options
-                        request.WorkspaceRoot
+                        request.RepositoryRoot
                         request.Location
                         LakeFsStateStore.BindProvisioning
                 with

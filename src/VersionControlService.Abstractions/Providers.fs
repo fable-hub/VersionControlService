@@ -8,7 +8,7 @@ namespace VersionControlService.Abstractions
 /// capabilities are added as new optional service records, never as new members
 /// on already-published records.
 type WorkspaceSession = {
-    Descriptor: WorkspaceDescriptor
+    Descriptor: RepositoryDescriptor
     Core: CoreVersionControl
     Synchronization: SynchronizationService option
     TextDiff: TextDiffService option
@@ -50,7 +50,7 @@ module WorkspaceSession =
 
     /// A core-only session: every optional service absent. Providers add the
     /// services they genuinely support.
-    let createCoreOnly (descriptor: WorkspaceDescriptor) (core: CoreVersionControl) : WorkspaceSession = {
+    let createCoreOnly (descriptor: RepositoryDescriptor) (core: CoreVersionControl) : WorkspaceSession = {
         Descriptor = descriptor
         Core = core
         Synchronization = None

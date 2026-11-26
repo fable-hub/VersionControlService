@@ -33,7 +33,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save selected assay"
                                 Paths = [| mkPath "assay.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "consumer-save")
                     )
@@ -47,7 +47,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = afterSave.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterSave.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "consumer-publish")
@@ -63,7 +63,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! linkedUpdate =
                     run (
                         (syncService linked.Session).Update
-                            { ExpectedWorkspaceVersion = linkedStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = linkedStatus.RepositoryVersion }
                             (ctx "consumer-linked-update")
                     )
 
@@ -88,7 +88,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save before broken publish"
                                 Paths = [| mkPath "pending.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "consumer-pending-save")
                     )
@@ -103,7 +103,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = preBroken.WorkspaceVersion
+                                ExpectedRepositoryVersion = preBroken.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "consumer-broken-publish")
@@ -119,7 +119,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = preRetry.WorkspaceVersion
+                                ExpectedRepositoryVersion = preRetry.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "consumer-retry-publish")
@@ -152,7 +152,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save my conflicting version"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "consumer-conflict-save")
                     )
@@ -169,7 +169,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! updateResult =
                     run (
                         (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "consumer-conflict-update")
                     )
 
@@ -191,7 +191,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = preResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = preResolve.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -206,7 +206,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = preFinalize.WorkspaceVersion
+                                ExpectedRepositoryVersion = preFinalize.RepositoryVersion
                                 Message = Some "resolve update conflict"
                             }
                             (ctx "consumer-finalize")
@@ -230,7 +230,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Name = "experiment-branch"
                                 BaseRef = None
                                 SwitchTo = true
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "consumer-branch")
                     )
@@ -250,7 +250,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save on experiment branch"
                                 Paths = [| mkPath "experiment.txt" |]
-                                ExpectedWorkspaceVersion = branchStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = branchStatus.RepositoryVersion
                             }
                             (ctx "consumer-branch-save")
                     )
@@ -271,7 +271,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.RestorePaths
                             {
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "consumer-discard")
                     )
@@ -305,7 +305,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save our text"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "consumer-text-save")
                     )
@@ -316,7 +316,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! updateResult =
                     run (
                         (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "consumer-text-update")
                     )
 
@@ -339,7 +339,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = preResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = preResolve.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = SupplyResolvedContent "our text\ntheir text\n"
                             }
@@ -354,7 +354,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = preFinalize.WorkspaceVersion
+                                ExpectedRepositoryVersion = preFinalize.RepositoryVersion
                                 Message = Some "merge both texts"
                             }
                             (ctx "consumer-text-finalize")
@@ -394,7 +394,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save once"
                                 Paths = [| mkPath "saved.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "consumer-save-once")
                     )
@@ -405,7 +405,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = afterSave.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterSave.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -428,7 +428,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true

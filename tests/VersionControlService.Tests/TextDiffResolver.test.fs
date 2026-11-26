@@ -236,7 +236,7 @@ let private bindingFor (repository: string) : WorkspaceBinding =
     {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = gitProviderId
-        WorkspaceRoot = repository
+        RepositoryRoot = repository
         ProviderStateRef = None
         Location = location
         ConnectionProfileId = None

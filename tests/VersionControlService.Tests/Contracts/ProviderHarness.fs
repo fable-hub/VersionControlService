@@ -152,12 +152,12 @@ module SuiteHelpers =
         | PartiallySucceeded(_, failure) -> failure
         | Succeeded _ -> failwith $"Expected {operationName} to carry a failure."
 
-    let getStatus (workspace: HarnessWorkspace) : JS.Promise<WorkspaceStatus> = promise {
+    let getStatus (workspace: HarnessWorkspace) : JS.Promise<RepositoryStatus> = promise {
         let! result = run (workspace.Session.Core.GetStatus(ctx "suite-status"))
         return expectValue "get status" result
     }
 
-    let sessionStatus (session: WorkspaceSession) : JS.Promise<WorkspaceStatus> = promise {
+    let sessionStatus (session: WorkspaceSession) : JS.Promise<RepositoryStatus> = promise {
         let! result = run (session.Core.GetStatus(ctx "suite-status"))
         return expectValue "get status" result
     }
@@ -172,7 +172,7 @@ module SuiteHelpers =
         | Some service -> service
         | None -> failwith "The conflict-resolution service is required for this profile."
 
-    let changePaths (status: WorkspaceStatus) =
+    let changePaths (status: RepositoryStatus) =
         status.Changes
         |> Array.map (fun change -> RepositoryPath.value change.Path)
         |> Array.sort
@@ -458,7 +458,7 @@ module FakeHarness =
 
         {
             BaseRevision = Some(mkRevisionId workspace.BaseRevisionId)
-            WorkspaceRevision = Some(mkRevisionId localHead)
+            LocalRevision = Some(mkRevisionId localHead)
             TargetRevision = targetRevision |> Option.map mkRevisionId
             TargetRef = None
             LocalRevisionCount = None
@@ -539,7 +539,7 @@ module FakeHarness =
         | None -> None
 
     let private createCore (workspace: FakeWorkspace) : CoreVersionControl =
-        let status () : WorkspaceStatus =
+        let status () : RepositoryStatus =
             let changes =
                 changesAgainstHead workspace
                 |> List.map (fun (path, kind) -> {
@@ -557,7 +557,7 @@ module FakeHarness =
                         Kind = LocalRef
                         IsCurrent = true
                     }
-                WorkspaceVersion = versionToken workspace
+                RepositoryVersion = versionToken workspace
                 Changes = changes
                 ActiveConflictSession = workspace.ActiveConflict |> Option.map conflictSummary
                 Synchronization = Some(synchronizationState workspace)
@@ -581,7 +581,7 @@ module FakeHarness =
                 }
             CreateRef =
                 fun request _ -> async {
-                    if request.ExpectedWorkspaceVersion <> versionToken workspace then
+                    if request.ExpectedRepositoryVersion <> versionToken workspace then
                         return OperationResult.failed (staleFailure ())
                     elif workspace.LocalRefs.ContainsKey request.Name then
                         return
@@ -644,7 +644,7 @@ module FakeHarness =
                 }
             SwitchRef =
                 fun request _ -> async {
-                    if request.ExpectedWorkspaceVersion <> versionToken workspace then
+                    if request.ExpectedRepositoryVersion <> versionToken workspace then
                         return OperationResult.failed (staleFailure ())
                     else
                         let refName = (ProviderRef.value request.TargetRef).Replace("fake:", "")
@@ -700,7 +700,7 @@ module FakeHarness =
 
                     if canceled then
                         return OperationResult.canceled "The revision transfer was canceled."
-                    elif request.ExpectedWorkspaceVersion <> versionToken workspace then
+                    elif request.ExpectedRepositoryVersion <> versionToken workspace then
                         return OperationResult.failed (staleFailure ())
                     elif request.Paths.Length = 0 then
                         return
@@ -762,13 +762,13 @@ module FakeHarness =
                                         OperationOutcome.performed (mkRevisionId revisionId) with
                                             AffectedPaths = selectedChanges |> Array.map fst
                                             ResultingRevision = Some(mkRevisionId revisionId)
-                                            ResultingWorkspaceVersion = Some(versionToken workspace)
+                                            ResultingRepositoryVersion = Some(versionToken workspace)
                                             Publication = LocalOnly
                                     }
                 }
             RestorePaths =
                 fun request _ -> async {
-                    if request.ExpectedWorkspaceVersion <> versionToken workspace then
+                    if request.ExpectedRepositoryVersion <> versionToken workspace then
                         return OperationResult.failed (staleFailure ())
                     else
                         let headFiles = revisionFiles workspace.Target (headRevisionId workspace)
@@ -848,7 +848,7 @@ module FakeHarness =
 
             if canceled then
                 return OperationResult.canceled "The update transfer was canceled."
-            elif request.ExpectedWorkspaceVersion <> versionToken workspace then
+            elif request.ExpectedRepositoryVersion <> versionToken workspace then
                 return OperationResult.failed (staleFailure ())
             elif workspace.ActiveConflict.IsSome then
                 return
@@ -950,7 +950,7 @@ module FakeHarness =
                                 {
                                     OperationOutcome.performed (synchronizationState workspace) with
                                         AffectedPaths = conflicts |> List.toArray
-                                        ResultingWorkspaceVersion = Some(versionToken workspace)
+                                        ResultingRepositoryVersion = Some(versionToken workspace)
                                 }
                                 (OperationFailure.create
                                     Conflict
@@ -973,7 +973,7 @@ module FakeHarness =
 
             if canceled then
                 return OperationResult.canceled "The publish transfer was canceled."
-            elif request.ExpectedWorkspaceVersion <> versionToken workspace then
+            elif request.ExpectedRepositoryVersion <> versionToken workspace then
                 return OperationResult.failed (staleFailure ())
             elif workspace.Target.PublishBroken then
                 return
@@ -1049,7 +1049,7 @@ module FakeHarness =
                                     OperationOutcome.performed (synchronizationState workspace) with
                                         Publication = Published
                                         ResultingRevision = Some(mkRevisionId localHead)
-                                        ResultingWorkspaceVersion = Some(versionToken workspace)
+                                        ResultingRepositoryVersion = Some(versionToken workspace)
                                 }
         }
         let baseService : SynchronizationService = {
@@ -1060,7 +1060,7 @@ module FakeHarness =
             Synchronize =
                 fun request context ->
                     async {
-                        if request.ExpectedWorkspaceVersion <> versionToken workspace then
+                        if request.ExpectedRepositoryVersion <> versionToken workspace then
                             return OperationResult.failed (staleFailure ())
                         else
                             return!
@@ -1074,13 +1074,13 @@ module FakeHarness =
                                             fun syncState context ->
                                                 updateAgainst
                                                     syncState.TargetRevision
-                                                    { ExpectedWorkspaceVersion = versionToken workspace }
+                                                    { ExpectedRepositoryVersion = versionToken workspace }
                                                     context
                                         Publish =
                                             fun syncState context ->
                                                 publish
                                                     {
-                                                        ExpectedWorkspaceVersion = versionToken workspace
+                                                        ExpectedRepositoryVersion = versionToken workspace
                                                         ExpectedTargetRevision = syncState.TargetRevision
                                                     }
                                                     context
@@ -1123,7 +1123,7 @@ module FakeHarness =
                 }
             Resolve =
                 fun request _ -> async {
-                    match validateHandle request.Handle request.ExpectedWorkspaceVersion with
+                    match validateHandle request.Handle request.ExpectedRepositoryVersion with
                     | Error() -> return handleRejection ()
                     | Ok session ->
                         let pathText = pathValue request.Path
@@ -1178,7 +1178,7 @@ module FakeHarness =
                 }
             Finalize =
                 fun request _ -> async {
-                    match validateHandle request.Handle request.ExpectedWorkspaceVersion with
+                    match validateHandle request.Handle request.ExpectedRepositoryVersion with
                     | Error() -> return handleRejection ()
                     | Ok session ->
                         if session.ConflictItems |> List.exists (fun item -> item.ResolvedContent.IsNone) then
@@ -1238,7 +1238,7 @@ module FakeHarness =
                 }
             Cancel =
                 fun request _ -> async {
-                    match validateHandle request.Handle request.ExpectedWorkspaceVersion with
+                    match validateHandle request.Handle request.ExpectedRepositoryVersion with
                     | Error() -> return handleRejection ()
                     | Ok session ->
                         workspace.LocalFiles <- session.PreUpdateFiles
@@ -1256,7 +1256,7 @@ module FakeHarness =
     let private createSession (workspace: FakeWorkspace) (binding: WorkspaceBinding) : WorkspaceSession =
         let descriptor = {
             ProviderId = fakeId
-            WorkspaceRoot = binding.WorkspaceRoot
+            RepositoryRoot = binding.RepositoryRoot
             Location = Some binding.Location
         }
 
@@ -1289,7 +1289,7 @@ module FakeHarness =
         let bindingFor (root: string) (location: RepositoryLocation) : WorkspaceBinding = {
             SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
             ProviderId = fakeId
-            WorkspaceRoot = root
+            RepositoryRoot = root
             ProviderStateRef = None
             Location = location
             ConnectionProfileId = location.ConnectionProfileId
@@ -1362,14 +1362,14 @@ module FakeHarness =
                     }
             Bind =
                 fun request _ -> async {
-                    return OperationResult.succeeded (bindingFor request.WorkspaceRoot request.Location)
+                    return OperationResult.succeeded (bindingFor request.RepositoryRoot request.Location)
                 }
             Open =
                 fun binding _ -> async {
                     let target = getTarget binding.Location
 
                     let workspace =
-                        match workspacesByRoot.TryGetValue binding.WorkspaceRoot with
+                        match workspacesByRoot.TryGetValue binding.RepositoryRoot with
                         | true, existing ->
                             // Bind re-targets an existing workspace: opening it with a new
                             // location switches its target while keeping local state.
@@ -1389,7 +1389,7 @@ module FakeHarness =
 
                             let created = {
                                 Target = target
-                                Root = binding.WorkspaceRoot
+                                Root = binding.RepositoryRoot
                                 Profile = binding.ConnectionProfileId
                                 LocalFiles = revisionFiles target baseRevision
                                 BaseRevisionId = baseRevision
@@ -1399,7 +1399,7 @@ module FakeHarness =
                                 ActiveConflict = None
                             }
 
-                            workspacesByRoot[binding.WorkspaceRoot] <- created
+                            workspacesByRoot[binding.RepositoryRoot] <- created
                             created
 
                     return OperationResult.succeeded (createSession workspace binding)
@@ -1432,10 +1432,10 @@ module FakeHarness =
         }
 
         let getWorkspaceState (harnessWorkspace: HarnessWorkspace) =
-            workspacesByRoot[harnessWorkspace.Binding.WorkspaceRoot]
+            workspacesByRoot[harnessWorkspace.Binding.RepositoryRoot]
 
         let createHarnessWorkspace (binding: WorkspaceBinding) (session: WorkspaceSession) : HarnessWorkspace =
-            let state = workspacesByRoot[binding.WorkspaceRoot]
+            let state = workspacesByRoot[binding.RepositoryRoot]
 
             {
                 Session = session

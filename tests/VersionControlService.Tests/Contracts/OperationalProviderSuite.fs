@@ -39,7 +39,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     OperationContext.create "operational-progress" OperationCancellation.none progressReports.Add
 
                 let! updateResult =
-                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
+                    run ((syncService workspace.Session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context)
 
                 expectOutcome "update with progress" updateResult |> ignore
                 Vitest.expect(progressReports.Count > 0).toBe (true)
@@ -74,7 +74,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
 
                 let! updateResult =
-                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
+                    run ((syncService workspace.Session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context)
 
                 expectOutcome "update with large-byte progress" updateResult |> ignore
 
@@ -112,7 +112,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         | _ -> ())
 
                 let! updateResult =
-                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
+                    run ((syncService workspace.Session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context)
 
                 let failure = expectFailure "canceled update" updateResult
                 Vitest.expect(failure.Category).toEqual (Canceled)
@@ -120,7 +120,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 // The workspace stayed unchanged.
                 let! afterStatus = getStatus workspace
-                Vitest.expect(afterStatus.WorkspaceVersion).toBe (status.WorkspaceVersion)
+                Vitest.expect(afterStatus.RepositoryVersion).toBe (status.RepositoryVersion)
 
                 let! canceledFile = workspace.ReadFile "canceled.txt"
                 Vitest.expect(canceledFile).toEqual (None)
@@ -145,7 +145,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "first workspace revision"
                                 Paths = [| mkPath "first-only.txt" |]
-                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                             }
                             (ctx "independent-revision")
                     )
@@ -153,7 +153,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 expectPerformed "first workspace revision" revisionResult |> ignore
 
                 let! secondAfter = getStatus secondWorkspace
-                Vitest.expect(secondAfter.WorkspaceVersion).toBe (secondStatus.WorkspaceVersion)
+                Vitest.expect(secondAfter.RepositoryVersion).toBe (secondStatus.RepositoryVersion)
             }
 
             profileTest "two sessions on the same workspace serialize mutations through version tokens"
@@ -166,7 +166,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! firstStatus = getStatus workspace
                 let! secondStatus = sessionStatus secondSession
-                Vitest.expect(secondStatus.WorkspaceVersion).toBe (firstStatus.WorkspaceVersion)
+                Vitest.expect(secondStatus.RepositoryVersion).toBe (firstStatus.RepositoryVersion)
 
                 let! firstMutation =
                     run (
@@ -174,7 +174,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "first session revision"
                                 Paths = [| mkPath "first.txt" |]
-                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                             }
                             (ctx "first-session-revision")
                     )
@@ -188,7 +188,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "second session stale revision"
                                 Paths = [| mkPath "second.txt" |]
-                                ExpectedWorkspaceVersion = secondStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = secondStatus.RepositoryVersion
                             }
                             (ctx "stale-session-revision")
                     )
@@ -206,7 +206,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "second session retried revision"
                                 Paths = [| mkPath "second.txt" |]
-                                ExpectedWorkspaceVersion = refreshedStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = refreshedStatus.RepositoryVersion
                             }
                             (ctx "retried-session-revision")
                     )
@@ -235,7 +235,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "interrupted revision"
                                 Paths = [| mkPath "interrupted.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             context
                     )
@@ -245,7 +245,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(failure.StateChanged).toBe (false)
 
                 let! afterStatus = getStatus workspace
-                Vitest.expect(afterStatus.WorkspaceVersion).toBe (status.WorkspaceVersion)
+                Vitest.expect(afterStatus.RepositoryVersion).toBe (status.RepositoryVersion)
                 Vitest.expect(changePaths afterStatus).toEqual ([| "interrupted.txt" |])
 
                 // The retry succeeds cleanly.
@@ -255,7 +255,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "retried revision"
                                 Paths = [| mkPath "interrupted.txt" |]
-                                ExpectedWorkspaceVersion = afterStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterStatus.RepositoryVersion
                             }
                             (ctx "retried-after-interrupt")
                     )
@@ -277,7 +277,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "revision before broken publish"
                                 Paths = [| mkPath "leak-probe.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "leak-revision")
                     )
@@ -289,7 +289,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = prePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = prePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "leak-publish")

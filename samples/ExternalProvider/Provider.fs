@@ -22,7 +22,7 @@ let private createCore () : CoreVersionControl = {
                 return
                     OperationResult.succeeded {
                         CurrentRef = None
-                        WorkspaceVersion = "sample-read-only"
+                        RepositoryVersion = "sample-read-only"
                         Changes = [||]
                         ActiveConflictSession = None
                         Synchronization = None
@@ -54,7 +54,7 @@ let factory: ProviderFactory = {
             async {
                 let descriptor = {
                     ProviderId = binding.ProviderId
-                    WorkspaceRoot = binding.WorkspaceRoot
+                    RepositoryRoot = binding.RepositoryRoot
                     Location = Some binding.Location
                 }
 

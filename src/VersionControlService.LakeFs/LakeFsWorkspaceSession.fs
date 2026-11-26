@@ -79,7 +79,7 @@ type private SessionState = {
 
 let private barrier (state: SessionState) (point: string) (context: OperationContext) =
     match state.Hooks.Barrier with
-    | Some hook -> hook state.Binding.WorkspaceRoot point context
+    | Some hook -> hook state.Binding.RepositoryRoot point context
     | None -> async.Return()
 
 let private connect (state: SessionState) : Async<Result<LakeFsConnection, OperationFailure>> =
@@ -102,7 +102,7 @@ let private objectKey (state: SessionState) (path: string) =
 
 let private repositoryPathOfKey (state: SessionState) (key: string) =
     LakeFsPathSafety.resolveRemotePath
-        state.Binding.WorkspaceRoot
+        state.Binding.RepositoryRoot
         state.Index.Prefix
         key
     |> LakeFsPathSafety.orRaise
@@ -119,7 +119,7 @@ let private repositoryPath path =
         )
 
 let private inspectLocalFile (state: SessionState) (path: string) =
-    LakeFsPathSafety.inspectFile state.Binding.WorkspaceRoot (repositoryPath path)
+    LakeFsPathSafety.inspectFile state.Binding.RepositoryRoot (repositoryPath path)
     |> LakeFsPathSafety.orRaise
 
 let private temporaryPath (state: SessionState) label =
@@ -148,16 +148,16 @@ let private cleanupConflictCandidates (state: SessionState) =
             ()
 
 let private writeLocal (state: SessionState) (path: string) (content: string) =
-    LakeFsPathSafety.writeUtf8File state.Binding.WorkspaceRoot (repositoryPath path) content
+    LakeFsPathSafety.writeUtf8File state.Binding.RepositoryRoot (repositoryPath path) content
     |> LakeFsPathSafety.orRaise
 
 let private removeLocal (state: SessionState) (path: string) =
-    LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot (repositoryPath path)
+    LakeFsPathSafety.removeFile state.Binding.RepositoryRoot (repositoryPath path)
     |> LakeFsPathSafety.orRaise
 
 /// All repo-relative files currently in the workspace directory.
 let private walkLocalFiles (state: SessionState) : string list =
-    LakeFsPathSafety.walkFiles state.Binding.WorkspaceRoot
+    LakeFsPathSafety.walkFiles state.Binding.RepositoryRoot
     |> LakeFsPathSafety.orRaise
     |> Array.map RepositoryPath.value
     |> Array.toList
@@ -357,11 +357,11 @@ let private mapOutcomeValue (value: 'T) (outcome: OperationOutcome<'U>) : Operat
     Warnings = outcome.Warnings
     AffectedPaths = outcome.AffectedPaths
     ResultingRevision = outcome.ResultingRevision
-    ResultingWorkspaceVersion = outcome.ResultingWorkspaceVersion
+    ResultingRepositoryVersion = outcome.ResultingRepositoryVersion
     Publication = outcome.Publication
 }
 
-let private localWorkspaceStatus (state: SessionState) : WorkspaceStatus =
+let private localWorkspaceStatus (state: SessionState) : RepositoryStatus =
     let changes =
         classifyWorkspace state
         |> List.choose (fun change ->
@@ -389,7 +389,7 @@ let private localWorkspaceStatus (state: SessionState) : WorkspaceStatus =
                 Kind = LocalRef
                 IsCurrent = true
             }
-        WorkspaceVersion = workspaceVersion state
+        RepositoryVersion = workspaceVersion state
         Changes = changes
         ActiveConflictSession = conflictSummary state
         Synchronization = None
@@ -411,7 +411,7 @@ let private synchronizationState (state: SessionState) (targetHead: string optio
 
     {
         BaseRevision = baseRevision |> Option.map mkRevisionId
-        WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+        LocalRevision = workspaceRevision |> Option.map mkRevisionId
         TargetRevision = targetHead |> Option.map mkRevisionId
         TargetRef =
             targetHead
@@ -566,7 +566,7 @@ let private getStatus (state: SessionState) (context: OperationContext) =
                                         Kind = LocalRef
                                         IsCurrent = true
                                     }
-                                WorkspaceVersion = workspaceVersion state
+                                RepositoryVersion = workspaceVersion state
                                 Changes = changes
                                 ActiveConflictSession = conflictSummary state
                                 Synchronization =
@@ -627,7 +627,7 @@ let private recoverInterruptedSelectedRevision
         let recoveryContext = LakeFsRequestOutput.withoutCancellation context "recovery"
         let ownsBranch =
             state.Index.OwnershipToken <> ""
-            && workspaceBranchName state.Binding.WorkspaceRoot state.Index.OwnershipToken
+            && workspaceBranchName state.Binding.RepositoryRoot state.Index.OwnershipToken
                = state.Index.WorkspaceBranch
 
         match ownsBranch, expectedHead with
@@ -766,7 +766,7 @@ let private finishSelectedRevision
                         OperationOutcome.performed (mkRevisionId commit.Id) with
                             AffectedPaths = affectedPaths
                             ResultingRevision = Some(mkRevisionId commit.Id)
-                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                            ResultingRepositoryVersion = Some(workspaceVersion state)
                             Publication = LocalOnly
                     }
         else
@@ -779,7 +779,7 @@ let private finishSelectedRevision
                 OperationOutcome.performed (mkRevisionId commit.Id) with
                     AffectedPaths = affectedPaths
                     ResultingRevision = Some(mkRevisionId commit.Id)
-                    ResultingWorkspaceVersion = Some(workspaceVersion state)
+                    ResultingRepositoryVersion = Some(workspaceVersion state)
                     Publication = LocalOnly
             }
 
@@ -886,7 +886,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                         inspected
                                         |> Option.map (fun source ->
                                             LakeFsPathSafety.validateOpenedFile
-                                                state.Binding.WorkspaceRoot
+                                                state.Binding.RepositoryRoot
                                                 (repositoryPath pathValue)
                                                 source.Identity)
                                     IsDeletion = objectState = LakeFsIndex.DeletedObject
@@ -1038,7 +1038,7 @@ let private materializationResultToOperation
             OperationOutcome.performed () with
                 Warnings = warnings
                 AffectedPaths = affectedPaths
-                ResultingWorkspaceVersion = Some(workspaceVersion state)
+                ResultingRepositoryVersion = Some(workspaceVersion state)
         }
     | LakeFsMaterialization.MaterializationFailed failure -> Failed failure
     | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
@@ -1048,7 +1048,7 @@ let private materializationResultToOperation
             {
                 OperationOutcome.performed () with
                     AffectedPaths = failure.AffectedPaths
-                    ResultingWorkspaceVersion = Some(workspaceVersion state)
+                    ResultingRepositoryVersion = Some(workspaceVersion state)
             },
             failure
         )
@@ -1105,7 +1105,7 @@ let private restorePathsWithoutRecovery (state: SessionState) (request: RestoreR
                             if validationFailure.IsNone then
                                 match
                                     LakeFsPathSafety.resolveWorkspacePath
-                                        state.Binding.WorkspaceRoot
+                                        state.Binding.RepositoryRoot
                                         path
                                 with
                                 | Error failure -> validationFailure <- Some failure
@@ -1150,7 +1150,7 @@ let private restorePathsWithoutRecovery (state: SessionState) (request: RestoreR
                             | Ok plan ->
                                 let! applied =
                                     LakeFsMaterialization.apply
-                                        state.Binding.WorkspaceRoot
+                                        state.Binding.RepositoryRoot
                                         state.StateDirectory
                                         state.RecoveryDirectory
                                         state.Index.WorkspaceRevision
@@ -1169,7 +1169,7 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
         | Ok() ->
             let! recovery =
                 LakeFsMaterialization.reapplyPending
-                    state.Binding.WorkspaceRoot
+                    state.Binding.RepositoryRoot
                     state.StateDirectory
                     state.RecoveryDirectory
                     (fun point barrierContext -> barrier state point barrierContext)
@@ -1279,7 +1279,7 @@ let private materializeRef
                     if validationFailure.IsNone then
                         match
                             LakeFsPathSafety.resolveWorkspacePath
-                                state.Binding.WorkspaceRoot
+                                state.Binding.RepositoryRoot
                                 repositoryPath
                         with
                         | Error pathFailure -> validationFailure <- Some pathFailure
@@ -1331,7 +1331,7 @@ let private materializeRef
                         | Ok removalPath ->
                             match
                                 LakeFsPathSafety.resolveWorkspacePath
-                                    state.Binding.WorkspaceRoot
+                                    state.Binding.RepositoryRoot
                                     removalPath
                             with
                             | Error pathFailure -> validationFailure <- Some pathFailure
@@ -1376,7 +1376,7 @@ let private materializeRef
 
                         let! applied =
                             LakeFsMaterialization.apply
-                                state.Binding.WorkspaceRoot
+                                state.Binding.RepositoryRoot
                                 state.StateDirectory
                                 state.RecoveryDirectory
                                 state.Index.WorkspaceRevision
@@ -1532,7 +1532,7 @@ let private switchWorkspaceToRef
                 return
                     Succeeded {
                         materializationOutcome with
-                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                            ResultingRepositoryVersion = Some(workspaceVersion state)
                     }
     }
 
@@ -1885,7 +1885,7 @@ let private buildConflictItems
                         match inspectLocalFile state path with
                         | None -> None
                         | Some inspected ->
-                            LakeFsPathSafety.readBuffer state.Binding.WorkspaceRoot (repositoryPath path)
+                            LakeFsPathSafety.readBuffer state.Binding.RepositoryRoot (repositoryPath path)
                             |> LakeFsPathSafety.orRaise
                             |> Option.map (candidateFromBuffer inspected.AbsolutePath)
 
@@ -2398,7 +2398,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                     ) with
                                                         Publication = Published
                                                         ResultingRevision = Some(mkRevisionId mergeResult.Reference)
-                                                        ResultingWorkspaceVersion = Some(workspaceVersion state)
+                                                        ResultingRepositoryVersion = Some(workspaceVersion state)
                                                 }
     }
 
@@ -2441,7 +2441,7 @@ let private removeResolvedDeletionFiles
                             AffectedPaths = [| pathValue |]
                     }
             | Ok path ->
-                match LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot path with
+                match LakeFsPathSafety.removeFile state.Binding.RepositoryRoot path with
                 | Ok() -> ()
                 | Error deletionFailure -> failure <- Some deletionFailure
 
@@ -2565,7 +2565,7 @@ let private completeConflictFinalize
                 return
                     Succeeded {
                         finalizedOutcome with
-                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                            ResultingRepositoryVersion = Some(workspaceVersion state)
                     }
     }
 
@@ -2624,7 +2624,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
     GetActiveSession = fun _ -> async { return OperationResult.succeeded (conflictSummary state) }
     Resolve =
         fun request context -> guardConflictMutation state (async {
-            match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
+            match validateHandle state request.Handle request.ExpectedRepositoryVersion with
             | Error failure -> return Failed failure
             | Ok conflict ->
                 match LakeFsConflictSession.resolve conflict request.Path request.Resolution with
@@ -2642,7 +2642,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
         })
     Finalize =
         fun request context -> guardConflictMutation state (async {
-            match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
+            match validateHandle state request.Handle request.ExpectedRepositoryVersion with
             | Error failure -> return Failed failure
             | Ok conflict ->
                 if LakeFsConflictSession.hasUnresolvedItems conflict then
@@ -2860,14 +2860,14 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                     | LakeFsConflictSession.WorkspaceFile path ->
                                                                         match
                                                                             LakeFsPathSafety.resolveWorkspacePath
-                                                                                state.Binding.WorkspaceRoot
+                                                                                state.Binding.RepositoryRoot
                                                                                 path
                                                                         with
                                                                         | Error failure -> Error failure
                                                                         | Ok _ ->
                                                                             match
                                                                                 LakeFsPathSafety.inspectFile
-                                                                                    state.Binding.WorkspaceRoot
+                                                                                    state.Binding.RepositoryRoot
                                                                                     path
                                                                             with
                                                                             | Error failure -> Error failure
@@ -2883,7 +2883,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
                                                                                 Ok(
                                                                                     inspected.AbsolutePath,
                                                                                     LakeFsPathSafety.validateOpenedFile
-                                                                                        state.Binding.WorkspaceRoot
+                                                                                        state.Binding.RepositoryRoot
                                                                                         path
                                                                                         inspected.Identity
                                                                                 )
@@ -3062,7 +3062,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
             })
     Cancel =
         fun request context -> guardConflictMutation state (async {
-            match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
+            match validateHandle state request.Handle request.ExpectedRepositoryVersion with
             | Error failure -> return Failed failure
             | Ok _ ->
                 // The update never touched the workspace branch or local files for
@@ -3080,7 +3080,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
 let private createSessionFromState (state: SessionState) : WorkspaceSession =
     let descriptor = {
         ProviderId = lakeFsProviderId
-        WorkspaceRoot = state.Binding.WorkspaceRoot
+        RepositoryRoot = state.Binding.RepositoryRoot
         Location = Some state.Binding.Location
     }
 
@@ -3089,27 +3089,27 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
         ListRefs = fun context -> listRefs state context |> LakeFsPathSafety.guard
         CreateRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                     createRef state request context)
                 |> LakeFsPathSafety.guard
         PreflightSwitchRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                     preflightSwitchRef state request context)
                 |> LakeFsPathSafety.guard
         SwitchRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                     switchRef state request context)
                 |> LakeFsPathSafety.guard
         CreateRevision =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                     createRevision state request context)
                 |> LakeFsPathSafety.guard
         RestorePaths =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion true (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion true (fun () ->
                     restorePaths state request context)
                 |> LakeFsPathSafety.guard
         GetDiffSummary = fun context -> getDiffSummary state context |> LakeFsPathSafety.guard
@@ -3136,17 +3136,17 @@ let private createSessionFromState (state: SessionState) : WorkspaceSession =
                     PreviewUpdate = fun context -> previewUpdate state context |> LakeFsPathSafety.guard
                     Update =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                            withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                                 update state request context)
                             |> LakeFsPathSafety.guard
                     Publish =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                            withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                                 publish state request.ExpectedTargetRevision context)
                             |> LakeFsPathSafety.guard
                     Synchronize =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
+                            withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
                                 Synchronization.compose
                                     {
                                         HasActiveConflictSession =
@@ -3206,7 +3206,7 @@ let private openSessionFromStateDirectory
                     | Error failure -> return Failed failure
                     | Ok target ->
                         let ownershipToken = LakeFsIndex.createOwnershipToken ()
-                        let workspaceBranch = workspaceBranchName binding.WorkspaceRoot ownershipToken
+                        let workspaceBranch = workspaceBranchName binding.RepositoryRoot ownershipToken
 
                         let! created =
                             LakeFsApi.createBranch
@@ -3219,9 +3219,9 @@ let private openSessionFromStateDirectory
                         match created with
                         | Error failure -> return Failed failure
                         | Ok() ->
-                            if not (NodeFileSystem.existsSync binding.WorkspaceRoot) then
+                            if not (NodeFileSystem.existsSync binding.RepositoryRoot) then
                                 NodeFileSystem.mkdirSync
-                                    binding.WorkspaceRoot
+                                    binding.RepositoryRoot
                                     (NodeFileSystem.MkdirOptions(recursive = true))
 
                             let state = {
@@ -3430,7 +3430,7 @@ let openSession
     (context: OperationContext)
     : Async<OperationResult<WorkspaceSession>> =
     async {
-        match LakeFsStateStore.resolve options binding.WorkspaceRoot binding.ProviderStateRef with
+        match LakeFsStateStore.resolve options binding.RepositoryRoot binding.ProviderStateRef with
         | Error failure -> return Failed failure
         | Ok state ->
             return!
@@ -3493,7 +3493,7 @@ let private cleanupOwnedWorkspaceBranchFromStateDirectory
                     if String.IsNullOrWhiteSpace ownershipToken then
                         ""
                     else
-                        workspaceBranchName binding.WorkspaceRoot ownershipToken
+                        workspaceBranchName binding.RepositoryRoot ownershipToken
 
                 let ownsBranch =
                     ownershipToken <> ""
@@ -3559,7 +3559,7 @@ let private cleanupOwnedWorkspaceBranchFromStateDirectory
                             | Ok _ ->
                                 match hooks.Barrier with
                                 | Some hook ->
-                                    do! hook binding.WorkspaceRoot "cleanup-precheck-done" context
+                                    do! hook binding.RepositoryRoot "cleanup-precheck-done" context
                                 | None -> ()
 
                                 let! finalHead =
@@ -3636,7 +3636,7 @@ let cleanupOwnedWorkspaceBranch
     (context: OperationContext)
     : Async<OperationResult<unit>> =
     async {
-        match LakeFsStateStore.resolve options binding.WorkspaceRoot binding.ProviderStateRef with
+        match LakeFsStateStore.resolve options binding.RepositoryRoot binding.ProviderStateRef with
         | Error failure -> return Failed failure
         | Ok state ->
             return!

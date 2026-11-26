@@ -7,7 +7,7 @@ The host owns binding persistence. VersionControlService does not keep an applic
 `WorkspaceBinding` contains:
 
 - the schema version and provider ID
-- `WorkspaceRoot`, the path the provider received. For `Adopt`, this is the root Git reports.
+- `RepositoryRoot`, the path the provider received. For `Adopt`, this is the root Git reports.
 - an optional opaque provider state reference
 - a nonsecret repository location
 - an optional connection profile ID

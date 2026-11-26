@@ -43,7 +43,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let session = expectValue "open initialized workspace" openResult
 
                 let! status = sessionStatus session
-                Vitest.expect(status.WorkspaceVersion.Length > 0).toBe (true)
+                Vitest.expect(status.RepositoryVersion.Length > 0).toBe (true)
             }
 
             profileTest "clones an existing repository location"
@@ -134,7 +134,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         harness.Factory.Bind
                             {
-                                WorkspaceRoot = workspace.Binding.WorkspaceRoot
+                                RepositoryRoot = workspace.Binding.RepositoryRoot
                                 Location = otherWorkspace.Binding.Location
                             }
                             (ctx "bind")
@@ -165,7 +165,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         harness.Factory.Clone
                             {
                                 Location = anchor.Binding.Location
-                                TargetPath = anchor.Binding.WorkspaceRoot
+                                TargetPath = anchor.Binding.RepositoryRoot
                                 TargetRef = None
                                 MaterializeAllObjects = true
                             }

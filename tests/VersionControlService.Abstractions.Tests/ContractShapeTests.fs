@@ -76,7 +76,7 @@ module FakeProvider =
     let createFinalSynchronization () : SynchronizationService =
         let state = {
             BaseRevision = None
-            WorkspaceRevision = None
+            LocalRevision = None
             TargetRevision = None
             TargetRef = Some finalTargetRef
             LocalRevisionCount = None
@@ -134,7 +134,7 @@ module FakeProvider =
 
         let status () = {
             CurrentRef = None
-            WorkspaceVersion = currentToken ()
+            RepositoryVersion = currentToken ()
             Changes = [||]
             ActiveConflictSession = None
             Synchronization = None
@@ -164,7 +164,7 @@ module FakeProvider =
                 }
             CreateRevision =
                 fun request _ -> async {
-                    if request.ExpectedWorkspaceVersion <> currentToken () then
+                    if request.ExpectedRepositoryVersion <> currentToken () then
                         return
                             OperationResult.failed (
                                 OperationFailure.create Concurrency "precondition_failed" "Stale workspace version."
@@ -188,7 +188,7 @@ module FakeProvider =
     let createSynchronization () : SynchronizationService =
         let state = {
             BaseRevision = None
-            WorkspaceRevision = None
+            LocalRevision = None
             TargetRevision = None
             TargetRef = None
             LocalRevisionCount = None
@@ -227,13 +227,13 @@ module FakeProvider =
     let createBinding (id: ProviderId) (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = id
-        WorkspaceRoot = workspaceRoot
+        RepositoryRoot = workspaceRoot
         ProviderStateRef = None
         Location = location
         ConnectionProfileId = location.ConnectionProfileId
     }
 
-    let createFactory (id: ProviderId) (buildSession: WorkspaceDescriptor -> WorkspaceSession) : ProviderFactory = {
+    let createFactory (id: ProviderId) (buildSession: RepositoryDescriptor -> WorkspaceSession) : ProviderFactory = {
         Id = id
         Probe = fun _ -> async { return NotDetected }
         VerifyLocation =
@@ -264,13 +264,13 @@ module FakeProvider =
                 }
         Bind =
             fun request _ -> async {
-                return OperationResult.succeeded (createBinding id request.WorkspaceRoot request.Location)
+                return OperationResult.succeeded (createBinding id request.RepositoryRoot request.Location)
             }
         Open =
             fun binding _ -> async {
                 let descriptor = {
                     ProviderId = binding.ProviderId
-                    WorkspaceRoot = binding.WorkspaceRoot
+                    RepositoryRoot = binding.RepositoryRoot
                     Location = Some binding.Location
                 }
 
@@ -324,7 +324,7 @@ let private openSession (factory: ProviderFactory) =
         let! bindResult =
             factory.Bind
                 {
-                    WorkspaceRoot = "/fake/workspace"
+                    RepositoryRoot = "/fake/workspace"
                     Location = location
                 }
                 context
@@ -334,9 +334,9 @@ let private openSession (factory: ProviderFactory) =
         return expectSucceeded "open" openResult
     }
 
-let private availabilityDescriptor: WorkspaceDescriptor = {
+let private availabilityDescriptor: RepositoryDescriptor = {
     ProviderId = FakeProvider.providerId "fake.availability"
-    WorkspaceRoot = "/test/workspace"
+    RepositoryRoot = "/test/workspace"
     Location = None
 }
 
@@ -417,7 +417,7 @@ let contractShapeTests =
             let! statusResult = session.Core.GetStatus context
             let status = expectSucceeded "core status" statusResult
 
-            Expect.equal status.WorkspaceVersion "fake-token-1" "The core works without any optional service."
+            Expect.equal status.RepositoryVersion "fake-token-1" "The core works without any optional service."
         }
 
         testCaseAsync "a synchronization provider needs no object-storage service"
@@ -474,7 +474,7 @@ let contractShapeTests =
                     {
                         Message = "stale attempt"
                         Paths = [||]
-                        ExpectedWorkspaceVersion = "fake-stale-revision"
+                        ExpectedRepositoryVersion = "fake-stale-revision"
                     }
                     context
 

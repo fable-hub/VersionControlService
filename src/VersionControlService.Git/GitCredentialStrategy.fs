@@ -29,7 +29,7 @@ type RevisionIdentity = {
 /// the session profile, the same value credential resolution receives, so an
 /// application that keeps several accounts per host can pick the matching one.
 type RevisionIdentityRequest = {
-    WorkspaceRoot: string
+    RepositoryRoot: string
     TargetHost: string option
     ConnectionProfileId: string option
 }

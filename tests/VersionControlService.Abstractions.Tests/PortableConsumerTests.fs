@@ -61,7 +61,7 @@ let private openFakeSession (factory: ProviderFactory) (context: OperationContex
         let! bindResult =
             factory.Bind
                 {
-                    WorkspaceRoot = "/fake/workspace"
+                    RepositoryRoot = "/fake/workspace"
                     Location = FakeProvider.fakeLocation factory.Id
                 }
                 context
@@ -94,7 +94,7 @@ let portableConsumerTests =
             let! statusResult = session.Core.GetStatus context
             let status = expectSucceeded "get status" statusResult
 
-            Expect.equal status.WorkspaceVersion "fake-token-1" "The fake session returns its workspace version."
+            Expect.equal status.RepositoryVersion "fake-token-1" "The fake session returns its workspace version."
         }
 
         testCaseAsync "a portable opened session returns every final SPI value through optional service results"

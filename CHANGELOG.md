@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -   `WorkspaceSession` and `ServiceAvailability` have a new field `History`, so record literals have to set it. `WorkspaceSession.createCoreOnly` sets it to `None`.
 -   `OpenDiffRequest` has a new required field `Comparison`, so record literals have to set it. `DiffComparison.WorkingFile` keeps the earlier behavior.
 -   A committed side of a text diff reports its revision in `DiffSourceInfo.Revision`, also when its content is a Git LFS object. Such a side used to report none.
+-   `WorkspaceDescriptor` is renamed to `RepositoryDescriptor`. Its fields and behavior stay, and the `WorkspaceRoot` field is renamed as described below.
+-   `WorkspaceStatus` is renamed to `RepositoryStatus`. `CoreVersionControl.GetStatus` and `SwitchRef` return the new type name.
+-   The field `WorkspaceRoot` is renamed to `RepositoryRoot` in `RepositoryDescriptor`, `WorkspaceBinding`, `AdoptRequest`, `BindRequest` and the `RevisionIdentityRequest` of the Git package.
+-   The field `WorkspaceVersion` of `RepositoryStatus` is renamed to `RepositoryVersion`.
+-   The field `ExpectedWorkspaceVersion` is renamed to `ExpectedRepositoryVersion` in `CreateRefRequest`, `SwitchRefRequest`, `CreateRevisionRequest`, `RestoreRequest`, `UpdateRequest`, `PublishRequest`, `SynchronizeRequest`, `ResolveConflictRequest`, `FinalizeConflictRequest` and `CancelConflictRequest`.
+-   The field `ResultingWorkspaceVersion` of `OperationOutcome` is renamed to `ResultingRepositoryVersion`.
+-   The field `WorkspaceRevision` of `SynchronizationState` is renamed to `LocalRevision`.
 
 ### Removed
 

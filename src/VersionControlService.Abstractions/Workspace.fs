@@ -17,7 +17,7 @@ type WorkspaceBinding = {
     ProviderId: ProviderId
     /// The local workspace root as the provider received it (for Adopt, the root the provider reports).
     /// Hosts compare roots with `ProviderResolver.normalizePath`.
-    WorkspaceRoot: string
+    RepositoryRoot: string
     /// Opaque provider state reference (e.g. a provider-owned workspace branch or index location).
     ProviderStateRef: string option
     Location: RepositoryLocation
@@ -72,23 +72,23 @@ type CloneRequest = {
 /// or mutating the workspace. Provider discovery remains read-only; adoption is
 /// explicit and may be unsupported by a provider.
 type AdoptRequest = {
-    WorkspaceRoot: string
+    RepositoryRoot: string
     ConnectionProfileId: string option
 }
 
 /// Attaches or re-targets an existing local workspace to a repository location
 /// without cloning (the neutral replacement for "connect remote").
 type BindRequest = {
-    WorkspaceRoot: string
+    RepositoryRoot: string
     Location: RepositoryLocation
 }
 
 /// Identity of one opened workspace session.
-type WorkspaceDescriptor = {
+type RepositoryDescriptor = {
     ProviderId: ProviderId
     /// The local workspace root as the provider received it (for Adopt, the root the provider reports).
     /// Hosts compare roots with `ProviderResolver.normalizePath`.
-    WorkspaceRoot: string
+    RepositoryRoot: string
     Location: RepositoryLocation option
 }
 

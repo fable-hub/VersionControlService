@@ -85,7 +85,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! updateResult =
                     run (
                         (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "unchanged-update")
                     )
 
@@ -109,7 +109,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! updateResult =
                     run (
                         (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "update")
                     )
 
@@ -133,7 +133,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "add published file"
                                 Paths = [| mkPath "published.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "publish-revision")
                     )
@@ -146,7 +146,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = afterRevision.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterRevision.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish")
@@ -162,7 +162,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! linkedUpdate =
                     run (
                         (syncService linked.Session).Update
-                            { ExpectedWorkspaceVersion = linkedStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = linkedStatus.RepositoryVersion }
                             (ctx "linked-update")
                     )
 
@@ -178,7 +178,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = repeatStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = repeatStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "repeat-publish")
@@ -200,7 +200,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "revision awaiting publish"
                                 Paths = [| mkPath "retry.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "retry-revision")
                     )
@@ -214,7 +214,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = brokenStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = brokenStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "broken-publish")
@@ -228,7 +228,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! afterFailure = getStatus workspace
 
                 match afterFailure.Synchronization with
-                | Some sync -> Vitest.expect(sync.WorkspaceRevision = revision.ResultingRevision).toBe (true)
+                | Some sync -> Vitest.expect(sync.LocalRevision = revision.ResultingRevision).toBe (true)
                 | None -> failwith "Expected synchronization state."
 
                 do! harness.RestorePublish workspace
@@ -238,7 +238,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = restoredStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = restoredStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "retry-publish")
@@ -279,7 +279,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "local revision"
                                 Paths = [| mkPath "local.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "stale-revision")
                     )
@@ -291,7 +291,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Publish
                             {
-                                ExpectedWorkspaceVersion = prePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = prePublish.RepositoryVersion
                                 ExpectedTargetRevision = Some staleTarget
                             }
                             (ctx "stale-publish")
@@ -316,7 +316,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -348,7 +348,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "save local content"
                                 Paths = [| mkPath "local.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "synchronize-local-revision")
                     )
@@ -360,7 +360,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = afterRevision.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterRevision.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -399,7 +399,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -427,7 +427,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = acceptedStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = acceptedStatus.RepositoryVersion
                                 ExpectedTargetRevision = observedTarget
                                 AcceptUpdateRisks = true
                                 PublishLocalRevisions = false
@@ -462,7 +462,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "commit local divergence"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "synchronize-conflict-revision")
                     )
@@ -474,7 +474,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = divergentStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = divergentStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -494,7 +494,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = acceptedStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = acceptedStatus.RepositoryVersion
                                 ExpectedTargetRevision = Some observedTarget
                                 AcceptUpdateRisks = true
                                 PublishLocalRevisions = false
@@ -527,7 +527,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -547,7 +547,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = movedStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = movedStatus.RepositoryVersion
                                 ExpectedTargetRevision = Some oldTarget
                                 AcceptUpdateRisks = true
                                 PublishLocalRevisions = true
@@ -571,7 +571,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = true
                                 PublishLocalRevisions = false
@@ -595,7 +595,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "local-only revision"
                                 Paths = [| mkPath "local-only.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "synchronize-local-only-revision")
                     )
@@ -611,7 +611,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSync.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSync.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -635,7 +635,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = "stale"
+                                ExpectedRepositoryVersion = "stale"
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -665,7 +665,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "conflicting local revision"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "synchronize-conflict-revision")
                     )
@@ -675,7 +675,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! updateResult =
                     run (
                         (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (ctx "synchronize-open-conflict")
                     )
 
@@ -686,7 +686,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     run (
                         (syncService workspace.Session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = conflictStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = conflictStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false

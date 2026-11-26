@@ -38,7 +38,7 @@ let private openConflict (harness: ProviderTestHarness) = promise {
                 {
                     Message = "workspace conflicting change"
                     Paths = [| mkPath "base.txt" |]
-                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                 }
                 (ctx "conflict-save")
         )
@@ -49,7 +49,7 @@ let private openConflict (harness: ProviderTestHarness) = promise {
     let! updateResult =
         run (
             (syncService workspace.Session).Update
-                { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                { ExpectedRepositoryVersion = status.RepositoryVersion }
                 (ctx "conflict-update")
         )
 
@@ -87,7 +87,7 @@ let private openModifyDeleteConflict (harness: ProviderTestHarness) (targetDelet
                 {
                     Message = "workspace modify-delete change"
                     Paths = [| mkPath "base.txt" |]
-                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                 }
                 (ctx "modify-delete-save")
         )
@@ -98,7 +98,7 @@ let private openModifyDeleteConflict (harness: ProviderTestHarness) (targetDelet
     let! updateResult =
         run (
             (syncService workspace.Session).Update
-                { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                { ExpectedRepositoryVersion = status.RepositoryVersion }
                 (ctx "modify-delete-update")
         )
 
@@ -158,7 +158,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -176,7 +176,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
                                 Message = Some "finalize deleted target"
                             }
                             (ctx "finalize-deleted-target")
@@ -202,7 +202,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "workspace"
                             }
@@ -218,7 +218,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
                                 Message = Some "finalize deleted workspace"
                             }
                             (ctx "finalize-deleted-workspace")
@@ -239,7 +239,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -262,7 +262,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = SupplyResolvedContent "hand-merged content\n"
                             }
@@ -277,7 +277,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         (conflictService workspace.Session).Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
                                 Message = Some "merge with supplied content"
                             }
                             (ctx "finalize-content")
@@ -301,7 +301,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "workspace"
                             }
@@ -317,7 +317,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = afterRotate.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterRotate.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -335,7 +335,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                     SessionId = "foreign-session"
                                     Version = "1"
                                 }
-                                ExpectedWorkspaceVersion = afterRotate.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterRotate.RepositoryVersion
                                 Message = None
                             }
                             (ctx "foreign-finalize")
@@ -345,7 +345,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 // No mutation happened: the workspace version is unchanged.
                 let! finalStatus = getStatus workspace
-                Vitest.expect(finalStatus.WorkspaceVersion).toBe (afterRotate.WorkspaceVersion)
+                Vitest.expect(finalStatus.RepositoryVersion).toBe (afterRotate.RepositoryVersion)
             }
 
             profileTest "refresh and deliberate retry recover a live session after a stale rejection"
@@ -360,7 +360,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = "not-the-current-version"
+                                ExpectedRepositoryVersion = "not-the-current-version"
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -379,7 +379,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             conflicts.Resolve
                                 {
                                     Handle = liveSummary.Handle
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "target"
                                 }
@@ -401,7 +401,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -416,7 +416,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
                                 Message = Some "finalize conflict"
                             }
                             (ctx "finalize")
@@ -436,7 +436,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterFinalize.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterFinalize.RepositoryVersion
                                 Message = None
                             }
                             (ctx "replay-finalize")
@@ -460,7 +460,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Cancel
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "cancel")
                     )
@@ -486,7 +486,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -510,7 +510,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterResolve.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterResolve.RepositoryVersion
                                 Message = Some "finalize during race"
                             }
                             (ctx "race-finalize")

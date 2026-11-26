@@ -262,7 +262,7 @@ Vitest.describe (
                         let binding: WorkspaceBinding = {
                             SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                             ProviderId = gitProviderId
-                            WorkspaceRoot = workPath
+                            RepositoryRoot = workPath
                             ProviderStateRef = None
                             Location = {
                                 ProviderId = gitProviderId
@@ -391,7 +391,7 @@ Vitest.describe (
                         let binding: WorkspaceBinding = {
                             SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                             ProviderId = gitProviderId
-                            WorkspaceRoot = workPath
+                            RepositoryRoot = workPath
                             ProviderStateRef = None
                             Location = {
                                 ProviderId = gitProviderId
@@ -508,7 +508,7 @@ Vitest.describe (
                         let binding: WorkspaceBinding = {
                             SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                             ProviderId = gitProviderId
-                            WorkspaceRoot = workPath
+                            RepositoryRoot = workPath
                             ProviderStateRef = None
                             Location = {
                                 ProviderId = gitProviderId
@@ -770,7 +770,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = workPath
+                        RepositoryRoot = workPath
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId
@@ -826,7 +826,7 @@ Vitest.describe (
                                         RepositoryPath.tryCreate "authenticated-publish.txt"
                                         |> Result.defaultWith failwith
                                     |]
-                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "credential-revision")
                         |> Async.StartAsPromise
@@ -838,7 +838,7 @@ Vitest.describe (
                     let! publishResult =
                         syncService.Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "credential-publish")
@@ -946,7 +946,7 @@ Vitest.describe (
                         Async.StartAsPromise(
                             factory.Bind
                                 {
-                                    WorkspaceRoot = workPath
+                                    RepositoryRoot = workPath
                                     Location = {
                                         ProviderId = gitProviderId
                                         DisplayName = None
@@ -965,7 +965,7 @@ Vitest.describe (
                         Async.StartAsPromise(
                             factory.Bind
                                 {
-                                    WorkspaceRoot = workPath
+                                    RepositoryRoot = workPath
                                     Location = anonymousBinding.Location
                                 }
                                 (ctx "local-bind")
@@ -1058,7 +1058,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = workPath
+                        RepositoryRoot = workPath
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId
@@ -1111,7 +1111,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = workPath
+                        RepositoryRoot = workPath
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId
@@ -1137,7 +1137,7 @@ Vitest.describe (
                         Async.StartAsPromise(
                             syncService.Publish
                                 {
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (ctx "missing-remote-publish")
@@ -1421,7 +1421,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = workPath
+                        RepositoryRoot = workPath
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId

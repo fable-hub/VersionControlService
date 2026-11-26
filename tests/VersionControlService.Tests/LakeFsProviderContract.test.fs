@@ -69,7 +69,7 @@ let lakeFsProviderOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
 }
 
 let stateDirectoryForBinding (binding: WorkspaceBinding) =
-    match LakeFsStateStore.resolve lakeFsProviderOptions binding.WorkspaceRoot binding.ProviderStateRef with
+    match LakeFsStateStore.resolve lakeFsProviderOptions binding.RepositoryRoot binding.ProviderStateRef with
     | Ok state -> state.StateDirectory
     | Error failure -> failwith $"Resolving test provider state failed ({failure.Code}): {failure.Message}"
 
@@ -148,7 +148,7 @@ let private repositoryPath value =
 type private MaterializationRecoveryScenario = {
     Root: string
     State: LakeFsStateStore.ResolvedState
-    WorkspaceRoot: string
+    RepositoryRoot: string
     CurrentIndex: LakeFsWorkspaceIndex.WorkspaceIndex
     Plan: LakeFsMaterialization.MaterializationPlan
     Paths: RepositoryPath[]
@@ -257,7 +257,7 @@ let private createMaterializationRecoveryScenario () = promise {
     return {
         Root = root
         State = state
-        WorkspaceRoot = workspaceRoot
+        RepositoryRoot = workspaceRoot
         CurrentIndex = currentIndex
         Plan = prepared |> Result.defaultWith (fun failure -> failwith failure.Message)
         Paths = paths
@@ -272,7 +272,7 @@ let private partiallyApplyRecoveryScenario scenario = promise {
 
     return!
         LakeFsMaterialization.apply
-            scenario.WorkspaceRoot
+            scenario.RepositoryRoot
             scenario.State.StateDirectory
             scenario.State.RecoveryDirectory
             scenario.CurrentIndex.WorkspaceRevision
@@ -420,7 +420,7 @@ let createLakeFsHarness () : ProviderTestHarness =
         {
             SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
             ProviderId = location.ProviderId
-            WorkspaceRoot = root
+            RepositoryRoot = root
             ProviderStateRef = Some state.StateId
             Location = location
             ConnectionProfileId = location.ConnectionProfileId
@@ -601,7 +601,7 @@ let createLakeFsHarness () : ProviderTestHarness =
             | Failed failure ->
                 failwith $"lakeFS session open failed ({failure.Category}/{failure.Code}): {failure.Message}"
 
-        controls[binding.WorkspaceRoot] <- {
+        controls[binding.RepositoryRoot] <- {
             Location = binding.Location
             Binding = binding
             RaceMutations = None
@@ -611,9 +611,9 @@ let createLakeFsHarness () : ProviderTestHarness =
         return {
             Session = session
             Binding = binding
-            WriteFile = fun path content -> writeUtf8FileAsync (join [| binding.WorkspaceRoot; path |]) content
-            ReadFile = fun path -> tryReadUtf8FileAsync (join [| binding.WorkspaceRoot; path |])
-            RemoveFile = fun path -> removeFileAsync (join [| binding.WorkspaceRoot; path |])
+            WriteFile = fun path content -> writeUtf8FileAsync (join [| binding.RepositoryRoot; path |]) content
+            ReadFile = fun path -> tryReadUtf8FileAsync (join [| binding.RepositoryRoot; path |])
+            RemoveFile = fun path -> removeFileAsync (join [| binding.RepositoryRoot; path |])
             // Windows and macOS default filesystems alias case, and only Windows enforces its
             // reserved names. Linux runners do neither, so the flags follow the platform.
             LocalFileSystemAliasesCase = localFileSystemAliasesCase ()
@@ -739,12 +739,12 @@ let createLakeFsHarness () : ProviderTestHarness =
             }
         ArmDestinationRace =
             fun workspace mutations -> promise {
-                controls[workspace.Binding.WorkspaceRoot].RaceMutations <- Some mutations
+                controls[workspace.Binding.RepositoryRoot].RaceMutations <- Some mutations
                 return ()
             }
         ArmSlowTransfer =
             fun workspace -> promise {
-                controls[workspace.Binding.WorkspaceRoot].SlowTransfer <- true
+                controls[workspace.Binding.RepositoryRoot].SlowTransfer <- true
                 return ()
             }
         Cleanup =
@@ -944,7 +944,7 @@ let private createSingleFileConflict harness = promise {
             {
                 Message = "create conflict staleness workspace revision"
                 Paths = [| repositoryPath "base.txt" |]
-                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
             }
             (context "conflict-staleness-save")
         |> Async.StartAsPromise
@@ -962,7 +962,7 @@ let private createSingleFileConflict harness = promise {
 
     let! updateResult =
         synchronization.Update
-            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+            { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
             (context "conflict-staleness-update")
         |> Async.StartAsPromise
 
@@ -1028,7 +1028,7 @@ Vitest.describe (
                         canceledConflicts.Cancel
                             {
                                 Handle = canceledSummary.Handle
-                                ExpectedWorkspaceVersion = cancelStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = cancelStatus.RepositoryVersion
                             }
                             (context "recovery-cancel")
                         |> Async.StartAsPromise
@@ -1062,7 +1062,7 @@ Vitest.describe (
                         finalizedConflicts.Resolve
                             {
                                 Handle = finalizedSummary.Handle
-                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
                                 Path = finalizedSummary.Items[0].Path
                                 Resolution = PickCandidate "target"
                             }
@@ -1081,7 +1081,7 @@ Vitest.describe (
                         finalizedConflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "cleanup candidates"
                             }
                             (context "recovery-finalize")
@@ -1130,7 +1130,7 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     let beforeUpdate = expectOperationValue "recovery gating before update" beforeUpdateResult
-                    armMaterializationApplyFailure workspace.Binding.WorkspaceRoot
+                    armMaterializationApplyFailure workspace.Binding.RepositoryRoot
 
                     let synchronization =
                         workspace.Session.Synchronization
@@ -1138,7 +1138,7 @@ Vitest.describe (
 
                     let! updateResult =
                         synchronization.Update
-                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (context "recovery-gating-update")
                         |> Async.StartAsPromise
 
@@ -1166,7 +1166,7 @@ Vitest.describe (
                     let resolvedState =
                         LakeFsStateStore.resolve
                             lakeFsProviderOptions
-                            workspace.Binding.WorkspaceRoot
+                            workspace.Binding.RepositoryRoot
                             workspace.Binding.ProviderStateRef
                         |> Result.defaultWith (fun failure -> failwith failure.Message)
 
@@ -1182,7 +1182,7 @@ Vitest.describe (
                         workspace.Session.Core.RestorePaths
                             {
                                 Paths = [||]
-                                ExpectedWorkspaceVersion = partialStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = partialStatus.RepositoryVersion
                             }
                             (context "recovery-gating-empty-restore")
                         |> Async.StartAsPromise
@@ -1206,7 +1206,7 @@ Vitest.describe (
                             {
                                 Message = "blocked during materialization recovery"
                                 Paths = [| replacedPath |]
-                                ExpectedWorkspaceVersion = partialStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = partialStatus.RepositoryVersion
                             }
                             (context "recovery-gating-create-revision")
                         |> Async.StartAsPromise
@@ -1215,7 +1215,7 @@ Vitest.describe (
 
                     let! blockedUpdateResult =
                         synchronization.Update
-                            { ExpectedWorkspaceVersion = partialStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = partialStatus.RepositoryVersion }
                             (context "recovery-gating-blocked-update")
                         |> Async.StartAsPromise
 
@@ -1233,7 +1233,7 @@ Vitest.describe (
                         workspace.Session.Core.RestorePaths
                             {
                                 Paths = [| repositoryPath "caller-only.txt" |]
-                                ExpectedWorkspaceVersion = callerStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = callerStatus.RepositoryVersion
                             }
                             (context "recovery-gating-replay")
                         |> Async.StartAsPromise
@@ -1967,7 +1967,7 @@ Vitest.describe (
 
                     let! replay =
                         LakeFsMaterialization.reapplyPending
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             (fun _ _ -> async.Return())
@@ -1991,7 +1991,7 @@ Vitest.describe (
 
                     let! completed =
                         LakeFsMaterialization.reapplyPending
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             (fun _ _ -> async.Return())
@@ -2031,7 +2031,7 @@ Vitest.describe (
 
                     let! replay =
                         LakeFsMaterialization.reapplyPending
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             (fun _ _ -> async.Return())
@@ -2077,7 +2077,7 @@ Vitest.describe (
                 try
                     let! applied =
                         LakeFsMaterialization.apply
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             scenario.CurrentIndex.WorkspaceRevision
@@ -2191,7 +2191,7 @@ Vitest.describe (
 
                     let! replay =
                         LakeFsMaterialization.reapplyPending
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             (fun _ _ -> async.Return())
@@ -2307,7 +2307,7 @@ Vitest.describe (
 
                     let! replay =
                         LakeFsMaterialization.reapplyPending
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             (fun _ _ -> async.Return())
@@ -2364,7 +2364,7 @@ Vitest.describe (
 
                     let! applied =
                         LakeFsMaterialization.apply
-                            scenario.WorkspaceRoot
+                            scenario.RepositoryRoot
                             scenario.State.StateDirectory
                             scenario.State.RecoveryDirectory
                             scenario.CurrentIndex.WorkspaceRevision
@@ -2415,7 +2415,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
                                 Path = summary.Items[0].Path
                                 Resolution = PickCandidate "target"
                             }
@@ -2435,7 +2435,7 @@ Vitest.describe (
                     let state =
                         LakeFsStateStore.resolve
                             lakeFsProviderOptions
-                            workspace.Binding.WorkspaceRoot
+                            workspace.Binding.RepositoryRoot
                             workspace.Binding.ProviderStateRef
                         |> Result.defaultWith (fun failure -> failwith failure.Message)
 
@@ -2483,7 +2483,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = pendingStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = pendingStatus.RepositoryVersion
                                 Path = summary.Items[0].Path
                                 Resolution = PickCandidate "workspace"
                             }
@@ -2496,7 +2496,7 @@ Vitest.describe (
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = pendingStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = pendingStatus.RepositoryVersion
                                 Message = Some "must remain blocked"
                             }
                             (context "recovery-conflict-blocked-finalize")
@@ -2508,7 +2508,7 @@ Vitest.describe (
                         conflicts.Cancel
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = pendingStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = pendingStatus.RepositoryVersion
                             }
                             (context "recovery-conflict-blocked-cancel")
                         |> Async.StartAsPromise
@@ -2729,7 +2729,7 @@ Vitest.describe (
                             {
                                 Message = "save selected literal path"
                                 Paths = [| repositoryPath "selected[1].txt" |]
-                                ExpectedWorkspaceVersion = statusBeforeRevision.WorkspaceVersion
+                                ExpectedRepositoryVersion = statusBeforeRevision.RepositoryVersion
                             }
                             (context "selected-revision-create")
                         |> Async.StartAsPromise
@@ -2798,7 +2798,7 @@ Vitest.describe (
                             {
                                 Message = "race selected revision"
                                 Paths = [| repositoryPath "selected[1].txt" |]
-                                ExpectedWorkspaceVersion = raceStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = raceStatus.RepositoryVersion
                             }
                             (context "selected-revision-race")
                         |> Async.StartAsPromise
@@ -2899,7 +2899,7 @@ Vitest.describe (
                         workspace.Session.Core.RestorePaths
                             {
                                 Paths = [| repositoryPath "base.txt" |]
-                                ExpectedWorkspaceVersion = dirtyStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = dirtyStatus.RepositoryVersion
                             }
                             (context "core-reads-restore")
                         |> Async.StartAsPromise
@@ -2960,7 +2960,7 @@ Vitest.describe (
                             {
                                 Message = "create paginated local revision"
                                 Paths = localPaths |> Array.map repositoryPath
-                                ExpectedWorkspaceVersion = localStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = localStatus.RepositoryVersion
                             }
                             (context "refresh-preview-local-revision")
                         |> Async.StartAsPromise
@@ -3080,7 +3080,7 @@ Vitest.describe (
                             {
                                 Message = "create conflicting workspace revision"
                                 Paths = [| repositoryPath "base.txt"; repositoryPath "second.txt" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (context "conflict-cycle-save")
                         |> Async.StartAsPromise
@@ -3098,7 +3098,7 @@ Vitest.describe (
 
                     let! updateResult =
                         synchronization.Update
-                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (context "conflict-cycle-update")
                         |> Async.StartAsPromise
 
@@ -3146,7 +3146,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
                                 Path = firstItem.Path
                                 Resolution = PickCandidate "target"
                             }
@@ -3168,7 +3168,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = afterFirstStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterFirstStatus.RepositoryVersion
                                 Path = secondItem.Path
                                 Resolution = PickCandidate "workspace"
                             }
@@ -3200,7 +3200,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = firstResolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = afterFirstStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterFirstStatus.RepositoryVersion
                                 Path = secondItem.Path
                                 Resolution = SupplyResolvedContent "supplied second\n"
                             }
@@ -3219,7 +3219,7 @@ Vitest.describe (
                         conflicts.Finalize
                             {
                                 Handle = secondResolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = None
                             }
                             (context "conflict-cycle-finalize")
@@ -3257,7 +3257,7 @@ Vitest.describe (
                         conflicts.Cancel
                             {
                                 Handle = secondResolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = closedStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = closedStatus.RepositoryVersion
                             }
                             (context "conflict-cycle-closed-replay")
                         |> Async.StartAsPromise
@@ -3327,13 +3327,13 @@ Vitest.describe (
                             |> Async.StartAsPromise
 
                         let secondStatus = expectOperationValue "conflict staleness second status" secondStatusResult
-                        Vitest.expect(secondStatus.WorkspaceVersion).not.toBe firstStatus.WorkspaceVersion
+                        Vitest.expect(secondStatus.RepositoryVersion).not.toBe firstStatus.RepositoryVersion
 
                         let! resolutionResult =
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                                     Path = item.Path
                                     Resolution = PickCandidate "workspace"
                                 }
@@ -3385,7 +3385,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = resolutionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = resolutionStatus.RepositoryVersion
                                 Path = item.Path
                                 Resolution = PickCandidate "workspace"
                             }
@@ -3399,14 +3399,14 @@ Vitest.describe (
                         |> Async.StartAsPromise
 
                     let finalizeStatus = expectOperationValue "conflict staleness finalize status" finalizeStatusResult
-                    candidatePath <- join [| workspace.Binding.WorkspaceRoot; "base.txt" |]
-                    outsideDirectory <- workspace.Binding.WorkspaceRoot + "-outside"
+                    candidatePath <- join [| workspace.Binding.RepositoryRoot; "base.txt" |]
+                    outsideDirectory <- workspace.Binding.RepositoryRoot + "-outside"
                     let outsideFile = join [| outsideDirectory; "base.txt" |]
                     let tracker = beginUploadRequestTracking ()
 
                     try
                         armFinalizePathMutation
-                            workspace.Binding.WorkspaceRoot
+                            workspace.Binding.RepositoryRoot
                             (fun () -> promise {
                                 RuntimeNodeFileSystem.mkdirSync outsideDirectory (RuntimeNodeFileSystem.MkdirOptions(recursive = true))
                                 RuntimeNodeFileSystem.writeFileSync
@@ -3428,7 +3428,7 @@ Vitest.describe (
                             conflicts.Finalize
                                 {
                                     Handle = resolution.RefreshedHandle
-                                    ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                     Message = Some "finalize symlink conflict"
                                 }
                                 (context "conflict-staleness-symlink-finalize")

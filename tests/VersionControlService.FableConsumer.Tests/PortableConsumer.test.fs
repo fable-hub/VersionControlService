@@ -35,7 +35,7 @@ let private fakeTargetRef: LogicalRef = {
 
 let private fakeSynchronizationState: SynchronizationState = {
     BaseRevision = None
-    WorkspaceRevision = None
+    LocalRevision = None
     TargetRevision = None
     TargetRef = Some fakeTargetRef
     LocalRevisionCount = None
@@ -103,7 +103,7 @@ let private createFakeObjectMaterialization () : ObjectMaterializationService = 
 let private createFakeCore () : CoreVersionControl =
     let status = {
         CurrentRef = None
-        WorkspaceVersion = "fake-revision-1"
+        RepositoryVersion = "fake-revision-1"
         Changes = [||]
         ActiveConflictSession = None
         Synchronization = None
@@ -151,7 +151,7 @@ let private createFakeFactory () : ProviderFactory =
     let binding workspaceRoot location = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = fakeProviderId
-        WorkspaceRoot = workspaceRoot
+        RepositoryRoot = workspaceRoot
         ProviderStateRef = None
         Location = location
         ConnectionProfileId = None
@@ -184,12 +184,12 @@ let private createFakeFactory () : ProviderFactory =
                         )
                 }
         Bind =
-            fun request _ -> async { return OperationResult.succeeded (binding request.WorkspaceRoot request.Location) }
+            fun request _ -> async { return OperationResult.succeeded (binding request.RepositoryRoot request.Location) }
         Open =
             fun workspaceBinding _ -> async {
                 let descriptor = {
                     ProviderId = workspaceBinding.ProviderId
-                    WorkspaceRoot = workspaceBinding.WorkspaceRoot
+                    RepositoryRoot = workspaceBinding.RepositoryRoot
                     Location = Some workspaceBinding.Location
                 }
 
@@ -226,7 +226,7 @@ let private openFakeSession (factory: ProviderFactory) (context: OperationContex
         let! bindResult =
             factory.Bind
                 {
-                    WorkspaceRoot = "/fake/workspace"
+                    RepositoryRoot = "/fake/workspace"
                     Location = fakeLocation
                 }
                 context
@@ -252,7 +252,7 @@ Vitest.describe (
                 }
 
                 let! status = Async.StartAsPromise workflow
-                Vitest.expect(status.WorkspaceVersion).toBe ("fake-revision-1")
+                Vitest.expect(status.RepositoryVersion).toBe ("fake-revision-1")
             }
         )
 

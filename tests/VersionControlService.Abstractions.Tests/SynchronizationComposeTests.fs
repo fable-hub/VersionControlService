@@ -15,7 +15,7 @@ let private path value =
 
 let private state relationship target = {
     BaseRevision = None
-    WorkspaceRevision = None
+    LocalRevision = None
     TargetRevision = target
     TargetRef = None
     LocalRevisionCount = None
@@ -25,7 +25,7 @@ let private state relationship target = {
 }
 
 let private request accept publish target = {
-    ExpectedWorkspaceVersion = "workspace-version"
+    ExpectedRepositoryVersion = "workspace-version"
     ExpectedTargetRevision = target
     AcceptUpdateRisks = accept
     PublishLocalRevisions = publish

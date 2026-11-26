@@ -1518,7 +1518,7 @@ let private resolveRevisionIdentity
                     | Error failure -> return Error failure
                     | Ok targetUrl ->
                         let identityRequest: GitCredentialStrategy.RevisionIdentityRequest = {
-                            WorkspaceRoot = state.RepoPath
+                            RepositoryRoot = state.RepoPath
                             TargetHost = targetUrl |> Option.bind GitCredentialStrategy.tryIdentityHost
                             ConnectionProfileId = state.ConnectionProfileId
                         }
@@ -1619,13 +1619,13 @@ let private toWorkspaceStatus
                             Kind = LocalRef
                             IsCurrent = true
                         })
-                    WorkspaceVersion = version
+                    RepositoryVersion = version
                     Changes = changes
                     ActiveConflictSession = None
                     Synchronization =
                         Some {
                             BaseRevision = None
-                            WorkspaceRevision = workspaceRevision
+                            LocalRevision = workspaceRevision
                             TargetRevision = targetRevision
                             TargetRef = upstream |> Option.map _.LogicalRef
                             LocalRevisionCount = upstream |> Option.map (fun _ -> status.Ahead)
@@ -3543,7 +3543,7 @@ let private synchronizationState (state: SessionState) (context: OperationContex
                     return
                         Ok {
                             BaseRevision = baseRevision |> Option.map GitInternals.mkRevisionId
-                            WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                            LocalRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
                             TargetRevision = targetRevision |> Option.map GitInternals.mkRevisionId
                             TargetRef = upstream |> Option.map _.LogicalRef
                             LocalRevisionCount = None
@@ -4133,7 +4133,7 @@ let private updateFromState
                         let outcome = {
                             OperationOutcome.performed newState with
                                 AffectedPaths = affectedPaths
-                                ResultingRevision = newState.WorkspaceRevision
+                                ResultingRevision = newState.LocalRevision
                         }
 
                         match hydration with
@@ -4810,7 +4810,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
 
                             let fallbackState verifiedRevision relationship = {
                                 BaseRevision = None
-                                WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                LocalRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
                                 TargetRevision = verifiedRevision |> Option.map GitInternals.mkRevisionId
                                 TargetRef = None
                                 LocalRevisionCount = None
@@ -4873,7 +4873,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             {
                                                 syncState with
                                                     BaseRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
-                                                    WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                                    LocalRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
                                                     TargetRevision = verifiedRevision |> Option.map GitInternals.mkRevisionId
                                                     RemoteChangedPaths = None
                                                     Relationship = UpToDate
@@ -4965,7 +4965,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                             {
                                                 syncState with
                                                     BaseRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
-                                                    WorkspaceRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
+                                                    LocalRevision = workspaceRevision |> Option.map GitInternals.mkRevisionId
                                                     TargetRevision = verifiedRevision |> Option.map GitInternals.mkRevisionId
                                                     RemoteChangedPaths = None
                                                     Relationship = UpToDate
@@ -5532,7 +5532,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
         Resolve =
             fun request context ->
                 withSerializedConflictMutation state (fun () -> async {
-                    let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
+                    let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
 
                     match validation with
                     | Error failure -> return Failed failure
@@ -5838,7 +5838,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
         Finalize =
             fun request context ->
                 withSerializedConflictMutation state (fun () -> async {
-                    let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
+                    let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
 
                     match validation with
                     | Error failure -> return Failed failure
@@ -6106,7 +6106,7 @@ let private createConflictService (state: SessionState) : ConflictResolutionServ
         Cancel =
             fun request context ->
                 withSerializedConflictMutation state (fun () -> async {
-                    let! validation = validateConflictHandle state request.Handle request.ExpectedWorkspaceVersion context
+                    let! validation = validateConflictHandle state request.Handle request.ExpectedRepositoryVersion context
 
                     match validation with
                     | Error failure -> return Failed failure
@@ -6180,7 +6180,7 @@ let private createSessionWithTextDiff
     (binding: WorkspaceBinding)
     : WorkspaceSession =
     let state = {
-        RepoPath = binding.WorkspaceRoot
+        RepoPath = binding.RepositoryRoot
         Hooks = hooks
         Lock = MutationLock()
         Location = binding.Location
@@ -6213,27 +6213,27 @@ let private createSessionWithTextDiff
         ListRefs = fun context -> listRefs state context
         CreateRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                     createRef state request context)
         PreflightSwitchRef = fun request context -> preflightSwitchRef state request context
         SwitchRef =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                     switchRef state request context)
         CreateRevision =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                     createRevision state request context)
         RestorePaths =
             fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                     restorePaths state request context)
         GetDiffSummary = fun context -> getDiffSummary state context
     }
 
     let descriptor = {
         ProviderId = gitProviderId
-        WorkspaceRoot = binding.WorkspaceRoot
+        RepositoryRoot = binding.RepositoryRoot
         Location = Some binding.Location
     }
 
@@ -6272,7 +6272,7 @@ let private createSessionWithTextDiff
                     PreviewUpdate = fun context -> previewUpdate state context
                     Update =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                            withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                                 async {
                                     let! guardResult = activeOperationGuard state context
 
@@ -6284,7 +6284,7 @@ let private createSessionWithTextDiff
                                 })
                     Publish =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                            withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                                 async {
                                     let! guardResult = activeOperationGuard state context
 
@@ -6296,7 +6296,7 @@ let private createSessionWithTextDiff
                                 })
                     Synchronize =
                         fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion context (fun () ->
+                            withValidatedMutation state request.ExpectedRepositoryVersion context (fun () ->
                                 async {
                                     let! result =
                                         Synchronization.compose
@@ -6431,7 +6431,7 @@ let private probe (workspacePath: string) : Async<ProbeResult> =
 let private bindingFor (workspaceRoot: string) (location: RepositoryLocation) : WorkspaceBinding = {
     SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
     ProviderId = gitProviderId
-    WorkspaceRoot = workspaceRoot
+    RepositoryRoot = workspaceRoot
     ProviderStateRef = None
     Location = {
         location with
@@ -7125,13 +7125,13 @@ let private createFactoryWithSessions
                 }
 
                 let! rootResult =
-                    runGit hooks request.WorkspaceRoot [| "rev-parse"; "--show-toplevel" |] None context
+                    runGit hooks request.RepositoryRoot [| "rev-parse"; "--show-toplevel" |] None context
 
                 match rootResult with
                 | Error failure -> return Failed failure
                 | Ok rootOutput when rootOutput.ExitCode = 0 ->
                     return! adoptParsedRoot (rootOutput.StdOut.Trim())
-                | Ok output when hasGitEntry request.WorkspaceRoot ->
+                | Ok output when hasGitEntry request.RepositoryRoot ->
                     let detail = output.StdErr + output.StdOut
 
                     if detail.Contains("dubious ownership", StringComparison.OrdinalIgnoreCase) then
@@ -7165,7 +7165,7 @@ let private createFactoryWithSessions
             | Error failure -> return Failed failure
             | Ok location ->
                 // Attach or re-target: set the origin remote of the existing workspace.
-                let! existing = runGit hooks request.WorkspaceRoot [| "remote" |] None context
+                let! existing = runGit hooks request.RepositoryRoot [| "remote" |] None context
 
                 let hasOrigin =
                     match existing with
@@ -7179,7 +7179,7 @@ let private createFactoryWithSessions
                     if hasOrigin then
                         runGitChecked
                             hooks
-                            request.WorkspaceRoot
+                            request.RepositoryRoot
                             [|
                                 "remote"
                                 "set-url"
@@ -7192,7 +7192,7 @@ let private createFactoryWithSessions
                     else
                         runGitChecked
                             hooks
-                            request.WorkspaceRoot
+                            request.RepositoryRoot
                             [|
                                 "remote"
                                 "add"
@@ -7210,7 +7210,7 @@ let private createFactoryWithSessions
                     // is exactly what `git fetch origin` will use.
                     let! effectiveLocation =
                         async {
-                            let! result = runGit hooks request.WorkspaceRoot [| "remote"; "get-url"; "origin" |] None context
+                            let! result = runGit hooks request.RepositoryRoot [| "remote"; "get-url"; "origin" |] None context
 
                             match result with
                             | Ok output when output.ExitCode = 0 && not (String.IsNullOrWhiteSpace output.StdOut) ->
@@ -7229,12 +7229,12 @@ let private createFactoryWithSessions
                             "fetch"
                             false
                             hooks
-                            request.WorkspaceRoot
+                            request.RepositoryRoot
                             (fetchArguments authArguments "origin")
                             [||]
                             context
 
-                    return OperationResult.succeeded (bindingFor request.WorkspaceRoot location)
+                    return OperationResult.succeeded (bindingFor request.RepositoryRoot location)
         }
     Open =
         fun binding _ -> async {

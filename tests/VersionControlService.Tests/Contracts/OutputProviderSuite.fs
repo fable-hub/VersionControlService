@@ -88,7 +88,7 @@ let register (harness: ProviderTestHarness) (secrets: string[]) : string * (unit
                             {
                                 Message = "revision with output"
                                 Paths = [| mkPath "output.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             context
                     )

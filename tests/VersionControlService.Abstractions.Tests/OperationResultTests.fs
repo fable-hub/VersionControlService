@@ -158,13 +158,13 @@ let operationResultTests =
                     |]
                     AffectedPaths = [| "x.txt"; "y.txt" |]
                     ResultingRevision = Some(expectRevisionId "def456")
-                    ResultingWorkspaceVersion = Some "workspace-token-1"
+                    ResultingRepositoryVersion = Some "workspace-token-1"
                     Publication = LocalOnly
             }
 
             Expect.equal outcome.Warnings.Length 1 "Structured warning kept."
             Expect.equal outcome.AffectedPaths.Length 2 "Affected paths kept."
-            Expect.equal outcome.ResultingWorkspaceVersion (Some "workspace-token-1") "Workspace version kept."
+            Expect.equal outcome.ResultingRepositoryVersion (Some "workspace-token-1") "Workspace version kept."
             Expect.equal outcome.Publication LocalOnly "Publication state kept."
 
         testCase "redaction strips credential material from failure details"

@@ -65,7 +65,7 @@ let quickStart (targetPath: string) =
         let readVersion () =
             async {
                 let! status = session.Core.GetStatus context
-                return (valueOf status).WorkspaceVersion
+                return (valueOf status).RepositoryVersion
             }
 
         // Edit files under targetPath, then read the status.
@@ -80,7 +80,7 @@ let quickStart (targetPath: string) =
                     {
                         Message = "Update results"
                         Paths = status.Changes |> Array.map (fun change -> change.Path)
-                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        ExpectedRepositoryVersion = status.RepositoryVersion
                     }
                     context
 
@@ -90,7 +90,7 @@ let quickStart (targetPath: string) =
         | Some sync ->
             // Pull. Every mutation moves the version, so read it again each time.
             let! version = readVersion ()
-            let! updated = sync.Update { ExpectedWorkspaceVersion = version } context
+            let! updated = sync.Update { ExpectedRepositoryVersion = version } context
             printfn "After update: %A" (valueOf updated).Relationship
 
             // Push.
@@ -99,7 +99,7 @@ let quickStart (targetPath: string) =
             let! published =
                 sync.Publish
                     {
-                        ExpectedWorkspaceVersion = version
+                        ExpectedRepositoryVersion = version
                         ExpectedTargetRevision = None
                     }
                     context
@@ -116,7 +116,7 @@ let main _ =
     0
 ```
 
-Each mutation carries the `WorkspaceVersion` of the status the caller last read. A workspace that changed in between rejects the call with a `Concurrency` failure. The Git provider does not return the new version after a mutation, so the example reads the status again before each one. `Synchronization` is optional on a session, which is why the example matches on it.
+Each mutation carries the `RepositoryVersion` of the status the caller last read. A workspace that changed in between rejects the call with a `Concurrency` failure. The Git provider does not return the new version after a mutation, so the example reads the status again before each one. `Synchronization` is optional on a session, which is why the example matches on it.
 
 `Synchronization.Synchronize` runs the pull and the push as one operation. It refuses when the pull would overwrite local changes or open a conflict session, and [synchronizing](docs/consuming.md#synchronizing) shows the refusals a host handles.
 

@@ -243,7 +243,7 @@ let private createSyncFixture (hooks: GitWorkspaceSession.GitSessionHooks) = pro
     let binding: WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = gitProviderId
-        WorkspaceRoot = workPath
+        RepositoryRoot = workPath
         ProviderStateRef = None
         Location = {
             ProviderId = gitProviderId
@@ -261,7 +261,7 @@ let private createSyncFixture (hooks: GitWorkspaceSession.GitSessionHooks) = pro
 let private syncBinding (workPath: string) (barePath: string) : WorkspaceBinding = {
     SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
     ProviderId = gitProviderId
-    WorkspaceRoot = workPath
+    RepositoryRoot = workPath
     ProviderStateRef = None
     Location = {
         ProviderId = gitProviderId
@@ -444,7 +444,7 @@ let private createLfsConflictFixtureWithOptions
                         {
                             Message = "local LFS binary conflict"
                             Paths = [| mkPath path |]
-                            ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                            ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                         }
                         (ctx "lfs-binary-conflict-save")
                 )
@@ -465,7 +465,7 @@ let private createLfsConflictFixtureWithOptions
             let! updateResult =
                 Async.StartAsPromise(
                     (syncService session).Update
-                        { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                        { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                         (ctx "lfs-binary-conflict-update")
                 )
 
@@ -534,7 +534,7 @@ let private pickLfsConflictWithIndexError (createLock: bool) (operationName: str
                 conflicts.Resolve
                     {
                         Handle = summary.Handle
-                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        ExpectedRepositoryVersion = status.RepositoryVersion
                         Path = mkPath path
                         Resolution = PickCandidate "workspace"
                     }
@@ -588,7 +588,7 @@ let private createModifyDeleteConflictFixture
                         {
                             Message = "local modify-delete change"
                             Paths = [| mkPath path |]
-                            ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                            ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                         }
                         (ctx "modify-delete-save")
                 )
@@ -614,7 +614,7 @@ let private createModifyDeleteConflictFixture
             let! updateResult =
                 Async.StartAsPromise(
                     (syncService session).Update
-                        { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                        { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                         (ctx "modify-delete-update")
                 )
 
@@ -645,7 +645,7 @@ let private createMergeHeadConflictFixture () = promise {
             {
                 Message = "local merge conflict"
                 Paths = [| mkPath "base.txt" |]
-                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
             }
             (ctx "merge-head-conflict-save")
         |> Async.StartAsPromise
@@ -670,7 +670,7 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
                 {
                     Message = "local conflicting change"
                     Paths = [| mkPath "base.txt" |]
-                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                 }
                 (ctx "preview-conflict-save")
         )
@@ -681,7 +681,7 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
     let! updateResult =
         Async.StartAsPromise(
             (syncService session).Update
-                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                 (ctx "preview-conflict-update")
         )
 
@@ -702,7 +702,7 @@ let private createUnmergedConflictFixtureWithHooks (hooks: GitWorkspaceSession.G
         | None -> failwith "Expected an active conflict session."
 
     let! capturedStatus = sessionStatus session
-    return root, workPath, session, conflicts, summary, capturedStatus.WorkspaceVersion
+    return root, workPath, session, conflicts, summary, capturedStatus.RepositoryVersion
 }
 
 let private createUnmergedConflictFixture () =
@@ -727,7 +727,7 @@ let private createPathUnmergedConflictFixtureWithHooks
                 {
                     Message = "local nested conflicting change"
                     Paths = [| mkPath conflictPath |]
-                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                 }
                 (ctx "nested-conflict-save")
         )
@@ -738,7 +738,7 @@ let private createPathUnmergedConflictFixtureWithHooks
     let! updateResult =
         Async.StartAsPromise(
             (syncService session).Update
-                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                 (ctx "nested-conflict-update")
         )
 
@@ -854,7 +854,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = capturedSummary.Handle
-                                    ExpectedWorkspaceVersion = capturedWorkspaceVersion
+                                    ExpectedRepositoryVersion = capturedWorkspaceVersion
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "target"
                                 }
@@ -932,7 +932,7 @@ let private verifyPorcelainV2Status
                     Name = "invalid..branch"
                     BaseRef = None
                     SwitchTo = false
-                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                    ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                 }
                 (ctx $"{name}-version-check")
             |> Async.StartAsPromise
@@ -1100,7 +1100,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "revision-identity-unchanged-update")
                         |> Async.StartAsPromise
 
@@ -1144,7 +1144,7 @@ Vitest.describe (
                             {
                                 Message = "test: local merge side"
                                 Paths = [| mkPath "workspace-only.txt" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "revision-identity-merge-local")
                         |> Async.StartAsPromise
@@ -1153,7 +1153,7 @@ Vitest.describe (
                     let! updateStatus = sessionStatus session
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (ctx "revision-identity-merge-update")
                         |> Async.StartAsPromise
 
@@ -1194,7 +1194,7 @@ Vitest.describe (
                             {
                                 Message = "test: local conflicting change"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "revision-identity-finalize-local")
                         |> Async.StartAsPromise
@@ -1203,7 +1203,7 @@ Vitest.describe (
                     let! updateStatus = sessionStatus session
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (ctx "revision-identity-finalize-update")
                         |> Async.StartAsPromise
 
@@ -1227,7 +1227,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = resolveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = resolveStatus.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -1240,7 +1240,7 @@ Vitest.describe (
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "test: revision identity finalize"
                             }
                             (ctx "revision-identity-finalize")
@@ -1299,7 +1299,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = workPath
+                        RepositoryRoot = workPath
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId
@@ -1318,7 +1318,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService credentialSession).Publish
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-without-remote")
@@ -1379,7 +1379,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish to configured upstream"
                                 Paths = [| mkPath "upstream-target.txt" |]
-                                ExpectedWorkspaceVersion = beforeRevisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeRevisionStatus.RepositoryVersion
                             }
                             (ctx "publish-upstream-revision")
                         |> Async.StartAsPromise
@@ -1392,7 +1392,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-to-configured-upstream")
@@ -1465,7 +1465,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-deleted-upstream")
@@ -1587,7 +1587,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = workPath
+                        RepositoryRoot = workPath
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId
@@ -1606,7 +1606,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-upstream-credentials")
@@ -1849,7 +1849,7 @@ Vitest.describe (
                             {
                                 Message = "test: split publish URLs"
                                 Paths = [| mkPath "split-publish.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "split-publish-revision")
                         |> Async.StartAsPromise
@@ -1862,7 +1862,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-split-urls")
@@ -2129,14 +2129,14 @@ Vitest.describe (
                     let! deletedStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "status-deleted-unmerged"))
                     let deletedWorkspace = expectSucceeded "status with deleted unmerged worktree file" deletedStatus
                     Vitest.expect(deletedWorkspace.Changes |> Array.filter isConflictedChange |> Array.length > 0).toBe true
-                    Vitest.expect(deletedWorkspace.WorkspaceVersion).not.toBe (beforeDeletion.WorkspaceVersion)
+                    Vitest.expect(deletedWorkspace.RepositoryVersion).not.toBe (beforeDeletion.RepositoryVersion)
 
                     let! staleResolve =
                         Async.StartAsPromise(
                             conflicts.Resolve
                                 {
                                     Handle = capturedSummary.Handle
-                                    ExpectedWorkspaceVersion = beforeDeletion.WorkspaceVersion
+                                    ExpectedRepositoryVersion = beforeDeletion.RepositoryVersion
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "target"
                                 }
@@ -2167,14 +2167,14 @@ Vitest.describe (
                         .expect(directoryWorkspace.Changes |> Array.filter isConflictedChange |> Array.length > 0)
                         .toBe true
 
-                    Vitest.expect(directoryWorkspace.WorkspaceVersion).not.toBe (deletedWorkspace.WorkspaceVersion)
+                    Vitest.expect(directoryWorkspace.RepositoryVersion).not.toBe (deletedWorkspace.RepositoryVersion)
 
                     let! cancelResult =
                         Async.StartAsPromise(
                             conflicts.Cancel
                                 {
                                     Handle = capturedSummary.Handle
-                                    ExpectedWorkspaceVersion = directoryWorkspace.WorkspaceVersion
+                                    ExpectedRepositoryVersion = directoryWorkspace.RepositoryVersion
                                 }
                                 (ctx "directory-replaced-unmerged-cancel")
                         )
@@ -2208,11 +2208,11 @@ Vitest.describe (
                     let conflictFile = join [| workPath; "base.txt" |]
                     do! writeUtf8FileAsync conflictFile "AB"
                     let! firstStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "collision-evidence-first"))
-                    let firstVersion = (expectValue "first collision evidence" firstStatus).WorkspaceVersion
+                    let firstVersion = (expectValue "first collision evidence" firstStatus).RepositoryVersion
 
                     do! writeUtf8FileAsync conflictFile "B!"
                     let! secondStatus = Async.StartAsPromise(session.Core.GetStatus(ctx "collision-evidence-second"))
-                    let secondVersion = (expectValue "second collision evidence" secondStatus).WorkspaceVersion
+                    let secondVersion = (expectValue "second collision evidence" secondStatus).RepositoryVersion
 
                     Vitest.expect(secondVersion).not.toBe (firstVersion)
                     do! removeDirectoryAsync root
@@ -2295,13 +2295,13 @@ Vitest.describe (
                     Vitest.expect(summary.Items[0].SupportsResolvedContent).toBe (false)
 
                     let! statusResult = Async.StartAsPromise(session.Core.GetStatus(ctx "binary-stage-status"))
-                    let workspaceVersion = (expectValue "binary stage status" statusResult).WorkspaceVersion
+                    let workspaceVersion = (expectValue "binary stage status" statusResult).RepositoryVersion
                     let! resolveResult =
                         Async.StartAsPromise(
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = workspaceVersion
+                                    ExpectedRepositoryVersion = workspaceVersion
                                     Path = mkPath "base.txt"
                                     Resolution = SupplyResolvedContent "manual text resolution\n"
                                 }
@@ -2337,7 +2337,7 @@ Vitest.describe (
                                 {
                                     Message = "local binary conflict"
                                     Paths = [| mkPath "base.txt" |]
-                                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                                 }
                                 (ctx "binary-conflict-save")
                         )
@@ -2349,7 +2349,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (ctx "binary-conflict-update")
                         )
 
@@ -2376,7 +2376,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "target"
                                 }
@@ -2470,7 +2470,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "workspace"
                                     }
@@ -2548,7 +2548,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "target"
                                     }
@@ -2600,7 +2600,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "target"
                                     }
@@ -2652,7 +2652,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "workspace"
                                     }
@@ -2718,7 +2718,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "workspace"
                                     }
@@ -2819,7 +2819,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = SupplyResolvedContent "manual replacement"
                                     }
@@ -2866,7 +2866,7 @@ Vitest.describe (
                                     {
                                         Message = "local plain file edit"
                                         Paths = [| mkPath path |]
-                                        ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                        ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                                     }
                                     (ctx "mixed-lfs-save")
                             )
@@ -2888,7 +2888,7 @@ Vitest.describe (
                         let! updateResult =
                             Async.StartAsPromise(
                                 (syncService session).Update
-                                    { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                    { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                     (ctx "mixed-lfs-update")
                             )
 
@@ -2950,7 +2950,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "workspace"
                                     }
@@ -3009,7 +3009,7 @@ Vitest.describe (
                                     conflicts.Resolve
                                         {
                                             Handle = summary.Handle
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            ExpectedRepositoryVersion = status.RepositoryVersion
                                             Path = mkPath path
                                             Resolution = PickCandidate "workspace"
                                         }
@@ -3070,7 +3070,7 @@ Vitest.describe (
                                 conflicts.Resolve
                                     {
                                         Handle = summary.Handle
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                         Path = mkPath path
                                         Resolution = PickCandidate "target"
                                     }
@@ -3111,7 +3111,7 @@ Vitest.describe (
                                 session.Core.RestorePaths
                                     {
                                         Paths = [| mkPath path |]
-                                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                        ExpectedRepositoryVersion = status.RepositoryVersion
                                     }
                                     (ctx "restore-conflicted-lfs-path")
                             )
@@ -3159,7 +3159,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     Path = mkPath path
                                     Resolution = PickCandidate "target"
                                 }
@@ -3183,7 +3183,7 @@ Vitest.describe (
                             conflicts.Finalize
                                 {
                                     Handle = outcome.Value.RefreshedHandle
-                                    ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                     Message = Some "test: delete binary conflict path"
                                 }
                                 (ctx "binary-delete-finalize")
@@ -3231,7 +3231,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     Path = mkPath path
                                     Resolution = PickCandidate "workspace"
                                 }
@@ -3284,7 +3284,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     Path = mkPath path
                                     Resolution = PickCandidate "target"
                                 }
@@ -3320,7 +3320,7 @@ Vitest.describe (
                                 {
                                     Message = "local add-add conflict"
                                     Paths = [| mkPath addedPath |]
-                                    ExpectedWorkspaceVersion = workspaceStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = workspaceStatus.RepositoryVersion
                                 }
                                 (ctx "add-add-conflict-save")
                         )
@@ -3332,7 +3332,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (ctx "add-add-conflict-update")
                         )
 
@@ -3359,7 +3359,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                     Path = mkPath addedPath
                                     Resolution = PickCandidate "base"
                                 }
@@ -4030,7 +4030,7 @@ Vitest.describe (
                                 {
                                     Message = "local conflicting change"
                                     Paths = [| mkPath "base.txt" |]
-                                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                                 }
                                 (ctx "conflict-save")
                         )
@@ -4042,7 +4042,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (ctx "conflict-update")
                         )
 
@@ -4077,7 +4077,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = "not-the-current-token"
+                                    ExpectedRepositoryVersion = "not-the-current-token"
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "target"
                                 }
@@ -4107,7 +4107,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = resolveStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = resolveStatus.RepositoryVersion
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "target"
                                 }
@@ -4125,7 +4125,7 @@ Vitest.describe (
                             conflicts.Resolve
                                 {
                                     Handle = summary.Handle
-                                    ExpectedWorkspaceVersion = replayStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = replayStatus.RepositoryVersion
                                     Path = mkPath "base.txt"
                                     Resolution = PickCandidate "workspace"
                                 }
@@ -4146,7 +4146,7 @@ Vitest.describe (
                             conflicts.Finalize
                                 {
                                     Handle = resolution.RefreshedHandle
-                                    ExpectedWorkspaceVersion = raceStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = raceStatus.RepositoryVersion
                                     Message = Some "finalize during race"
                                 }
                                 (ctx "raced-finalize")
@@ -4176,7 +4176,7 @@ Vitest.describe (
                             conflicts.Finalize
                                 {
                                     Handle = liveSummary.Handle
-                                    ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                     Message = None
                                 }
                                 (ctx "retry-finalize")
@@ -4198,7 +4198,7 @@ Vitest.describe (
                             conflicts.Finalize
                                 {
                                     Handle = liveSummary.Handle
-                                    ExpectedWorkspaceVersion = finalStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = finalStatus.RepositoryVersion
                                     Message = None
                                 }
                                 (ctx "replay-finalize")
@@ -4255,7 +4255,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -4268,7 +4268,7 @@ Vitest.describe (
                         conflicts.Finalize
                             {
                                 Handle = resolution.RefreshedHandle
-                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "late finalize cancellation"
                             }
                             (ctx "late-finalize-cancel")
@@ -4334,7 +4334,7 @@ Vitest.describe (
                         conflicts.Finalize
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = finalizeStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = finalizeStatus.RepositoryVersion
                                 Message = Some "cleanup committed merge"
                             }
                             (ctx "already-committed-finalize")
@@ -4396,7 +4396,7 @@ Vitest.describe (
                         conflicts.Cancel
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "late-cancel-abort")
                         |> Async.StartAsPromise
@@ -4449,7 +4449,7 @@ Vitest.describe (
                         conflicts.Resolve
                             {
                                 Handle = summary.Handle
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 Path = mkPath "base.txt"
                                 Resolution = PickCandidate "target"
                             }
@@ -4534,7 +4534,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (ctx "foreign-merge-recovery")
                         |> Async.StartAsPromise
 
@@ -4577,7 +4577,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let request = {
                         Handle = summary.Handle
-                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        ExpectedRepositoryVersion = status.RepositoryVersion
                         Path = mkPath "base.txt"
                         Resolution = PickCandidate "target"
                     }
@@ -4658,7 +4658,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                                 (cancelableContext "c-update")
                         )
 
@@ -4676,7 +4676,7 @@ Vitest.describe (
                                 {
                                     Message = "revision awaiting canceled publish"
                                     Paths = [| mkPath "publish-cancel.txt" |]
-                                    ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                                 }
                                 (ctx "c-save")
                         )
@@ -4690,7 +4690,7 @@ Vitest.describe (
                         Async.StartAsPromise(
                             (syncService session).Publish
                                 {
-                                    ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (cancelableContext "c-publish")
@@ -4735,7 +4735,7 @@ Vitest.describe (
                     let! retryUpdate =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = retryUpdateStatus.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = retryUpdateStatus.RepositoryVersion }
                                 (ctx "retry-update")
                         )
 
@@ -4747,7 +4747,7 @@ Vitest.describe (
                         Async.StartAsPromise(
                             (syncService session).Publish
                                 {
-                                    ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (ctx "retry-publish")
@@ -4951,7 +4951,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-update-lock")
                         )
 
@@ -5035,7 +5035,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-update-merge")
                         )
 
@@ -5104,7 +5104,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-ff-merge")
                         )
 
@@ -5172,7 +5172,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-ff-tracked")
                         )
 
@@ -5235,7 +5235,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "late-cancel-merge")
                         )
 
@@ -5302,7 +5302,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (ctx "post-merge-inspection-failure")
                         |> Async.StartAsPromise
 
@@ -5357,7 +5357,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             (ctx "post-merge-inspection-timeout")
                         |> Async.StartAsPromise
 
@@ -5407,13 +5407,13 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                             updateContext
                         |> Async.StartAsPromise
 
                     match updateResult with
                     | Succeeded outcome ->
-                        Vitest.expect(outcome.Value.WorkspaceRevision |> Option.map RevisionId.value).toEqual (
+                        Vitest.expect(outcome.Value.LocalRevision |> Option.map RevisionId.value).toEqual (
                             Some(targetHash.Trim())
                         )
                         Vitest.expect(outcome.Value.Relationship).toEqual (UpToDate)
@@ -5464,7 +5464,7 @@ Vitest.describe (
                             {
                                 Message = "local conflicting change after cancellation"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "conflict-after-cancellation-save")
                         |> Async.StartAsPromise
@@ -5474,7 +5474,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
                             (OperationContext.create "conflict-after-cancellation-update" cancellation.Cancellation ignore)
                         |> Async.StartAsPromise
 
@@ -5592,7 +5592,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-ff-staged")
                         )
 
@@ -5664,7 +5664,7 @@ Vitest.describe (
                     let! updateResult =
                         Async.StartAsPromise(
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = beforeUpdate.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = beforeUpdate.RepositoryVersion }
                                 (ctx "cancel-protected")
                         )
 
@@ -5769,7 +5769,7 @@ Vitest.describe (
                                 {
                                     Message = "save local conflict"
                                     Paths = [| mkPath "base.txt" |]
-                                    ExpectedWorkspaceVersion = beforeRevision.WorkspaceVersion
+                                    ExpectedRepositoryVersion = beforeRevision.RepositoryVersion
                                 }
                                 (ctx "preview-local-conflict")
                         )
@@ -5898,7 +5898,7 @@ let private synchronizeWithoutPublishIn (session: WorkspaceSession) (context: Op
     return!
         (syncService session).Synchronize
             {
-                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                ExpectedRepositoryVersion = status.RepositoryVersion
                 ExpectedTargetRevision = None
                 AcceptUpdateRisks = false
                 PublishLocalRevisions = false
@@ -6053,7 +6053,7 @@ Vitest.describe (
                                 source.Cancel())
 
                     let! updateResult =
-                        (syncService session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context
+                        (syncService session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context
                         |> Async.StartAsPromise
 
                     match updateResult with
@@ -6118,7 +6118,7 @@ Vitest.describe (
                         OperationContext.create "lfs-cancel-during-checkout" source.Cancellation ignore
 
                     let! updateResult =
-                        (syncService session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context
+                        (syncService session).Update { ExpectedRepositoryVersion = status.RepositoryVersion } context
                         |> Async.StartAsPromise
 
                     let outcome = expectSucceededOutcome "update that is canceled during the checkout" updateResult
@@ -6177,7 +6177,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-update-with-lock")
                         |> Async.StartAsPromise
 
@@ -6247,7 +6247,7 @@ Vitest.describe (
 
                         let! updateResult =
                             (syncService session).Update
-                                { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                                { ExpectedRepositoryVersion = status.RepositoryVersion }
                                 (ctx $"lfs-checkout-with-lock-{attempt}")
                             |> Async.StartAsPromise
 
@@ -6305,7 +6305,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-checkout-index-error-exit-0")
                         |> Async.StartAsPromise
 
@@ -6367,7 +6367,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-failed-fetch-failed-checkout")
                         |> Async.StartAsPromise
 
@@ -6455,7 +6455,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-up-to-date-update")
                         |> Async.StartAsPromise
 
@@ -6518,7 +6518,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "lfs-update-hydration")
                         |> Async.StartAsPromise
 
@@ -6905,7 +6905,7 @@ Vitest.describe (
                             {
                                 Message = "test: unrelated LFS history"
                                 Paths = [| mkPath "unrelated-large.bin" |]
-                                ExpectedWorkspaceVersion = unrelatedStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = unrelatedStatus.RepositoryVersion
                             }
                             (ctx "unrelated-lfs-revision")
                         |> Async.StartAsPromise
@@ -6932,7 +6932,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish explicit LFS object"
                                 Paths = [| mkPath "publish-large.bin" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "lfs-publish-revision")
                         |> Async.StartAsPromise
@@ -6972,7 +6972,7 @@ Vitest.describe (
                                 return!
                                     (syncService session).Publish
                                         {
-                                            ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                            ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                             ExpectedTargetRevision = None
                                         }
                                         publishContext
@@ -7346,7 +7346,7 @@ Vitest.describe (
                             {
                                 Message = "feature revision"
                                 Paths = [| mkPath "feature.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "feature-revision")
                         |> Async.StartAsPromise
@@ -7365,7 +7365,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = afterRevision.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterRevision.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -7432,7 +7432,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -7481,7 +7481,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "update-held-index-lock")
                         |> Async.StartAsPromise
 
@@ -7511,7 +7511,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "rejected-update")
                         |> Async.StartAsPromise
 
@@ -7576,7 +7576,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "rejected-update-status-failure")
                         |> Async.StartAsPromise
 
@@ -7606,7 +7606,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -7636,7 +7636,7 @@ Vitest.describe (
 
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "cherry-pick-conflict-update")
                         |> Async.StartAsPromise
 
@@ -7659,7 +7659,7 @@ Vitest.describe (
                     let! status = sessionStatus session
                     let! updateResult =
                         (syncService session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
+                            { ExpectedRepositoryVersion = status.RepositoryVersion }
                             (ctx "merge-head-conflict-update")
                         |> Async.StartAsPromise
 
@@ -7683,7 +7683,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "merge-head-conflict-publish")
@@ -7712,7 +7712,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -7741,7 +7741,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -7774,7 +7774,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = false
@@ -7808,7 +7808,7 @@ Vitest.describe (
                             {
                                 Message = "local revision before rejected publish"
                                 Paths = [| mkPath "local-only.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "rejected-publish-revision")
                         |> Async.StartAsPromise
@@ -7825,7 +7825,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -7862,7 +7862,7 @@ Vitest.describe (
                     let! retryResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -7875,7 +7875,7 @@ Vitest.describe (
                         Vitest.expect(outcome.Publication).toEqual (Published)
 
                         let workspaceRevision =
-                            outcome.Value.WorkspaceRevision
+                            outcome.Value.LocalRevision
                             |> Option.map RevisionId.value
                             |> Option.defaultWith (fun () -> failwith "Expected the synchronized workspace revision.")
 
@@ -7912,7 +7912,7 @@ Vitest.describe (
                             {
                                 Message = "local revision for rejected publish"
                                 Paths = [| mkPath "local-only.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "local-ahead-rejected-publish-revision")
                         |> Async.StartAsPromise
@@ -7929,7 +7929,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -7975,7 +7975,7 @@ Vitest.describe (
                             {
                                 Message = "local revision for locked publish"
                                 Paths = [| mkPath "locked-publish.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "locked-publish-revision")
                         |> Async.StartAsPromise
@@ -7987,7 +7987,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "locked-publish")
@@ -8004,7 +8004,7 @@ Vitest.describe (
                     let! retryResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = retryStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = retryStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "retry-locked-publish")
@@ -8057,7 +8057,7 @@ Vitest.describe (
                             {
                                 Message = "local revision for batched publish rejection"
                                 Paths = [| mkPath "batched-publish.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "batched-publish-revision")
                         |> Async.StartAsPromise
@@ -8069,7 +8069,7 @@ Vitest.describe (
                         let! publishResult =
                             (syncService session).Publish
                                 {
-                                    ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                    ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (ctx contextId)
@@ -8146,7 +8146,7 @@ let private initializeAndBindWorkspace
         let! bindResult =
             factory.Bind
                 {
-                    WorkspaceRoot = initializedBinding.WorkspaceRoot
+                    RepositoryRoot = initializedBinding.RepositoryRoot
                     Location = (syncBinding workPath barePath).Location
                 }
                 (ctx $"{operationPrefix}-bind")
@@ -8180,7 +8180,7 @@ Vitest.describe (
                             {
                                 Message = "feature revision"
                                 Paths = [| mkPath "feature.txt" |]
-                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-feature-revision")
                         |> Async.StartAsPromise
@@ -8191,7 +8191,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -8213,7 +8213,7 @@ Vitest.describe (
                     let! nextSynchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeNextSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeNextSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -8254,7 +8254,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -8310,7 +8310,7 @@ Vitest.describe (
                             {
                                 Message = "initial empty remote revision"
                                 Paths = [| mkPath "initial.txt" |]
-                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-empty-revision")
                         |> Async.StartAsPromise
@@ -8321,7 +8321,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -8339,7 +8339,7 @@ Vitest.describe (
                     let! nextSynchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeNextSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeNextSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -8374,7 +8374,7 @@ Vitest.describe (
                             {
                                 Message = "feature revision before plain push"
                                 Paths = [| mkPath "feature.txt" |]
-                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-equal-revision")
                         |> Async.StartAsPromise
@@ -8390,7 +8390,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-equal-remote")
@@ -8427,7 +8427,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-unfetched-target")
@@ -8465,7 +8465,7 @@ Vitest.describe (
                             {
                                 Message = "feature base revision"
                                 Paths = [| mkPath "feature.txt" |]
-                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = firstStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-diverged-base")
                         |> Async.StartAsPromise
@@ -8480,7 +8480,7 @@ Vitest.describe (
                             {
                                 Message = "local feature revision"
                                 Paths = [| mkPath "local-only.txt" |]
-                                ExpectedWorkspaceVersion = localStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = localStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-diverged-local")
                         |> Async.StartAsPromise
@@ -8492,7 +8492,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-diverged")
@@ -8530,7 +8530,7 @@ Vitest.describe (
                             {
                                 Message = "feature revision before remote advance"
                                 Paths = [| mkPath "feature.txt" |]
-                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-adopt-revision")
                         |> Async.StartAsPromise
@@ -8543,7 +8543,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-adopt")
@@ -8565,7 +8565,7 @@ Vitest.describe (
                     let! synchronizeResult =
                         (syncService session).Synchronize
                             {
-                                ExpectedWorkspaceVersion = beforeSynchronize.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeSynchronize.RepositoryVersion
                                 ExpectedTargetRevision = None
                                 AcceptUpdateRisks = false
                                 PublishLocalRevisions = true
@@ -8606,7 +8606,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = Some expectedTarget
                             }
                             (ctx "publish-tracking-stale-target")
@@ -8675,7 +8675,7 @@ Vitest.describe (
                             {
                                 Message = "feature revision for tracking failure"
                                 Paths = [| mkPath "feature.txt" |]
-                                ExpectedWorkspaceVersion = revisionStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = revisionStatus.RepositoryVersion
                             }
                             (ctx "publish-tracking-config-failure-revision")
                         |> Async.StartAsPromise
@@ -8686,7 +8686,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = beforePublish.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforePublish.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-tracking-config-failure")
@@ -8872,7 +8872,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish explicit LFS object"
                                 Paths = [| mkPath "publish-large.bin" |]
-                                ExpectedWorkspaceVersion = saveStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = saveStatus.RepositoryVersion
                             }
                             (ctx "output-publish-revision")
                         |> Async.StartAsPromise
@@ -8884,7 +8884,7 @@ Vitest.describe (
                     let! publishResult =
                         (syncService session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (outputContext "output-publish" batches)

@@ -336,7 +336,7 @@ let private createSelectedRevisionFixture () = promise {
     let binding: WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = gitProviderId
-        WorkspaceRoot = workPath
+        RepositoryRoot = workPath
         ProviderStateRef = None
         Location = {
             ProviderId = gitProviderId
@@ -410,7 +410,7 @@ let private createPublishFixture hooks = promise {
     let binding: WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = gitProviderId
-        WorkspaceRoot = workPath
+        RepositoryRoot = workPath
         ProviderStateRef = None
         Location = {
             ProviderId = gitProviderId
@@ -591,7 +591,7 @@ let private openSession (workPath: string) (barePath: string) : WorkspaceSession
     let binding: WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = gitProviderId
-        WorkspaceRoot = workPath
+        RepositoryRoot = workPath
         ProviderStateRef = None
         Location = {
             ProviderId = gitProviderId
@@ -619,7 +619,7 @@ let private openMaterializationWithToken (workPath: string) (remoteUrl: string) 
     let binding: WorkspaceBinding = {
         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
         ProviderId = gitProviderId
-        WorkspaceRoot = workPath
+        RepositoryRoot = workPath
         ProviderStateRef = None
         Location = {
             ProviderId = gitProviderId
@@ -755,7 +755,7 @@ let private createTextPublishRevision
                 {
                     Message = $"test: {operationName}"
                     Paths = [| repositoryPath path |]
-                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                    ExpectedRepositoryVersion = status.RepositoryVersion
                 }
                 (ctx $"{operationName}-revision")
             |> Async.StartAsPromise
@@ -797,7 +797,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject revision with index lock"
                                 Paths = [| repositoryPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "index-lock-create-revision")
                         |> Async.StartAsPromise
@@ -908,7 +908,7 @@ Vitest.describe (
                                 {
                                     Message = "test: parse the index lock path"
                                     Paths = [| repositoryPath "base.txt" |]
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (ctx "index-lock-path-parsing")
                             |> Async.StartAsPromise
@@ -977,7 +977,7 @@ Vitest.describe (
                             {
                                 Message = "test: report post-commit index lock"
                                 Paths = [| repositoryPath "base.txt" |]
-                                ExpectedWorkspaceVersion = beforeStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = beforeStatus.RepositoryVersion
                             }
                             (ctx "post-commit-index-lock")
                         |> Async.StartAsPromise
@@ -1115,7 +1115,7 @@ Vitest.describe (
                         // the changed workspace and a retry-materialization action.
                         match cloneResult with
                         | PartiallySucceeded(outcome, failure) ->
-                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (clonePath)
+                            Vitest.expect(outcome.Value.RepositoryRoot).toBe (clonePath)
                             Vitest.expect(failure.StateChanged).toBe (true)
 
                             Vitest
@@ -1436,7 +1436,7 @@ Vitest.describe (
 
                         match result with
                         | Succeeded outcome ->
-                            Vitest.expect(outcome.Value.WorkspaceRoot).toBe (targetPath)
+                            Vitest.expect(outcome.Value.RepositoryRoot).toBe (targetPath)
                         | Failed failure ->
                             failwith $"Expected clone success after late cancellation ({failure.Code})."
                         | PartiallySucceeded _ -> failwith "Expected clone success after late cancellation."
@@ -1465,7 +1465,7 @@ Vitest.describe (
                     let binding: WorkspaceBinding = {
                         SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
                         ProviderId = gitProviderId
-                        WorkspaceRoot = root
+                        RepositoryRoot = root
                         ProviderStateRef = None
                         Location = {
                             ProviderId = gitProviderId
@@ -4809,7 +4809,7 @@ Vitest.describe (
                                 {
                                     Message = "test: save during a free"
                                     Paths = [| repositoryPath "note.txt" |]
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (ctx "save-during-free")
                             |> Async.StartAsPromise
@@ -5326,7 +5326,7 @@ Vitest.describe (
                                 {
                                     Message = "test: save during a download"
                                     Paths = [| repositoryPath "note.txt" |]
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (ctx "save-during-download")
                             |> Async.StartAsPromise
@@ -5389,7 +5389,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject dirty attributes"
                                 Paths = [| largePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "dirty-attributes-revision")
                         |> Async.StartAsPromise
@@ -5460,7 +5460,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject missing LFS dependency"
                                 Paths = [| largePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "missing-lfs-revision")
                         |> Async.StartAsPromise
@@ -5511,7 +5511,7 @@ Vitest.describe (
                             {
                                 Message = "test: validate every selected directory descendant"
                                 Paths = [| repositoryPath "selected" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "directory-lfs-revision")
                         |> Async.StartAsPromise
@@ -5581,7 +5581,7 @@ Vitest.describe (
                             {
                                 Message = "test: skip ignored selected directory descendants"
                                 Paths = [| repositoryPath "selected" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "ignored-directory-lfs-revision")
                         |> Async.StartAsPromise
@@ -5640,7 +5640,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject working-tree-only LFS coverage"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "working-attributes-lfs-revision")
                         |> Async.StartAsPromise
@@ -5702,7 +5702,7 @@ Vitest.describe (
                             {
                                 Message = "test: surface selected LFS stat failure"
                                 Paths = [| repositoryPath "stat-failure.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "stat-failure-lfs-revision")
                         |> Async.StartAsPromise
@@ -5756,7 +5756,7 @@ Vitest.describe (
                             {
                                 Message = "test: commit pretracked LFS file"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "pretracked-lfs-revision")
                         |> Async.StartAsPromise
@@ -5814,7 +5814,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject stale LFS classification"
                                 Paths = [| repositoryPath "growing.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "growing-lfs-revision")
                         |> Async.StartAsPromise
@@ -5910,7 +5910,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject tab-path stale LFS classification"
                                 Paths = [| repositoryPath relativePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "tab-growing-lfs-revision")
                         |> Async.StartAsPromise
@@ -5992,7 +5992,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject malformed staged metadata"
                                 Paths = [| repositoryPath relativePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "malformed-staged-revision")
                         |> Async.StartAsPromise
@@ -6032,7 +6032,7 @@ Vitest.describe (
                     do! createDirectoryJunctionAsync workPath linkedRepo
                     let linkedBinding = {
                         binding with
-                            WorkspaceRoot = linkedRepo
+                            RepositoryRoot = linkedRepo
                             Location = {
                                 binding.Location with
                                     ProviderLocation = linkedRepo
@@ -6055,7 +6055,7 @@ Vitest.describe (
                             {
                                 Message = "test: reject unsafe attributes path"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "unsafe-attributes-revision")
                         |> Async.StartAsPromise
@@ -6125,7 +6125,7 @@ Vitest.describe (
                             {
                                 Message = "test: fail LFS preparation"
                                 Paths = [| largePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "prepare-lfs-revision")
                         |> Async.StartAsPromise
@@ -6185,7 +6185,7 @@ Vitest.describe (
                             {
                                 Message = "test: cancel automatic LFS"
                                 Paths = [| largePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             context
                         |> Async.StartAsPromise
@@ -6240,7 +6240,7 @@ Vitest.describe (
                                         {
                                             Message = "test: clean attributes temp after fsync failure"
                                             Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            ExpectedRepositoryVersion = status.RepositoryVersion
                                         }
                                         (ctx "attributes-temp-fsync-revision")
                                     |> Async.StartAsPromise
@@ -6322,7 +6322,7 @@ Vitest.describe (
                                         {
                                             Message = "test: fall back from restricted hard links"
                                             Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            ExpectedRepositoryVersion = status.RepositoryVersion
                                         }
                                         (ctx "attributes-link-fallback-revision")
                                     |> Async.StartAsPromise
@@ -6392,7 +6392,7 @@ Vitest.describe (
                                         {
                                             Message = "test: clean exclusive attributes after fsync failure"
                                             Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            ExpectedRepositoryVersion = status.RepositoryVersion
                                         }
                                         (ctx "attributes-fallback-fsync-revision")
                                     |> Async.StartAsPromise
@@ -6472,7 +6472,7 @@ Vitest.describe (
                                         {
                                             Message = "test: preserve consumer attributes after fsync failure"
                                             Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            ExpectedRepositoryVersion = status.RepositoryVersion
                                         }
                                         (ctx "attributes-consumer-fsync-revision")
                                     |> Async.StartAsPromise
@@ -6556,7 +6556,7 @@ Vitest.describe (
                             {
                                 Message = "test: preserve concurrent attributes edit"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "attributes-race-revision")
                         |> Async.StartAsPromise
@@ -6624,7 +6624,7 @@ Vitest.describe (
                             {
                                 Message = "test: preserve replacement attributes inode"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "attributes-inode-swap-revision")
                         |> Async.StartAsPromise
@@ -6699,7 +6699,7 @@ Vitest.describe (
                                         {
                                             Message = "test: preserve attributes symlink"
                                             Paths = [| repositoryPath "large.bin" |]
-                                            ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                            ExpectedRepositoryVersion = status.RepositoryVersion
                                         }
                                         (ctx "attributes-symlink-swap-revision")
                                     |> Async.StartAsPromise
@@ -6770,7 +6770,7 @@ Vitest.describe (
                             {
                                 Message = "test: preserve pre-append attributes edit"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "final-attributes-race-revision")
                         |> Async.StartAsPromise
@@ -6846,7 +6846,7 @@ Vitest.describe (
                             {
                                 Message = "test: preserve newest installed attributes"
                                 Paths = [| repositoryPath "large.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "installed-attributes-race-revision")
                         |> Async.StartAsPromise
@@ -6916,7 +6916,7 @@ Vitest.describe (
                             {
                                 Message = "test: partial LFS reconciliation"
                                 Paths = [| largePath |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "partial-lfs-revision")
                         |> Async.StartAsPromise
@@ -6987,7 +6987,7 @@ Vitest.describe (
                             {
                                 Message = "test: index-only recovery"
                                 Paths = [| repositoryPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "index-only-recovery-revision")
                         |> Async.StartAsPromise
@@ -7038,7 +7038,7 @@ Vitest.describe (
                                 {
                                     Message = "test: missing LFS upload"
                                     Paths = [| repositoryPath "missing-upload.bin" |]
-                                    ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
                                 }
                                 (ctx "missing-upload-revision")
                             |> Async.StartAsPromise
@@ -7078,7 +7078,7 @@ Vitest.describe (
                         let! result =
                             (synchronization session).Publish
                                 {
-                                    ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                     ExpectedTargetRevision = None
                                 }
                                 (ctx "missing-upload-publish")
@@ -7120,7 +7120,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish rename"
                                 Paths = [| repositoryPath "base.txt"; repositoryPath "renamed.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "publish-rename-revision")
                         |> Async.StartAsPromise
@@ -7135,7 +7135,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "publish-rename")
@@ -7205,7 +7205,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish before response loss"
                                 Paths = [| repositoryPath "response-loss.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "push-response-loss-revision")
                         |> Async.StartAsPromise
@@ -7221,7 +7221,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "push-response-loss")
@@ -7311,7 +7311,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "new-branch-response-loss")
@@ -7381,7 +7381,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish before nonzero response"
                                 Paths = [| repositoryPath "nonzero-response.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "push-nonzero-revision")
                         |> Async.StartAsPromise
@@ -7397,7 +7397,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "push-nonzero")
@@ -7498,7 +7498,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "raced-third-publish")
@@ -7569,7 +7569,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "clean-push-not-observed")
@@ -7668,7 +7668,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "clean-push-raced")
@@ -7777,7 +7777,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "unavailable-path-evidence")
@@ -7861,7 +7861,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "inconclusive-verification-publish")
@@ -8009,7 +8009,7 @@ Vitest.describe (
                                 let publishPromise =
                                     (synchronization session).Publish
                                         {
-                                            ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                            ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                             ExpectedTargetRevision = None
                                         }
                                         (OperationContext.create
@@ -8119,7 +8119,7 @@ Vitest.describe (
                             {
                                 Message = "test: publish before caller cancellation"
                                 Paths = [| repositoryPath "canceled-response.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "push-canceled-revision")
                         |> Async.StartAsPromise
@@ -8136,7 +8136,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             publishContext
@@ -8239,7 +8239,7 @@ Vitest.describe (
                             {
                                 Message = "test: verified publish"
                                 Paths = [| repositoryPath "published.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "verified-publish-revision")
                         |> Async.StartAsPromise
@@ -8254,7 +8254,7 @@ Vitest.describe (
                     let! result =
                         (synchronization session).Publish
                             {
-                                ExpectedWorkspaceVersion = publishStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = publishStatus.RepositoryVersion
                                 ExpectedTargetRevision = None
                             }
                             (ctx "verified-publish")

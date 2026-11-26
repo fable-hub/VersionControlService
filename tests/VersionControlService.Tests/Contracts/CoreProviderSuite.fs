@@ -34,7 +34,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "select the bracket file only"
                                 Paths = [| mkPath "a[1].txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "literal-revision")
                     )
@@ -52,7 +52,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "wildcard is not a pathspec"
                                 Paths = [| mkPath "*.txt" |]
-                                ExpectedWorkspaceVersion = afterStatus.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterStatus.RepositoryVersion
                             }
                             (ctx "wildcard-revision")
                     )
@@ -61,7 +61,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! finalStatus = getStatus workspace
                 Vitest.expect(changePaths finalStatus).toEqual ([| "a1.txt" |])
-                Vitest.expect(finalStatus.WorkspaceVersion).toBe (afterStatus.WorkspaceVersion)
+                Vitest.expect(finalStatus.RepositoryVersion).toBe (afterStatus.RepositoryVersion)
             }
 
             profileTest "a failed selected revision preserves unrelated workspace state"
@@ -77,7 +77,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "missing path must fail"
                                 Paths = [| mkPath "missing.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "failed-revision")
                     )
@@ -87,7 +87,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! afterStatus = getStatus workspace
                 Vitest.expect(changePaths afterStatus).toEqual ([| "b.txt" |])
-                Vitest.expect(afterStatus.WorkspaceVersion).toBe (status.WorkspaceVersion)
+                Vitest.expect(afterStatus.RepositoryVersion).toBe (status.RepositoryVersion)
 
                 let! content = workspace.ReadFile "b.txt"
                 Vitest.expect(content).toEqual (Some "unrelated dirty change\n")
@@ -106,7 +106,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.RestorePaths
                             {
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "restore")
                     )
@@ -134,7 +134,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "nothing changed"
                                 Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "unchanged-revision")
                     )
@@ -159,7 +159,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Name = "feature-create-only"
                                 BaseRef = None
                                 SwitchTo = false
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "create-only")
                     )
@@ -179,7 +179,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                                 Name = "feature-create-switch"
                                 BaseRef = None
                                 SwitchTo = true
-                                ExpectedWorkspaceVersion = afterCreateOnly.WorkspaceVersion
+                                ExpectedRepositoryVersion = afterCreateOnly.RepositoryVersion
                             }
                             (ctx "create-switch")
                     )
@@ -217,7 +217,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.PreflightSwitchRef
                             {
                                 TargetRef = riskyRef
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "risky-preflight")
                     )
@@ -231,7 +231,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.PreflightSwitchRef
                             {
                                 TargetRef = safeRef
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "safe-preflight")
                     )
@@ -246,12 +246,12 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! firstStatus = getStatus workspace
                 let! secondStatus = getStatus workspace
-                Vitest.expect(secondStatus.WorkspaceVersion).toBe (firstStatus.WorkspaceVersion)
+                Vitest.expect(secondStatus.RepositoryVersion).toBe (firstStatus.RepositoryVersion)
 
                 do! workspace.WriteFile "token-change.txt" "content\n"
 
                 let! thirdStatus = getStatus workspace
-                Vitest.expect(thirdStatus.WorkspaceVersion = firstStatus.WorkspaceVersion).toBe (false)
+                Vitest.expect(thirdStatus.RepositoryVersion = firstStatus.RepositoryVersion).toBe (false)
             }
 
             profileTest "operations return structured failures instead of throwing"
@@ -265,7 +265,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "no paths"
                                 Paths = [||]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "empty-selection")
                     )
@@ -283,7 +283,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.SwitchRef
                             {
                                 TargetRef = bogusRef
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "bogus-switch")
                     )
@@ -300,7 +300,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             {
                                 Message = "stale token"
                                 Paths = [| mkPath "stale-probe.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "stale-mutation")
                     )
@@ -330,7 +330,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.SwitchRef
                             {
                                 TargetRef = unicodeRef
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "unicode-switch")
                     )
@@ -366,7 +366,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         workspace.Session.Core.SwitchRef
                             {
                                 TargetRef = caseRef
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (ctx "case-switch")
                     )
@@ -389,7 +389,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                             workspace.Session.Core.SwitchRef
                                 {
                                     TargetRef = invalidRef
-                                    ExpectedWorkspaceVersion = freshStatus.WorkspaceVersion
+                                    ExpectedRepositoryVersion = freshStatus.RepositoryVersion
                                 }
                                 (ctx "invalid-switch")
                         )

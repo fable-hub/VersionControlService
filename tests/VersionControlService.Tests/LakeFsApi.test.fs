@@ -735,7 +735,7 @@ Vitest.describe (
                         Async.StartAsPromise(
                             factory.Bind
                                 {
-                                    WorkspaceRoot = "/lake-workspace"
+                                    RepositoryRoot = "/lake-workspace"
                                     Location = location
                                 }
                                 (ctx "bind")

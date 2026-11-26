@@ -1,7 +1,7 @@
 namespace VersionControlService.Abstractions
 
 /// Provider-issued opaque conflict-session handle. Its Version rotates after every
-/// successful nonterminal resolution and is distinct from WorkspaceVersion; the two
+/// successful nonterminal resolution and is distinct from RepositoryVersion; the two
 /// tokens have different lifetimes and are never collapsed into one field.
 type ConflictSessionHandle = {
     SessionId: string
@@ -52,7 +52,7 @@ type ConflictResolution =
 type ResolveConflictRequest = {
     Handle: ConflictSessionHandle
     /// Independently observed workspace version; separate lifetime from the handle.
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     Path: RepositoryPath
     Resolution: ConflictResolution
 }
@@ -66,13 +66,13 @@ type ConflictResolutionOutcome = {
 
 type FinalizeConflictRequest = {
     Handle: ConflictSessionHandle
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     Message: string option
 }
 
 type CancelConflictRequest = {
     Handle: ConflictSessionHandle
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 /// Stable recovery action code for stale/foreign/closed conflict-session handles.

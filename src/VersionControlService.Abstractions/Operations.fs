@@ -243,7 +243,7 @@ type OperationOutcome<'T> = {
     AffectedPaths: string[]
     ResultingRevision: RevisionId option
     /// Opaque optimistic-concurrency token observed after the operation.
-    ResultingWorkspaceVersion: string option
+    ResultingRepositoryVersion: string option
     Publication: PublicationState
 }
 
@@ -285,7 +285,7 @@ module OperationOutcome =
         Warnings = [||]
         AffectedPaths = [||]
         ResultingRevision = None
-        ResultingWorkspaceVersion = None
+        ResultingRepositoryVersion = None
         Publication = PublicationNotApplicable
     }
 
@@ -295,7 +295,7 @@ module OperationOutcome =
         Warnings = [||]
         AffectedPaths = [||]
         ResultingRevision = None
-        ResultingWorkspaceVersion = None
+        ResultingRepositoryVersion = None
         Publication = PublicationNotApplicable
     }
 

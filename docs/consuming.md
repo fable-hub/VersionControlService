@@ -222,7 +222,7 @@ let! result = factory.Initialize { TargetPath = targetPath; Location = Some loca
 `publish_target_missing`:
 
 ```fsharp
-let! result = factory.Bind { WorkspaceRoot = workspaceRoot; Location = location } context
+let! result = factory.Bind { RepositoryRoot = workspaceRoot; Location = location } context
 ```
 
 `Adopt` is the fourth, and it is for a workspace the provider already owns. The next section
@@ -354,9 +354,9 @@ providers.
 exist locally and a publish can still be retried. `PublicationNotApplicable` means the
 operation has no publication meaning at all, so it is not a claim that anything was published.
 
-`ResultingWorkspaceVersion` is optional and a provider may leave it `None`. The built-in Git
+`ResultingRepositoryVersion` is optional and a provider may leave it `None`. The built-in Git
 provider never sets it, and lakeFS does, so do not build a host around it. Two payloads carry
-a workspace version: `Core.GetStatus` and `SwitchRef`, which both return a `WorkspaceStatus`.
+a workspace version: `Core.GetStatus` and `SwitchRef`, which both return a `RepositoryStatus`.
 The synchronization operations return a `SynchronizationState`, which has revisions and a
 target but no workspace version, so call `Core.GetStatus` after a synchronize to get the token
 for the next mutation. The token is opaque either way, so do not parse it or compare it for
@@ -877,7 +877,7 @@ so a file genuinely named `report [draft].csv` round-trips.
 /// token the next mutation has to carry.
 type SaveResult = {
     Revision: RevisionId option
-    WorkspaceVersion: string option
+    RepositoryVersion: string option
 }
 
 let saveSelected
@@ -900,7 +900,7 @@ let saveSelected
                     {
                         Message = message
                         Paths = parsed |> Array.choose (snd >> Result.toOption)
-                        ExpectedWorkspaceVersion = expectedWorkspaceVersion
+                        ExpectedRepositoryVersion = expectedWorkspaceVersion
                     }
                     context
 
@@ -909,19 +909,19 @@ let saveSelected
                 match outcome.Effect with
                 | Unchanged _ ->
                     // Nothing needed committing, and the workspace version has not moved.
-                    return Ok { Revision = None; WorkspaceVersion = Some expectedWorkspaceVersion }
+                    return Ok { Revision = None; RepositoryVersion = Some expectedWorkspaceVersion }
                 | Performed ->
                     // CreateRevision is an OperationResult<RevisionId>, so the new revision is
                     // outcome.Value. ResultingRevision is optional metadata that a conforming
                     // provider may leave as None, so do not read the revision out of it.
                     //
-                    // The commit moved the workspace version, and ResultingWorkspaceVersion is
+                    // The commit moved the workspace version, and ResultingRepositoryVersion is
                     // None on Git. None here means the host re-reads the status before the
                     // next mutation. It does not mean the version is unchanged.
                     return
                         Ok {
                             Revision = Some outcome.Value
-                            WorkspaceVersion = outcome.ResultingWorkspaceVersion
+                            RepositoryVersion = outcome.ResultingRepositoryVersion
                         }
 
             | PartiallySucceeded(_, failure) ->
@@ -939,7 +939,7 @@ let saveSelected
     }
 ```
 
-`ExpectedWorkspaceVersion` is the version from the status the host last showed. A
+`ExpectedRepositoryVersion` is the version from the status the host last showed. A
 workspace that moved underneath rejects the save with `Concurrency`, so nobody commits
 work they never saw.
 
@@ -1039,7 +1039,7 @@ let synchronize
             let! result =
                 synchronization.Synchronize
                     {
-                        ExpectedWorkspaceVersion = expectedWorkspaceVersion
+                        ExpectedRepositoryVersion = expectedWorkspaceVersion
                         ExpectedTargetRevision = observedTarget
                         AcceptUpdateRisks = acceptedConflictSession
                         // Leave this true and let publish_target_missing tell you there is
@@ -1103,7 +1103,7 @@ The provider codes and evidence are tabulated in [provider authoring](provider-a
 ## Conflict sessions
 
 When an update leaves conflicts, the provider opens a session and
-`WorkspaceStatus.ActiveConflictSession` reports it. `GetActiveSession` returns the
+`RepositoryStatus.ActiveConflictSession` reports it. `GetActiveSession` returns the
 summary, with one `ConflictItem` per path and the candidates that path offers.
 
 Resolution is one path at a time, and each success rotates the handle:
@@ -1125,7 +1125,7 @@ let resolvePath
                 conflicts.Resolve
                     {
                         Handle = handle
-                        ExpectedWorkspaceVersion = expectedWorkspaceVersion
+                        ExpectedRepositoryVersion = expectedWorkspaceVersion
                         Path = path
                         Resolution = choice
                     }
