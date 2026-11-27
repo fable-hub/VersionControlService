@@ -3,7 +3,7 @@
 module VersionControlService.LakeFs.LakeFsTypes
 
 /// Nonsecret connection data. The secret access key arrives separately through
-/// the injected credential resolver and never lives in bindings or requests.
+/// the injected credential resolver and never lives in provider state or requests.
 type LakeFsConnection = {
     /// e.g. http://localhost:8000
     Endpoint: string

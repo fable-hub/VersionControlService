@@ -4,13 +4,13 @@ open VersionControlService.Abstractions
 open Fable.Core
 open Fable.Core.JsInterop
 
-module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
+module GitProvider = VersionControlService.Git.GitProvider
+module GitProviderOptions = VersionControlService.Git.GitProviderOptions
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
+module LakeFsProvider = VersionControlService.LakeFs.LakeFsProvider
 module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
-module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodePath = VersionControlService.Runtime.Node.Path
-module ProviderResolver = VersionControlService.Abstractions.ProviderResolver
 
 [<Import("tmpdir", "node:os")>]
 let private temporaryDirectory () : string = jsNative
@@ -21,7 +21,7 @@ let private makeTemporaryDirectory (_prefix: string) : string = jsNative
 [<Import("rmSync", "node:fs")>]
 let private removeTemporaryDirectory (_path: string) (_options: NodeFileSystem.RmOptions) : unit = jsNative
 
-let private runGitOperation (factory: ProviderFactory) =
+let private runGitOperation (provider: IVersionControl) =
     async {
         let targetPath =
             NodePath.join [| temporaryDirectory (); "version-control-service-consumer-" |]
@@ -31,25 +31,20 @@ let private runGitOperation (factory: ProviderFactory) =
 
         try
             let! initialized =
-                factory.Initialize
+                provider.Initialize
                     { TargetPath = targetPath; Location = None }
                     context
 
             match initialized with
-            | Succeeded initialization ->
-                let! opened = factory.Open initialization.Value context
+            | Executed(Succeeded initialization) ->
+                let repository = initialization.Value
+                let! status = Async.Catch(provider.GetStatus repository context)
+                let! closed = Async.Catch(provider.Close repository)
 
-                match opened with
-                | Succeeded outcome ->
-                    let session = outcome.Value
-                    let! status = Async.Catch(session.Core.GetStatus context)
-                    let! closed = Async.Catch(session.Close())
-
-                    return
-                        match status, closed with
-                        | Choice1Of2(Succeeded _), Choice1Of2() -> true
-                        | _ -> false
-                | _ -> return false
+                return
+                    match status, closed with
+                    | Choice1Of2(Executed(Succeeded _)), Choice1Of2() -> true
+                    | _ -> false
             | _ -> return false
         finally
             removeTemporaryDirectory targetPath (NodeFileSystem.RmOptions(recursive = true, force = true))
@@ -57,22 +52,22 @@ let private runGitOperation (factory: ProviderFactory) =
 
 [<EntryPoint>]
 let main _ =
-    let gitFactory =
-        GitWorkspaceSession.createFactory GitWorkspaceSession.GitSessionHooks.none
+    let gitProvider = GitProvider.create GitProviderOptions.defaults
 
     let lakeFsOptions: LakeFsProviderOptions.LakeFsProviderOptions = {
         StateRoot = ".version-control-service-package-consumer-state"
         PathCaseSensitivity = CaseInsensitive
+        Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+        Credentials = LakeFsCredentials.unconfigured
     }
 
-    let lakeFsFactory =
-        LakeFsWorkspaceSession.createFactory lakeFsOptions LakeFsCredentials.unconfigured
+    let lakeFsProvider = LakeFsProvider.create lakeFsOptions
 
+    // lakeFS has no history, so asking for it needs no server and shows that the package loads.
     let operation =
-        match ProviderResolver.tryCreateCatalog [ gitFactory; lakeFsFactory ] with
-        | Ok catalog when ProviderResolver.factories catalog |> Array.length = 2 -> runGitOperation gitFactory
-        | Ok _
-        | Error _ -> async.Return false
+        match Subscribe.single (fun functions -> functions.History.ListRevisions) lakeFsProvider with
+        | Error _ -> runGitOperation gitProvider
+        | Ok _ -> async.Return false
 
 #if FABLE_COMPILER
     Async.StartImmediate(async {

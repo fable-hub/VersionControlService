@@ -1,7 +1,10 @@
-/// lakeFS workspace sessions: a provider-owned, server-visible workspace branch,
+/// The lakeFS provider: a provider-owned, server-visible workspace branch,
 /// a local object index, and client-side check-then-act-then-verify for every
 /// commit and merge (lakeFS has no server-side expected-head precondition).
 module VersionControlService.LakeFs.LakeFsWorkspaceSession
+
+[<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VersionControlService.Tests")>]
+do ()
 
 open System
 open Fable.Core
@@ -39,16 +42,6 @@ let private workspaceBranchName (workspaceRoot: string) (ownershipToken: string)
 
     $"vcs-workspace-{sanitizedWorkspaceId}-{ownershipToken.Substring(0, 12)}"
 
-/// Test seams, mirroring the Git provider: named barrier points let harnesses
-/// advance destinations inside check-then-act-then-verify windows.
-type LakeFsSessionHooks = {
-    Barrier: (string -> string -> OperationContext -> Async<unit>) option
-}
-
-module LakeFsSessionHooks =
-
-    let none: LakeFsSessionHooks = { Barrier = None }
-
 let private lakeFsProviderId =
     match ProviderId.tryCreate "lakefs" with
     | Ok providerId -> providerId
@@ -65,12 +58,13 @@ let private mkProviderRef (value: string) =
     | Error message -> failwith message
 
 type private SessionState = {
-    Binding: WorkspaceBinding
+    RepositoryRoot: string
+    ConnectionProfileId: string option
     StateDirectory: string
     RecoveryDirectory: string
     Location: LakeFsLocation
     Credentials: LakeFsCredentials.LakeFsCredentialStrategy
-    Hooks: LakeFsSessionHooks
+    Hooks: LakeFsProviderOptions.LakeFsSessionHooks
     mutable Index: LakeFsIndex.WorkspaceIndex
     mutable Conflict: LakeFsConflictSession.State option
     mutable ConflictGeneration: int
@@ -79,12 +73,12 @@ type private SessionState = {
 
 let private barrier (state: SessionState) (point: string) (context: OperationContext) =
     match state.Hooks.Barrier with
-    | Some hook -> hook state.Binding.WorkspaceRoot point context
+    | Some hook -> hook state.RepositoryRoot point context
     | None -> async.Return()
 
 let private connect (state: SessionState) : Async<Result<LakeFsConnection, OperationFailure>> =
     async {
-        let! connection = state.Credentials.ResolveConnection state.Binding.ConnectionProfileId
+        let! connection = state.Credentials.ResolveConnection state.ConnectionProfileId
 
         match connection with
         | Ok resolved -> return Ok resolved
@@ -102,7 +96,7 @@ let private objectKey (state: SessionState) (path: string) =
 
 let private repositoryPathOfKey (state: SessionState) (key: string) =
     LakeFsPathSafety.resolveRemotePath
-        state.Binding.WorkspaceRoot
+        state.RepositoryRoot
         state.Index.Prefix
         key
     |> LakeFsPathSafety.orRaise
@@ -119,7 +113,7 @@ let private repositoryPath path =
         )
 
 let private inspectLocalFile (state: SessionState) (path: string) =
-    LakeFsPathSafety.inspectFile state.Binding.WorkspaceRoot (repositoryPath path)
+    LakeFsPathSafety.inspectFile state.RepositoryRoot (repositoryPath path)
     |> LakeFsPathSafety.orRaise
 
 let private temporaryPath (state: SessionState) label =
@@ -148,16 +142,16 @@ let private cleanupConflictCandidates (state: SessionState) =
             ()
 
 let private writeLocal (state: SessionState) (path: string) (content: string) =
-    LakeFsPathSafety.writeUtf8File state.Binding.WorkspaceRoot (repositoryPath path) content
+    LakeFsPathSafety.writeUtf8File state.RepositoryRoot (repositoryPath path) content
     |> LakeFsPathSafety.orRaise
 
 let private removeLocal (state: SessionState) (path: string) =
-    LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot (repositoryPath path)
+    LakeFsPathSafety.removeFile state.RepositoryRoot (repositoryPath path)
     |> LakeFsPathSafety.orRaise
 
 /// All repo-relative files currently in the workspace directory.
 let private walkLocalFiles (state: SessionState) : string list =
-    LakeFsPathSafety.walkFiles state.Binding.WorkspaceRoot
+    LakeFsPathSafety.walkFiles state.RepositoryRoot
     |> LakeFsPathSafety.orRaise
     |> Array.map RepositoryPath.value
     |> Array.toList
@@ -357,11 +351,11 @@ let private mapOutcomeValue (value: 'T) (outcome: OperationOutcome<'U>) : Operat
     Warnings = outcome.Warnings
     AffectedPaths = outcome.AffectedPaths
     ResultingRevision = outcome.ResultingRevision
-    ResultingWorkspaceVersion = outcome.ResultingWorkspaceVersion
+    ResultingRepositoryVersion = outcome.ResultingRepositoryVersion
     Publication = outcome.Publication
 }
 
-let private localWorkspaceStatus (state: SessionState) : WorkspaceStatus =
+let private localWorkspaceStatus (state: SessionState) : RepositoryStatus =
     let changes =
         classifyWorkspace state
         |> List.choose (fun change ->
@@ -389,7 +383,7 @@ let private localWorkspaceStatus (state: SessionState) : WorkspaceStatus =
                 Kind = LocalRef
                 IsCurrent = true
             }
-        WorkspaceVersion = workspaceVersion state
+        RepositoryVersion = workspaceVersion state
         Changes = changes
         ActiveConflictSession = conflictSummary state
         Synchronization = None
@@ -411,7 +405,7 @@ let private synchronizationState (state: SessionState) (targetHead: string optio
 
     {
         BaseRevision = baseRevision |> Option.map mkRevisionId
-        WorkspaceRevision = workspaceRevision |> Option.map mkRevisionId
+        LocalRevision = workspaceRevision |> Option.map mkRevisionId
         TargetRevision = targetHead |> Option.map mkRevisionId
         TargetRef =
             targetHead
@@ -566,7 +560,7 @@ let private getStatus (state: SessionState) (context: OperationContext) =
                                         Kind = LocalRef
                                         IsCurrent = true
                                     }
-                                WorkspaceVersion = workspaceVersion state
+                                RepositoryVersion = workspaceVersion state
                                 Changes = changes
                                 ActiveConflictSession = conflictSummary state
                                 Synchronization =
@@ -627,7 +621,7 @@ let private recoverInterruptedSelectedRevision
         let recoveryContext = LakeFsRequestOutput.withoutCancellation context "recovery"
         let ownsBranch =
             state.Index.OwnershipToken <> ""
-            && workspaceBranchName state.Binding.WorkspaceRoot state.Index.OwnershipToken
+            && workspaceBranchName state.RepositoryRoot state.Index.OwnershipToken
                = state.Index.WorkspaceBranch
 
         match ownsBranch, expectedHead with
@@ -766,7 +760,7 @@ let private finishSelectedRevision
                         OperationOutcome.performed (mkRevisionId commit.Id) with
                             AffectedPaths = affectedPaths
                             ResultingRevision = Some(mkRevisionId commit.Id)
-                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                            ResultingRepositoryVersion = Some(workspaceVersion state)
                             Publication = LocalOnly
                     }
         else
@@ -779,7 +773,7 @@ let private finishSelectedRevision
                 OperationOutcome.performed (mkRevisionId commit.Id) with
                     AffectedPaths = affectedPaths
                     ResultingRevision = Some(mkRevisionId commit.Id)
-                    ResultingWorkspaceVersion = Some(workspaceVersion state)
+                    ResultingRepositoryVersion = Some(workspaceVersion state)
                     Publication = LocalOnly
             }
 
@@ -868,7 +862,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                 state.Index.WorkspaceRevision |> Option.defaultValue "none"
 
                             return
-                                OperationResult.noOp
+                                OperationResult.unchanged
                                     (Some "The selected paths are unchanged.")
                                     (mkRevisionId currentRevision)
                         else
@@ -886,7 +880,7 @@ let private createRevision (state: SessionState) (request: CreateRevisionRequest
                                         inspected
                                         |> Option.map (fun source ->
                                             LakeFsPathSafety.validateOpenedFile
-                                                state.Binding.WorkspaceRoot
+                                                state.RepositoryRoot
                                                 (repositoryPath pathValue)
                                                 source.Identity)
                                     IsDeletion = objectState = LakeFsIndex.DeletedObject
@@ -1038,7 +1032,7 @@ let private materializationResultToOperation
             OperationOutcome.performed () with
                 Warnings = warnings
                 AffectedPaths = affectedPaths
-                ResultingWorkspaceVersion = Some(workspaceVersion state)
+                ResultingRepositoryVersion = Some(workspaceVersion state)
         }
     | LakeFsMaterialization.MaterializationFailed failure -> Failed failure
     | LakeFsMaterialization.MaterializationPartiallyApplied(saved, failure) ->
@@ -1048,7 +1042,7 @@ let private materializationResultToOperation
             {
                 OperationOutcome.performed () with
                     AffectedPaths = failure.AffectedPaths
-                    ResultingWorkspaceVersion = Some(workspaceVersion state)
+                    ResultingRepositoryVersion = Some(workspaceVersion state)
             },
             failure
         )
@@ -1105,7 +1099,7 @@ let private restorePathsWithoutRecovery (state: SessionState) (request: RestoreR
                             if validationFailure.IsNone then
                                 match
                                     LakeFsPathSafety.resolveWorkspacePath
-                                        state.Binding.WorkspaceRoot
+                                        state.RepositoryRoot
                                         path
                                 with
                                 | Error failure -> validationFailure <- Some failure
@@ -1150,7 +1144,7 @@ let private restorePathsWithoutRecovery (state: SessionState) (request: RestoreR
                             | Ok plan ->
                                 let! applied =
                                     LakeFsMaterialization.apply
-                                        state.Binding.WorkspaceRoot
+                                        state.RepositoryRoot
                                         state.StateDirectory
                                         state.RecoveryDirectory
                                         state.Index.WorkspaceRevision
@@ -1169,7 +1163,7 @@ let private restorePaths (state: SessionState) (request: RestoreRequest) (contex
         | Ok() ->
             let! recovery =
                 LakeFsMaterialization.reapplyPending
-                    state.Binding.WorkspaceRoot
+                    state.RepositoryRoot
                     state.StateDirectory
                     state.RecoveryDirectory
                     (fun point barrierContext -> barrier state point barrierContext)
@@ -1279,7 +1273,7 @@ let private materializeRef
                     if validationFailure.IsNone then
                         match
                             LakeFsPathSafety.resolveWorkspacePath
-                                state.Binding.WorkspaceRoot
+                                state.RepositoryRoot
                                 repositoryPath
                         with
                         | Error pathFailure -> validationFailure <- Some pathFailure
@@ -1331,7 +1325,7 @@ let private materializeRef
                         | Ok removalPath ->
                             match
                                 LakeFsPathSafety.resolveWorkspacePath
-                                    state.Binding.WorkspaceRoot
+                                    state.RepositoryRoot
                                     removalPath
                             with
                             | Error pathFailure -> validationFailure <- Some pathFailure
@@ -1376,7 +1370,7 @@ let private materializeRef
 
                         let! applied =
                             LakeFsMaterialization.apply
-                                state.Binding.WorkspaceRoot
+                                state.RepositoryRoot
                                 state.StateDirectory
                                 state.RecoveryDirectory
                                 state.Index.WorkspaceRevision
@@ -1532,7 +1526,7 @@ let private switchWorkspaceToRef
                 return
                     Succeeded {
                         materializationOutcome with
-                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                            ResultingRepositoryVersion = Some(workspaceVersion state)
                     }
     }
 
@@ -1885,7 +1879,7 @@ let private buildConflictItems
                         match inspectLocalFile state path with
                         | None -> None
                         | Some inspected ->
-                            LakeFsPathSafety.readBuffer state.Binding.WorkspaceRoot (repositoryPath path)
+                            LakeFsPathSafety.readBuffer state.RepositoryRoot (repositoryPath path)
                             |> LakeFsPathSafety.orRaise
                             |> Option.map (candidateFromBuffer inspected.AbsolutePath)
 
@@ -1906,7 +1900,7 @@ let private updateAgainst (state: SessionState) (head: string) (context: Operati
     async {
         if Some head = state.Index.BaseRevision then
             return
-                OperationResult.noOp
+                OperationResult.unchanged
                     (Some "The workspace is already up to date.")
                     (synchronizationState state (Some head))
         else
@@ -2228,7 +2222,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                         }
                 elif state.Index.WorkspaceRevision = Some head then
                     return
-                        OperationResult.noOp
+                        OperationResult.unchanged
                             (Some "The target already has every local revision.")
                             (synchronizationState state (Some head))
                 else
@@ -2398,7 +2392,7 @@ let private publish (state: SessionState) (expectedTarget: RevisionId option) (c
                                                     ) with
                                                         Publication = Published
                                                         ResultingRevision = Some(mkRevisionId mergeResult.Reference)
-                                                        ResultingWorkspaceVersion = Some(workspaceVersion state)
+                                                        ResultingRepositoryVersion = Some(workspaceVersion state)
                                                 }
     }
 
@@ -2441,7 +2435,7 @@ let private removeResolvedDeletionFiles
                             AffectedPaths = [| pathValue |]
                     }
             | Ok path ->
-                match LakeFsPathSafety.removeFile state.Binding.WorkspaceRoot path with
+                match LakeFsPathSafety.removeFile state.RepositoryRoot path with
                 | Ok() -> ()
                 | Error deletionFailure -> failure <- Some deletionFailure
 
@@ -2565,7 +2559,7 @@ let private completeConflictFinalize
                 return
                     Succeeded {
                         finalizedOutcome with
-                            ResultingWorkspaceVersion = Some(workspaceVersion state)
+                            ResultingRepositoryVersion = Some(workspaceVersion state)
                     }
     }
 
@@ -2620,585 +2614,713 @@ let private partialConflictFinalize
                 )
         }
 
-let private createConflictService (state: SessionState) : ConflictResolutionService = {
-    GetActiveSession = fun _ -> async { return OperationResult.succeeded (conflictSummary state) }
-    Resolve =
-        fun request context -> guardConflictMutation state (async {
-            match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
+let private getActiveConflictSession (state: SessionState) (_: OperationContext) =
+    async { return OperationResult.succeeded (conflictSummary state) }
+
+let private resolveConflict (state: SessionState) (request: ResolveConflictRequest) (context: OperationContext) =
+    guardConflictMutation state (async {
+        match validateHandle state request.Handle request.ExpectedRepositoryVersion with
+        | Error failure -> return Failed failure
+        | Ok conflict ->
+            match LakeFsConflictSession.resolve conflict request.Path request.Resolution with
             | Error failure -> return Failed failure
-            | Ok conflict ->
-                match LakeFsConflictSession.resolve conflict request.Path request.Resolution with
-                | Error failure -> return Failed failure
-                | Ok() ->
-                    return
-                        OperationResult.succeeded {
-                            RefreshedHandle = {
-                                SessionId = conflict.SessionId
-                                Version = string conflict.HandleVersion
-                            }
-                            RemainingItems =
-                                conflictSummary state |> Option.map _.Items |> Option.defaultValue [||]
+            | Ok() ->
+                return
+                    OperationResult.succeeded {
+                        RefreshedHandle = {
+                            SessionId = conflict.SessionId
+                            Version = string conflict.HandleVersion
                         }
-        })
-    Finalize =
-        fun request context -> guardConflictMutation state (async {
-            match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
-            | Error failure -> return Failed failure
-            | Ok conflict ->
-                if LakeFsConflictSession.hasUnresolvedItems conflict then
-                    return
-                        Failed(
-                            OperationFailure.create
-                                Validation
-                                "conflicts_unresolved"
-                                "Every conflict item must be resolved before finalizing."
-                        )
-                else
-                    let! connection = connect state
+                        RemainingItems =
+                            conflictSummary state |> Option.map _.Items |> Option.defaultValue [||]
+                    }
+    })
 
-                    match connection with
+let private finalizeConflict (state: SessionState) (request: FinalizeConflictRequest) (context: OperationContext) =
+    guardConflictMutation state (async {
+        match validateHandle state request.Handle request.ExpectedRepositoryVersion with
+        | Error failure -> return Failed failure
+        | Ok conflict ->
+            if LakeFsConflictSession.hasUnresolvedItems conflict then
+                return
+                    Failed(
+                        OperationFailure.create
+                            Validation
+                            "conflicts_unresolved"
+                            "Every conflict item must be resolved before finalizing."
+                    )
+            else
+                let! connection = connect state
+
+                match connection with
+                | Error failure -> return Failed failure
+                | Ok resolved ->
+                    let! targetHead = getTargetHead state context
+
+                    match targetHead with
                     | Error failure -> return Failed failure
-                    | Ok resolved ->
-                        let! targetHead = getTargetHead state context
+                    | Ok observedTarget when observedTarget <> conflict.TargetRevisionAtOpen ->
+                        return
+                            Failed {
+                                handleRejection () with
+                                    RevisionEvidence = [|
+                                        "expected_target", mkRevisionId conflict.TargetRevisionAtOpen
+                                        "observed_target", mkRevisionId observedTarget
+                                    |]
+                            }
+                    | Ok observedTarget ->
+                        match conflict.PendingFinalizeRevision with
+                        | Some pendingRevision ->
+                            let! pendingBranch =
+                                LakeFsApi.getBranch
+                                    resolved
+                                    state.Index.Repository
+                                    state.Index.WorkspaceBranch
+                                    context
 
-                        match targetHead with
-                        | Error failure -> return Failed failure
-                        | Ok observedTarget when observedTarget <> conflict.TargetRevisionAtOpen ->
-                            return
-                                Failed {
-                                    handleRejection () with
-                                        RevisionEvidence = [|
-                                            "expected_target", mkRevisionId conflict.TargetRevisionAtOpen
-                                            "observed_target", mkRevisionId observedTarget
-                                        |]
-                                }
-                        | Ok observedTarget ->
-                            match conflict.PendingFinalizeRevision with
-                            | Some pendingRevision ->
-                                let! pendingBranch =
-                                    LakeFsApi.getBranch
-                                        resolved
-                                        state.Index.Repository
-                                        state.Index.WorkspaceBranch
-                                        context
+                            match pendingBranch with
+                            | Error failure -> return Failed failure
+                            | Ok branch when branch.CommitId <> pendingRevision ->
+                                return
+                                    Failed {
+                                        handleRejection () with
+                                            RevisionEvidence = [|
+                                                "expected_destination", mkRevisionId pendingRevision
+                                                "observed_destination", mkRevisionId branch.CommitId
+                                            |]
+                                    }
+                            | Ok _ ->
+                                let! targetWriteSet =
+                                    readConflictFinalizeTargetWriteSet state observedTarget context
 
-                                match pendingBranch with
+                                match targetWriteSet with
                                 | Error failure -> return Failed failure
-                                | Ok branch when branch.CommitId <> pendingRevision ->
-                                    return
-                                        Failed {
-                                            handleRejection () with
-                                                RevisionEvidence = [|
-                                                    "expected_destination", mkRevisionId pendingRevision
-                                                    "observed_destination", mkRevisionId branch.CommitId
-                                                |]
-                                        }
-                                | Ok _ ->
-                                    let! targetWriteSet =
-                                        readConflictFinalizeTargetWriteSet state observedTarget context
+                                | Ok targetChangedPaths ->
+                                    return!
+                                        completeConflictFinalize
+                                            state
+                                            resolved
+                                            observedTarget
+                                            targetChangedPaths
+                                            pendingRevision
+                                            context
+                        | None ->
+                            let expectedDestination = conflict.WorkspaceRevisionAtOpen
+                            do! barrier state "finalize-precheck-done" context
 
-                                    match targetWriteSet with
-                                    | Error failure -> return Failed failure
-                                    | Ok targetChangedPaths ->
-                                        return!
-                                            completeConflictFinalize
-                                                state
-                                                resolved
-                                                observedTarget
-                                                targetChangedPaths
-                                                pendingRevision
-                                                context
-                            | None ->
-                                let expectedDestination = conflict.WorkspaceRevisionAtOpen
-                                do! barrier state "finalize-precheck-done" context
+                            let! destinationBeforeMerge = async {
+                                let! targetWriteSet =
+                                    readConflictFinalizeTargetWriteSet state observedTarget context
 
-                                let! destinationBeforeMerge = async {
-                                    let! targetWriteSet =
-                                        readConflictFinalizeTargetWriteSet state observedTarget context
-
-                                    match targetWriteSet with
-                                    | Error failure -> return Error failure
-                                    | Ok targetChangedPaths ->
-                                        let! destination =
-                                            LakeFsApi.getBranch
-                                                resolved
-                                                state.Index.Repository
-                                                state.Index.WorkspaceBranch
-                                                context
-
-                                        return destination |> Result.map (fun branch -> targetChangedPaths, branch)
-                                }
-
-                                match destinationBeforeMerge with
-                                | Error failure -> return Failed failure
-                                | Ok(targetChangedPaths, observedDestination) ->
-                                    // Use destination-wins only to establish the merge base;
-                                    // each selected resolution is applied explicitly below.
-                                    let! merged =
-                                        LakeFsApi.mergeWithStrategy
+                                match targetWriteSet with
+                                | Error failure -> return Error failure
+                                | Ok targetChangedPaths ->
+                                    let! destination =
+                                        LakeFsApi.getBranch
                                             resolved
                                             state.Index.Repository
-                                            observedTarget
                                             state.Index.WorkspaceBranch
-                                            "Merge online changes"
-                                            (Some "dest-wins")
                                             context
 
-                                    match merged with
-                                    | Error failure ->
-                                        return Failed(conflictStateChangedFailure failure)
-                                    | Ok mergeResult ->
-                                        let! mergeBranch =
-                                            LakeFsApi.getBranch
-                                                resolved
-                                                state.Index.Repository
-                                                state.Index.WorkspaceBranch
-                                                context
+                                    return destination |> Result.map (fun branch -> targetChangedPaths, branch)
+                            }
 
-                                        let! mergeCommit =
-                                            LakeFsApi.getCommit
-                                                resolved
-                                                state.Index.Repository
-                                                mergeResult.Reference
-                                                context
+                            match destinationBeforeMerge with
+                            | Error failure -> return Failed failure
+                            | Ok(targetChangedPaths, observedDestination) ->
+                                // Use destination-wins only to establish the merge base;
+                                // each selected resolution is applied explicitly below.
+                                let! merged =
+                                    LakeFsApi.mergeWithStrategy
+                                        resolved
+                                        state.Index.Repository
+                                        observedTarget
+                                        state.Index.WorkspaceBranch
+                                        "Merge online changes"
+                                        (Some "dest-wins")
+                                        context
 
-                                        let verificationReadFailure =
+                                match merged with
+                                | Error failure ->
+                                    return Failed(conflictStateChangedFailure failure)
+                                | Ok mergeResult ->
+                                    let! mergeBranch =
+                                        LakeFsApi.getBranch
+                                            resolved
+                                            state.Index.Repository
+                                            state.Index.WorkspaceBranch
+                                            context
+
+                                    let! mergeCommit =
+                                        LakeFsApi.getCommit
+                                            resolved
+                                            state.Index.Repository
+                                            mergeResult.Reference
+                                            context
+
+                                    let verificationReadFailure =
+                                        match mergeBranch, mergeCommit with
+                                        | Error failure, _ -> Some(failure, None)
+                                        | Ok branch, Error failure -> Some(failure, Some branch.CommitId)
+                                        | Ok _, Ok _ -> None
+
+                                    match verificationReadFailure with
+                                    | Some(failure, observedDestinationAfter) ->
+
+                                        let evidence =
+                                            [|
+                                                "expected_destination", mkRevisionId expectedDestination
+                                                yield!
+                                                    observedDestinationAfter
+                                                    |> Option.map (fun revision ->
+                                                        "observed_destination", mkRevisionId revision)
+                                                    |> Option.toList
+                                            |]
+
+                                        return
+                                            Failed {
+                                                conflictStateChangedFailure failure with
+                                                    RevisionEvidence =
+                                                        Array.append failure.RevisionEvidence evidence
+                                            }
+
+                                    | None ->
+                                        let mergeVerified =
                                             match mergeBranch, mergeCommit with
-                                            | Error failure, _ -> Some(failure, None)
-                                            | Ok branch, Error failure -> Some(failure, Some branch.CommitId)
-                                            | Ok _, Ok _ -> None
+                                            | Ok branch, Ok commit ->
+                                                let sourceVerified =
+                                                    mergeResult.Reference = observedTarget
+                                                    || commit.Parents |> Array.contains observedTarget
 
-                                        match verificationReadFailure with
-                                        | Some(failure, observedDestinationAfter) ->
+                                                let destinationVerified =
+                                                    mergeResult.Reference = observedDestination.CommitId
+                                                    || commit.Parents
+                                                       |> Array.contains observedDestination.CommitId
 
-                                            let evidence =
-                                                [|
-                                                    "expected_destination", mkRevisionId expectedDestination
-                                                    yield!
-                                                        observedDestinationAfter
-                                                        |> Option.map (fun revision ->
-                                                            "observed_destination", mkRevisionId revision)
-                                                        |> Option.toList
-                                                |]
+                                                branch.CommitId = mergeResult.Reference
+                                                && sourceVerified
+                                                && destinationVerified
+                                            | _ -> false
 
+                                        if not mergeVerified then
                                             return
-                                                Failed {
-                                                    conflictStateChangedFailure failure with
-                                                        RevisionEvidence =
-                                                            Array.append failure.RevisionEvidence evidence
-                                                }
+                                                partialConflictFinalize
+                                                    state
+                                                    conflict
+                                                    expectedDestination
+                                                    observedDestination.CommitId
+                                                    mergeResult.Reference
+                                                    (Some observedTarget)
+                                                    false
+                                                    false
+                                        else
+                                            let! destinationAfterMerge =
+                                                LakeFsApi.getBranch
+                                                    resolved
+                                                    state.Index.Repository
+                                                    state.Index.WorkspaceBranch
+                                                    context
 
-                                        | None ->
-                                            let mergeVerified =
-                                                match mergeBranch, mergeCommit with
-                                                | Ok branch, Ok commit ->
-                                                    let sourceVerified =
-                                                        mergeResult.Reference = observedTarget
-                                                        || commit.Parents |> Array.contains observedTarget
+                                            let destinationMoved =
+                                                match destinationAfterMerge with
+                                                | Error failure -> Some(Failed(conflictStateChangedFailure failure))
+                                                | Ok branch when branch.CommitId <> mergeResult.Reference ->
+                                                    Some(
+                                                        partialConflictFinalize
+                                                            state
+                                                            conflict
+                                                            expectedDestination
+                                                            branch.CommitId
+                                                            mergeResult.Reference
+                                                            (Some observedTarget)
+                                                            false
+                                                            true
+                                                    )
+                                                | Ok _ -> None
 
-                                                    let destinationVerified =
-                                                        mergeResult.Reference = observedDestination.CommitId
-                                                        || commit.Parents
-                                                           |> Array.contains observedDestination.CommitId
+                                            match destinationMoved with
+                                            | Some result -> return result
+                                            | None ->
+                                                do! barrier state "finalize-merge-verified" context
 
-                                                    branch.CommitId = mergeResult.Reference
-                                                    && sourceVerified
-                                                    && destinationVerified
-                                                | _ -> false
+                                                let mutable resolutionFailure: OperationFailure option = None
+                                                // The first resolution upload announces the batch.
+                                                let mutable uploadAnnounced = false
 
-                                            if not mergeVerified then
-                                                return
-                                                    partialConflictFinalize
-                                                        state
-                                                        conflict
-                                                        expectedDestination
-                                                        observedDestination.CommitId
-                                                        mergeResult.Reference
-                                                        (Some observedTarget)
-                                                        false
-                                                        false
-                                            else
-                                                let! destinationAfterMerge =
-                                                    LakeFsApi.getBranch
-                                                        resolved
-                                                        state.Index.Repository
-                                                        state.Index.WorkspaceBranch
-                                                        context
-
-                                                let destinationMoved =
-                                                    match destinationAfterMerge with
-                                                    | Error failure -> Some(Failed(conflictStateChangedFailure failure))
-                                                    | Ok branch when branch.CommitId <> mergeResult.Reference ->
-                                                        Some(
-                                                            partialConflictFinalize
-                                                                state
-                                                                conflict
-                                                                expectedDestination
-                                                                branch.CommitId
-                                                                mergeResult.Reference
-                                                                (Some observedTarget)
-                                                                false
-                                                                true
-                                                        )
-                                                    | Ok _ -> None
-
-                                                match destinationMoved with
-                                                | Some result -> return result
-                                                | None ->
-                                                    do! barrier state "finalize-merge-verified" context
-
-                                                    let mutable resolutionFailure: OperationFailure option = None
-                                                    // The first resolution upload announces the batch.
-                                                    let mutable uploadAnnounced = false
-
-                                                    for item in conflict.Items do
-                                                        if resolutionFailure.IsNone then
-                                                            match item.ResolvedContent with
-                                                            | Some(Some content) ->
-                                                                let sourceAndValidation =
-                                                                    match content with
-                                                                    | LakeFsConflictSession.WorkspaceFile path ->
+                                                for item in conflict.Items do
+                                                    if resolutionFailure.IsNone then
+                                                        match item.ResolvedContent with
+                                                        | Some(Some content) ->
+                                                            let sourceAndValidation =
+                                                                match content with
+                                                                | LakeFsConflictSession.WorkspaceFile path ->
+                                                                    match
+                                                                        LakeFsPathSafety.resolveWorkspacePath
+                                                                            state.RepositoryRoot
+                                                                            path
+                                                                    with
+                                                                    | Error failure -> Error failure
+                                                                    | Ok _ ->
                                                                         match
-                                                                            LakeFsPathSafety.resolveWorkspacePath
-                                                                                state.Binding.WorkspaceRoot
+                                                                            LakeFsPathSafety.inspectFile
+                                                                                state.RepositoryRoot
                                                                                 path
                                                                         with
                                                                         | Error failure -> Error failure
-                                                                        | Ok _ ->
-                                                                            match
-                                                                                LakeFsPathSafety.inspectFile
-                                                                                    state.Binding.WorkspaceRoot
+                                                                        | Ok None ->
+                                                                            Error {
+                                                                                OperationFailure.create
+                                                                                    NotFound
+                                                                                    "workspace_file_missing"
+                                                                                    "The selected workspace conflict candidate is no longer present." with
+                                                                                    AffectedPaths = [| RepositoryPath.value path |]
+                                                                            }
+                                                                        | Ok(Some inspected) ->
+                                                                            Ok(
+                                                                                inspected.AbsolutePath,
+                                                                                LakeFsPathSafety.validateOpenedFile
+                                                                                    state.RepositoryRoot
                                                                                     path
-                                                                            with
-                                                                            | Error failure -> Error failure
-                                                                            | Ok None ->
-                                                                                Error {
-                                                                                    OperationFailure.create
-                                                                                        NotFound
-                                                                                        "workspace_file_missing"
-                                                                                        "The selected workspace conflict candidate is no longer present." with
-                                                                                        AffectedPaths = [| RepositoryPath.value path |]
-                                                                                }
-                                                                            | Ok(Some inspected) ->
-                                                                                Ok(
-                                                                                    inspected.AbsolutePath,
-                                                                                    LakeFsPathSafety.validateOpenedFile
-                                                                                        state.Binding.WorkspaceRoot
-                                                                                        path
-                                                                                        inspected.Identity
-                                                                                )
-                                                                    | LakeFsConflictSession.ExistingFile path ->
-                                                                        Ok(path, fun stats ->
-                                                                            if stats.isSymbolicLink() || not (stats.isFile()) then
-                                                                                Error(
-                                                                                    OperationFailure.create
-                                                                                        Validation
-                                                                                        "symlink_not_supported"
-                                                                                        "The conflict candidate is not a regular file."
-                                                                                )
-                                                                            else
-                                                                                Ok())
-                                                                    | LakeFsConflictSession.SuppliedText text ->
-                                                                        let path = temporaryPath state "conflict-resolution"
-                                                                        NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path text
-                                                                        Ok(path, fun stats ->
-                                                                            if stats.isSymbolicLink() || not (stats.isFile()) then
-                                                                                Error(
-                                                                                    OperationFailure.create
-                                                                                        Validation
-                                                                                        "symlink_not_supported"
-                                                                                        "The conflict candidate is not a regular file."
-                                                                                )
-                                                                            else
-                                                                                Ok())
+                                                                                    inspected.Identity
+                                                                            )
+                                                                | LakeFsConflictSession.ExistingFile path ->
+                                                                    Ok(path, fun stats ->
+                                                                        if stats.isSymbolicLink() || not (stats.isFile()) then
+                                                                            Error(
+                                                                                OperationFailure.create
+                                                                                    Validation
+                                                                                    "symlink_not_supported"
+                                                                                    "The conflict candidate is not a regular file."
+                                                                            )
+                                                                        else
+                                                                            Ok())
+                                                                | LakeFsConflictSession.SuppliedText text ->
+                                                                    let path = temporaryPath state "conflict-resolution"
+                                                                    NodeFileSystem.writeUtf8FileExclusiveAndFlushSync path text
+                                                                    Ok(path, fun stats ->
+                                                                        if stats.isSymbolicLink() || not (stats.isFile()) then
+                                                                            Error(
+                                                                                OperationFailure.create
+                                                                                    Validation
+                                                                                    "symlink_not_supported"
+                                                                                    "The conflict candidate is not a regular file."
+                                                                            )
+                                                                        else
+                                                                            Ok())
 
-                                                                match sourceAndValidation with
-                                                                | Error failure -> resolutionFailure <- Some failure
-                                                                | Ok(sourcePath, validateSource) ->
-                                                                    if not uploadAnnounced then
-                                                                        uploadAnnounced <- true
+                                                            match sourceAndValidation with
+                                                            | Error failure -> resolutionFailure <- Some failure
+                                                            | Ok(sourcePath, validateSource) ->
+                                                                if not uploadAnnounced then
+                                                                    uploadAnnounced <- true
 
-                                                                        LakeFsApi.reportStepStart
-                                                                            ProgressPhaseCodes.UploadObjects
-                                                                            "Uploading objects"
-                                                                            context
+                                                                    LakeFsApi.reportStepStart
+                                                                        ProgressPhaseCodes.UploadObjects
+                                                                        "Uploading objects"
+                                                                        context
 
-                                                                    let! upload =
-                                                                        LakeFsApi.uploadObjectFromFileChecked
-                                                                            resolved
-                                                                            state.Index.Repository
-                                                                            state.Index.WorkspaceBranch
-                                                                            (objectKey state item.ItemPath)
-                                                                            sourcePath
-                                                                            validateSource
-                                                                            context
-
-                                                                    match upload with
-                                                                    | Error failure -> resolutionFailure <- Some failure
-                                                                    | Ok _ -> ()
-                                                            | Some None ->
-                                                                let! deletion =
-                                                                    LakeFsApi.deleteObject
+                                                                let! upload =
+                                                                    LakeFsApi.uploadObjectFromFileChecked
                                                                         resolved
                                                                         state.Index.Repository
                                                                         state.Index.WorkspaceBranch
                                                                         (objectKey state item.ItemPath)
+                                                                        sourcePath
+                                                                        validateSource
                                                                         context
 
-                                                                match deletion with
-                                                                | Error failure when failure.Category = NotFound -> ()
+                                                                match upload with
                                                                 | Error failure -> resolutionFailure <- Some failure
-                                                                | Ok() -> ()
-                                                            | None -> ()
+                                                                | Ok _ -> ()
+                                                        | Some None ->
+                                                            let! deletion =
+                                                                LakeFsApi.deleteObject
+                                                                    resolved
+                                                                    state.Index.Repository
+                                                                    state.Index.WorkspaceBranch
+                                                                    (objectKey state item.ItemPath)
+                                                                    context
 
-                                                    match resolutionFailure with
-                                                    | Some failure ->
+                                                            match deletion with
+                                                            | Error failure when failure.Category = NotFound -> ()
+                                                            | Error failure -> resolutionFailure <- Some failure
+                                                            | Ok() -> ()
+                                                        | None -> ()
+
+                                                match resolutionFailure with
+                                                | Some failure ->
+                                                    return Failed { failure with StateChanged = true }
+                                                | None ->
+                                                    // A foreign staged change alone does not trigger the commit. A commit triggered by a resolution path carries whatever else is staged, because lakeFS has no per-path commit.
+                                                    let resolutionPaths =
+                                                        conflict.Items
+                                                        |> List.map (fun item -> objectKey state item.ItemPath)
+                                                        |> Set.ofList
+
+                                                    let! pendingChanges =
+                                                        LakeFsApi.diffBranch
+                                                            resolved
+                                                            state.Index.Repository
+                                                            state.Index.WorkspaceBranch
+                                                            context
+
+                                                    let! committed =
+                                                        match pendingChanges with
+                                                        | Error failure -> async { return Error failure }
+                                                        | Ok [||] -> async { return Ok mergeResult.Reference }
+                                                        | Ok changes when
+                                                            changes
+                                                            |> Array.exists (fun change ->
+                                                                Set.contains change.Path resolutionPaths) ->
+                                                            async {
+                                                                let! commit =
+                                                                    LakeFsApi.commit
+                                                                        resolved
+                                                                        state.Index.Repository
+                                                                        state.Index.WorkspaceBranch
+                                                                        (request.Message
+                                                                         |> Option.defaultValue
+                                                                             "Merge online changes")
+                                                                        context
+
+                                                                return commit |> Result.map _.Id
+                                                            }
+                                                         | Ok _ -> async { return Ok mergeResult.Reference }
+
+                                                    match committed with
+                                                    | Error failure ->
                                                         return Failed { failure with StateChanged = true }
-                                                    | None ->
-                                                        // A foreign staged change alone does not trigger the commit. A commit triggered by a resolution path carries whatever else is staged, because lakeFS has no per-path commit.
-                                                        let resolutionPaths =
-                                                            conflict.Items
-                                                            |> List.map (fun item -> objectKey state item.ItemPath)
-                                                            |> Set.ofList
-
-                                                        let! pendingChanges =
-                                                            LakeFsApi.diffBranch
+                                                    | Ok commitId ->
+                                                        let! branchAfter =
+                                                            LakeFsApi.getBranch
                                                                 resolved
                                                                 state.Index.Repository
                                                                 state.Index.WorkspaceBranch
                                                                 context
 
-                                                        let! committed =
-                                                            match pendingChanges with
-                                                            | Error failure -> async { return Error failure }
-                                                            | Ok [||] -> async { return Ok mergeResult.Reference }
-                                                            | Ok changes when
-                                                                changes
-                                                                |> Array.exists (fun change ->
-                                                                    Set.contains change.Path resolutionPaths) ->
-                                                                async {
-                                                                    let! commit =
-                                                                        LakeFsApi.commit
-                                                                            resolved
-                                                                            state.Index.Repository
-                                                                            state.Index.WorkspaceBranch
-                                                                            (request.Message
-                                                                             |> Option.defaultValue
-                                                                                 "Merge online changes")
-                                                                            context
+                                                        let! commitAfter =
+                                                            LakeFsApi.getCommit
+                                                                resolved
+                                                                state.Index.Repository
+                                                                commitId
+                                                                context
 
-                                                                    return commit |> Result.map _.Id
-                                                                }
-                                                             | Ok _ -> async { return Ok mergeResult.Reference }
+                                                        let! targetAfter = getTargetHead state context
 
-                                                        match committed with
-                                                        | Error failure ->
-                                                            return Failed { failure with StateChanged = true }
-                                                        | Ok commitId ->
-                                                            let! branchAfter =
-                                                                LakeFsApi.getBranch
+                                                        let resolutionVerified =
+                                                            match branchAfter, commitAfter with
+                                                            | Ok branch, Ok resultingCommit ->
+                                                                branch.CommitId = commitId
+                                                                && (commitId = mergeResult.Reference
+                                                                    || resultingCommit.Parents
+                                                                       |> Array.contains mergeResult.Reference)
+                                                            | _ -> false
+
+                                                        let targetVerified =
+                                                            match targetAfter with
+                                                            | Ok target -> target = observedTarget
+                                                            | Error _ -> false
+
+                                                        let canConfirmOnRetry =
+                                                            resolutionVerified && targetVerified
+
+                                                        if
+                                                            expectedDestination = observedDestination.CommitId
+                                                            && canConfirmOnRetry
+                                                        then
+                                                            conflict.PendingFinalizeRevision <- Some commitId
+                                                            do! barrier state "finalize-before-completion" context
+
+                                                            return!
+                                                                completeConflictFinalize
+                                                                    state
                                                                     resolved
-                                                                    state.Index.Repository
-                                                                    state.Index.WorkspaceBranch
-                                                                    context
-
-                                                            let! commitAfter =
-                                                                LakeFsApi.getCommit
-                                                                    resolved
-                                                                    state.Index.Repository
+                                                                    observedTarget
+                                                                    targetChangedPaths
                                                                     commitId
                                                                     context
-
-                                                            let! targetAfter = getTargetHead state context
-
-                                                            let resolutionVerified =
-                                                                match branchAfter, commitAfter with
-                                                                | Ok branch, Ok resultingCommit ->
-                                                                    branch.CommitId = commitId
-                                                                    && (commitId = mergeResult.Reference
-                                                                        || resultingCommit.Parents
-                                                                           |> Array.contains mergeResult.Reference)
-                                                                | _ -> false
-
-                                                            let targetVerified =
+                                                        else
+                                                            let observedTargetAfter =
                                                                 match targetAfter with
-                                                                | Ok target -> target = observedTarget
-                                                                | Error _ -> false
+                                                                | Ok target -> Some target
+                                                                | Error _ -> None
 
-                                                            let canConfirmOnRetry =
-                                                                resolutionVerified && targetVerified
-
-                                                            if
-                                                                expectedDestination = observedDestination.CommitId
-                                                                && canConfirmOnRetry
-                                                            then
-                                                                conflict.PendingFinalizeRevision <- Some commitId
-                                                                do! barrier state "finalize-before-completion" context
-
-                                                                return!
-                                                                    completeConflictFinalize
-                                                                        state
-                                                                        resolved
-                                                                        observedTarget
-                                                                        targetChangedPaths
-                                                                        commitId
-                                                                        context
-                                                            else
-                                                                let observedTargetAfter =
-                                                                    match targetAfter with
-                                                                    | Ok target -> Some target
-                                                                    | Error _ -> None
-
-                                                                return
-                                                                    partialConflictFinalize
-                                                                        state
-                                                                        conflict
-                                                                        expectedDestination
-                                                                        observedDestination.CommitId
-                                                                        commitId
-                                                                        observedTargetAfter
-                                                                        canConfirmOnRetry
-                                                                        false
-            })
-    Cancel =
-        fun request context -> guardConflictMutation state (async {
-            match validateHandle state request.Handle request.ExpectedWorkspaceVersion with
-            | Error failure -> return Failed failure
-            | Ok _ ->
-                // The update never touched the workspace branch or local files for
-                // conflicting paths, so canceling only closes the session.
-                cleanupConflictCandidates state
-                state.Conflict <- None
-                return OperationResult.succeeded ()
+                                                            return
+                                                                partialConflictFinalize
+                                                                    state
+                                                                    conflict
+                                                                    expectedDestination
+                                                                    observedDestination.CommitId
+                                                                    commitId
+                                                                    observedTargetAfter
+                                                                    canConfirmOnRetry
+                                                                    false
         })
+
+let private cancelConflict (state: SessionState) (request: CancelConflictRequest) (context: OperationContext) =
+    guardConflictMutation state (async {
+        match validateHandle state request.Handle request.ExpectedRepositoryVersion with
+        | Error failure -> return Failed failure
+        | Ok _ ->
+            // The update never touched the workspace branch or local files for
+            // conflicting paths, so canceling only closes the session.
+            cleanupConflictCandidates state
+            state.Conflict <- None
+            return OperationResult.succeeded ()
+    })
+
+// ---------------------------------------------------------------------------
+// Repository assembly and open
+// ---------------------------------------------------------------------------
+
+/// One opened lakeFS repository. It holds the state of one open, so two opens of one folder
+/// are two objects with their own state.
+type private LakeFsRepository(descriptor: RepositoryDescriptor, state: SessionState) =
+    inherit Repository(descriptor)
+    member _.State = state
+
+/// Runs the function on the state of the repository. A repository that another provider
+/// opened gets the failure for that.
+let private withRepository
+    (repository: Repository)
+    (run: SessionState -> Async<OperationResult<'T>>)
+    : Async<OperationResult<'T>> =
+    match repository with
+    | :? LakeFsRepository as lakeFs -> run lakeFs.State
+    | _ -> async { return Failed(Repository.ofAnotherProvider repository) }
+
+let private createRepositoryFromState (state: SessionState) (location: RepositoryLocation) : Repository =
+    let descriptor: RepositoryDescriptor = {
+        ProviderId = lakeFsProviderId
+        RepositoryRoot = state.RepositoryRoot
+        Location = Some location
+    }
+
+    LakeFsRepository(descriptor, state) :> Repository
+
+let private runGetStatus
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<RepositoryStatus>> =
+    withRepository repository (fun state -> getStatus state context |> LakeFsPathSafety.guard)
+
+let private runListRefs (repository: Repository) (context: OperationContext) : Async<OperationResult<LogicalRef[]>> =
+    withRepository repository (fun state -> listRefs state context |> LakeFsPathSafety.guard)
+
+let private runCreateRef
+    (repository: Repository)
+    (request: CreateRefRequest)
+    (context: OperationContext)
+    : Async<OperationResult<LogicalRef>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            createRef state request context)
+        |> LakeFsPathSafety.guard)
+
+let private runPreflightSwitchRef
+    (repository: Repository)
+    (request: SwitchRefRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SwitchPreflight>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            preflightSwitchRef state request context)
+        |> LakeFsPathSafety.guard)
+
+let private runSwitchRef
+    (repository: Repository)
+    (request: SwitchRefRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RepositoryStatus>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            switchRef state request context)
+        |> LakeFsPathSafety.guard)
+
+let private runCreateRevision
+    (repository: Repository)
+    (request: CreateRevisionRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RevisionId>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            createRevision state request context)
+        |> LakeFsPathSafety.guard)
+
+let private runRestorePaths
+    (repository: Repository)
+    (request: RestoreRequest)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion true (fun () ->
+            restorePaths state request context)
+        |> LakeFsPathSafety.guard)
+
+let private runGetDiffSummary
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<DiffSummary>> =
+    withRepository repository (fun state -> getDiffSummary state context |> LakeFsPathSafety.guard)
+
+let private runGetActiveSession
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<ConflictSessionSummary option>> =
+    withRepository repository (fun state -> getActiveConflictSession state context |> LakeFsPathSafety.guard)
+
+let private runResolve
+    (repository: Repository)
+    (request: ResolveConflictRequest)
+    (context: OperationContext)
+    : Async<OperationResult<ConflictResolutionOutcome>> =
+    withRepository repository (fun state -> resolveConflict state request context |> LakeFsPathSafety.guard)
+
+let private runFinalize
+    (repository: Repository)
+    (request: FinalizeConflictRequest)
+    (context: OperationContext)
+    : Async<OperationResult<RevisionId option>> =
+    withRepository repository (fun state -> finalizeConflict state request context |> LakeFsPathSafety.guard)
+
+let private runCancel
+    (repository: Repository)
+    (request: CancelConflictRequest)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> =
+    withRepository repository (fun state -> cancelConflict state request context |> LakeFsPathSafety.guard)
+
+let private runRefresh
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun state -> refresh state context |> LakeFsPathSafety.guard)
+
+let private runPreviewUpdate
+    (repository: Repository)
+    (context: OperationContext)
+    : Async<OperationResult<UpdatePreview>> =
+    withRepository repository (fun state -> previewUpdate state context |> LakeFsPathSafety.guard)
+
+let private runUpdate
+    (repository: Repository)
+    (request: UpdateRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            update state request context)
+        |> LakeFsPathSafety.guard)
+
+let private runPublish
+    (repository: Repository)
+    (request: PublishRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            publish state request.ExpectedTargetRevision context)
+        |> LakeFsPathSafety.guard)
+
+let private runSynchronize
+    (repository: Repository)
+    (request: SynchronizeRequest)
+    (context: OperationContext)
+    : Async<OperationResult<SynchronizationState>> =
+    withRepository repository (fun state ->
+        withValidatedMutation state request.ExpectedRepositoryVersion false (fun () ->
+            Synchronization.compose
+                {
+                    HasActiveConflictSession =
+                        fun _ -> async { return OperationResult.succeeded state.Conflict.IsSome }
+                    Refresh = fun context -> refresh state context
+                    PreviewUpdate =
+                        fun syncState context ->
+                            async {
+                                match syncState.TargetRevision with
+                                | Some head -> return! previewAgainst state (RevisionId.value head) context
+                                | None -> return Failed(targetRevisionMissing ())
+                            }
+                    Update =
+                        fun syncState context ->
+                            async {
+                                match syncState.TargetRevision with
+                                | Some head -> return! updateAgainst state (RevisionId.value head) context
+                                | None -> return Failed(targetRevisionMissing ())
+                            }
+                    Publish =
+                        fun syncState context ->
+                            publish state syncState.TargetRevision context
+                }
+                request
+                context)
+        |> LakeFsPathSafety.guard)
+
+let private checkDependencies (_: OperationContext) : Async<OperationResult<DependencyStatus[]>> =
+    async {
+        // The lakeFS provider needs no local tooling: the API client is built in.
+        return OperationResult.succeeded [||]
+    }
+
+/// The location a repository reports when the caller brought none: the one the index records.
+let private locationOfIndex (index: LakeFsIndex.WorkspaceIndex) : LakeFsLocation = {
+    Repository = index.Repository
+    TargetRef = index.TargetRef
+    Prefix = index.Prefix
 }
 
-// ---------------------------------------------------------------------------
-// Session assembly and open
-// ---------------------------------------------------------------------------
-
-let private createSessionFromState (state: SessionState) : WorkspaceSession =
-    let descriptor = {
-        ProviderId = lakeFsProviderId
-        WorkspaceRoot = state.Binding.WorkspaceRoot
-        Location = Some state.Binding.Location
-    }
-
-    let core: CoreVersionControl = {
-        GetStatus = fun context -> getStatus state context |> LakeFsPathSafety.guard
-        ListRefs = fun context -> listRefs state context |> LakeFsPathSafety.guard
-        CreateRef =
-            fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                    createRef state request context)
-                |> LakeFsPathSafety.guard
-        PreflightSwitchRef =
-            fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                    preflightSwitchRef state request context)
-                |> LakeFsPathSafety.guard
-        SwitchRef =
-            fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                    switchRef state request context)
-                |> LakeFsPathSafety.guard
-        CreateRevision =
-            fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                    createRevision state request context)
-                |> LakeFsPathSafety.guard
-        RestorePaths =
-            fun request context ->
-                withValidatedMutation state request.ExpectedWorkspaceVersion true (fun () ->
-                    restorePaths state request context)
-                |> LakeFsPathSafety.guard
-        GetDiffSummary = fun context -> getDiffSummary state context |> LakeFsPathSafety.guard
-    }
-
-    let conflictResolution = createConflictService state
-
-    let guardedConflictResolution = {
-        GetActiveSession =
-            fun context -> conflictResolution.GetActiveSession context |> LakeFsPathSafety.guard
-        Resolve =
-            fun request context -> conflictResolution.Resolve request context |> LakeFsPathSafety.guard
-        Finalize =
-            fun request context -> conflictResolution.Finalize request context |> LakeFsPathSafety.guard
-        Cancel =
-            fun request context -> conflictResolution.Cancel request context |> LakeFsPathSafety.guard
-    }
+let private repositoryLocationOfIndex
+    (index: LakeFsIndex.WorkspaceIndex)
+    (connectionProfileId: string option)
+    : RepositoryLocation =
+    let prefix = if index.Prefix = "" then "" else $"/{index.Prefix}"
 
     {
-        WorkspaceSession.createCoreOnly descriptor core with
-            Synchronization =
-                Some {
-                    Refresh = fun context -> refresh state context |> LakeFsPathSafety.guard
-                    PreviewUpdate = fun context -> previewUpdate state context |> LakeFsPathSafety.guard
-                    Update =
-                        fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                                update state request context)
-                            |> LakeFsPathSafety.guard
-                    Publish =
-                        fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                                publish state request.ExpectedTargetRevision context)
-                            |> LakeFsPathSafety.guard
-                    Synchronize =
-                        fun request context ->
-                            withValidatedMutation state request.ExpectedWorkspaceVersion false (fun () ->
-                                Synchronization.compose
-                                    {
-                                        HasActiveConflictSession =
-                                            fun _ -> async { return OperationResult.succeeded state.Conflict.IsSome }
-                                        Refresh = fun context -> refresh state context
-                                        PreviewUpdate =
-                                            fun syncState context ->
-                                                async {
-                                                    match syncState.TargetRevision with
-                                                    | Some head -> return! previewAgainst state (RevisionId.value head) context
-                                                    | None -> return Failed(targetRevisionMissing ())
-                                                }
-                                        Update =
-                                            fun syncState context ->
-                                                async {
-                                                    match syncState.TargetRevision with
-                                                    | Some head -> return! updateAgainst state (RevisionId.value head) context
-                                                    | None -> return Failed(targetRevisionMissing ())
-                                                }
-                                        Publish =
-                                            fun syncState context ->
-                                                publish state syncState.TargetRevision context
-                                    }
-                                    request
-                                    context)
-                            |> LakeFsPathSafety.guard
-                }
-            ConflictResolution = Some guardedConflictResolution
+        ProviderId = lakeFsProviderId
+        DisplayName = None
+        ProviderLocation = $"lakefs://{index.Repository}/{index.TargetRef}{prefix}"
+        ConnectionProfileId = connectionProfileId
     }
 
-/// Opens a session: loads the index or creates the provider-owned workspace
+/// Opens a repository: loads the index or creates the provider-owned workspace
 /// branch (server-visible; filtered only from logical listings) and materializes
-/// the target into the workspace directory.
-let private openSessionFromStateDirectory
+/// the target into the workspace directory. Clone, Initialize and Bind pass the
+/// location of their request. Open passes none and takes the location from the index.
+let private openRepositoryFromStateDirectory
     (providerState: LakeFsStateStore.ResolvedState)
-    (hooks: LakeFsSessionHooks)
+    (hooks: LakeFsProviderOptions.LakeFsSessionHooks)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    (binding: WorkspaceBinding)
+    (repositoryRoot: string)
+    (connectionProfileId: string option)
+    (requestedLocation: RepositoryLocation option)
     (context: OperationContext)
-    : Async<OperationResult<WorkspaceSession>> =
+    : Async<OperationResult<Repository>> =
     async {
-        match LakeFsLocation.tryParse binding.Location.ProviderLocation with
+        let requestedLocations =
+            match requestedLocation with
+            | None -> Ok None
+            | Some location ->
+                LakeFsLocation.tryParse location.ProviderLocation
+                |> Result.map (fun parsed ->
+                    Some(
+                        parsed,
+                        {
+                            location with
+                                ProviderLocation = RepositoryLocation.withoutUserInfo location.ProviderLocation
+                        }
+                    ))
+
+        match requestedLocations with
         | Error message -> return Failed(OperationFailure.create Validation "invalid_location" message)
-        | Ok location ->
-            let! connection = credentials.ResolveConnection binding.ConnectionProfileId
+        | Ok requested ->
+            let! connection = credentials.ResolveConnection connectionProfileId
 
             match connection with
             | Error message ->
                 return
                     Failed(OperationFailure.createRedacted Authentication "connection_profile_unresolved" message)
             | Ok resolved ->
-                let createOwnedState (previousEntries: LakeFsIndex.IndexEntry[]) = async {
+                let createOwnedState (location: LakeFsLocation) (previousEntries: LakeFsIndex.IndexEntry[]) = async {
                     let! targetBranch =
                         LakeFsApi.getBranch resolved location.Repository location.TargetRef context
 
@@ -3206,7 +3328,7 @@ let private openSessionFromStateDirectory
                     | Error failure -> return Failed failure
                     | Ok target ->
                         let ownershipToken = LakeFsIndex.createOwnershipToken ()
-                        let workspaceBranch = workspaceBranchName binding.WorkspaceRoot ownershipToken
+                        let workspaceBranch = workspaceBranchName repositoryRoot ownershipToken
 
                         let! created =
                             LakeFsApi.createBranch
@@ -3219,13 +3341,14 @@ let private openSessionFromStateDirectory
                         match created with
                         | Error failure -> return Failed failure
                         | Ok() ->
-                            if not (NodeFileSystem.existsSync binding.WorkspaceRoot) then
+                            if not (NodeFileSystem.existsSync repositoryRoot) then
                                 NodeFileSystem.mkdirSync
-                                    binding.WorkspaceRoot
+                                    repositoryRoot
                                     (NodeFileSystem.MkdirOptions(recursive = true))
 
-                            let state = {
-                                Binding = binding
+                            let state: SessionState = {
+                                RepositoryRoot = repositoryRoot
+                                ConnectionProfileId = connectionProfileId
                                 StateDirectory = providerState.StateDirectory
                                 RecoveryDirectory = providerState.RecoveryDirectory
                                 Location = location
@@ -3356,48 +3479,41 @@ let private openSessionFromStateDirectory
                 | LakeFsIndex.Corrupt message ->
                     return Failed(OperationFailure.createRedacted ProviderError "index_corrupt" message)
                 | LakeFsIndex.Loaded index ->
-                    if
-                        index.Repository = location.Repository
-                        && index.TargetRef = location.TargetRef
-                        && index.Prefix = location.Prefix
-                    then
-                        let state = {
-                            Binding = binding
-                            StateDirectory = providerState.StateDirectory
-                            RecoveryDirectory = providerState.RecoveryDirectory
-                            Location = location
-                            Credentials = credentials
-                            Hooks = hooks
-                            Index = index
-                            Conflict = None
-                            ConflictGeneration = 0
-                            Busy = false
-                        }
+                    // Only Open reaches a loaded index, because Clone, Initialize and Bind start
+                    // from a new state entry. The index names the location.
+                    let location = locationOfIndex index
+                    let descriptorLocation = repositoryLocationOfIndex index connectionProfileId
 
-                        let openLoadedState () = async {
-                            if providerState.IsReady then
-                                return OperationResult.succeeded (createSessionFromState state)
-                            else
-                                match LakeFsStateStore.markReady providerState with
-                                | Error failure -> return Failed failure
-                                | Ok _ -> return OperationResult.succeeded (createSessionFromState state)
-                        }
+                    let state: SessionState = {
+                        RepositoryRoot = repositoryRoot
+                        ConnectionProfileId = connectionProfileId
+                        StateDirectory = providerState.StateDirectory
+                        RecoveryDirectory = providerState.RecoveryDirectory
+                        Location = location
+                        Credentials = credentials
+                        Hooks = hooks
+                        Index = index
+                        Conflict = None
+                        ConflictGeneration = 0
+                        Busy = false
+                    }
 
-                        match
-                            LakeFsMaterialization.loadPendingRecoveries state.RecoveryDirectory
-                        with
-                        | Error failure -> return Failed failure
-                        | Ok _ ->
-                            LakeFsStateStore.sweepTransientEntries providerState
-                            return! openLoadedState ()
-                    else
-                        return
-                            Failed(
-                                OperationFailure.create
-                                    Concurrency
-                                    "provider_state_mismatch"
-                                    "The external lakeFS state does not match the workspace binding location."
-                            )
+                    let openLoadedState () = async {
+                        if providerState.IsReady then
+                            return OperationResult.succeeded (createRepositoryFromState state descriptorLocation)
+                        else
+                            match LakeFsStateStore.markReady providerState with
+                            | Error failure -> return Failed failure
+                            | Ok _ -> return OperationResult.succeeded (createRepositoryFromState state descriptorLocation)
+                    }
+
+                    match
+                        LakeFsMaterialization.loadPendingRecoveries state.RecoveryDirectory
+                    with
+                    | Error failure -> return Failed failure
+                    | Ok _ ->
+                        LakeFsStateStore.sweepTransientEntries providerState
+                        return! openLoadedState ()
                 | LakeFsIndex.Missing ->
                     if providerState.IsReady then
                         return
@@ -3408,37 +3524,198 @@ let private openSessionFromStateDirectory
                                     "The ready external lakeFS provider state is missing its workspace index."
                             )
                     else
-                        let! created = createOwnedState [||]
-
-                        match created with
-                        | Failed failure -> return Failed failure
-                        | PartiallySucceeded(outcome, failure) ->
+                        match requested with
+                        | None ->
                             return
-                                PartiallySucceeded(
-                                    mapOutcomeValue (createSessionFromState outcome.Value) outcome,
-                                    failure
+                                Failed(
+                                    OperationFailure.create
+                                        ProviderError
+                                        "first_open_incomplete"
+                                        "The first open of this lakeFS folder did not finish. Initialize or bind the folder again, or delete it and clone it again."
                                 )
-                        | Succeeded outcome ->
-                            return Succeeded(mapOutcomeValue (createSessionFromState outcome.Value) outcome)
+                        | Some(location, descriptorLocation) ->
+                            let! created = createOwnedState location [||]
+
+                            match created with
+                            | Failed failure -> return Failed failure
+                            | PartiallySucceeded(outcome, failure) ->
+                                return
+                                    PartiallySucceeded(
+                                        mapOutcomeValue
+                                            (createRepositoryFromState outcome.Value descriptorLocation)
+                                            outcome,
+                                        failure
+                                    )
+                            | Succeeded outcome ->
+                                return
+                                    Succeeded(
+                                        mapOutcomeValue
+                                            (createRepositoryFromState outcome.Value descriptorLocation)
+                                            outcome
+                                    )
     }
 
-let openSession
+/// Creates the state entry of a folder and runs the first open of it with the location of the
+/// request that brought the folder.
+let private openProvisionedState
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
-    (hooks: LakeFsSessionHooks)
-    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    (binding: WorkspaceBinding)
+    (folder: string)
+    (location: RepositoryLocation)
+    (provisioningMode: string)
     (context: OperationContext)
-    : Async<OperationResult<WorkspaceSession>> =
+    : Async<OperationResult<Repository>> =
     async {
-        match LakeFsStateStore.resolve options binding.WorkspaceRoot binding.ProviderStateRef with
+        match LakeFsStateStore.createForProvisioning options folder provisioningMode with
+        | Error failure -> return Failed failure
+        | Ok created ->
+            match LakeFsStateStore.resolve options folder created.StateId with
+            | Error failure -> return Failed failure
+            | Ok state ->
+                return!
+                    openRepositoryFromStateDirectory
+                        state
+                        options.Hooks
+                        options.Credentials
+                        folder
+                        location.ConnectionProfileId
+                        (Some location)
+                        context
+                    |> LakeFsPathSafety.guard
+    }
+
+let private initializeRepository
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (request: InitializeRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> =
+    async {
+        match request.Location with
+        | None ->
+            return
+                Failed(
+                    OperationFailure.create
+                        Validation
+                        "location_required"
+                        "Initializing a lakeFS workspace requires a repository location."
+                )
+        | Some location ->
+            let! resolved = LakeFsProviderFactory.resolveLocation options.Credentials location
+
+            match resolved with
+            | Error failure -> return Failed failure
+            | Ok _ ->
+                if not (NodeFileSystem.existsSync request.TargetPath) then
+                    NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
+
+                return!
+                    openProvisionedState
+                        options
+                        request.TargetPath
+                        location
+                        LakeFsStateStore.InitializeProvisioning
+                        context
+    }
+
+let private cloneRepository
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (request: CloneRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> =
+    async {
+        let locationResolution =
+            match LakeFsLocation.tryParse request.Location.ProviderLocation with
+            | Error message ->
+                async.Return(Error(OperationFailure.create Validation "invalid_location" message))
+            | Ok parsed ->
+                match request.TargetRef with
+                | Some reference when ProviderRef.value reference <> $"lakefs:{parsed.TargetRef}" ->
+                    async.Return(
+                        Error(
+                            OperationFailure.create
+                                Validation
+                                "target_ref_mismatch"
+                                "The requested provider ref does not match the ref in the lakeFS location."
+                        )
+                    )
+                | _ -> LakeFsProviderFactory.resolveLocation options.Credentials request.Location
+
+        let! resolved = locationResolution
+
+        match resolved with
+        | Error failure -> return Failed failure
+        | Ok _ ->
+            let targetExists = NodeFileSystem.existsSync request.TargetPath
+
+            let targetNonEmpty =
+                targetExists
+                && (let target = NodeFileSystem.lstatSync request.TargetPath
+
+                    not (target.isDirectory ())
+                    || target.isSymbolicLink ()
+                    || (NodeFileSystem.readdirSync request.TargetPath).Length > 0)
+
+            if targetNonEmpty then
+                return
+                    Failed(
+                        OperationFailure.create
+                            Validation
+                            "target_not_empty"
+                            "The clone target directory is not empty."
+                    )
+            elif context.Cancellation.IsCancellationRequested() then
+                return OperationResult.canceled "The lakeFS clone was canceled before provisioning."
+            else
+                // The clone provisions the directory and the state entry. The first open creates the
+                // workspace branch and downloads the objects.
+                LakeFsApi.reportStepStart ProgressPhaseCodes.Clone "Preparing repository workspace" context
+
+                if not targetExists then
+                    NodeFileSystem.mkdirSync request.TargetPath (NodeFileSystem.MkdirOptions(recursive = true))
+
+                return!
+                    openProvisionedState
+                        options
+                        request.TargetPath
+                        request.Location
+                        LakeFsStateStore.CloneProvisioning
+                        context
+    }
+
+let private bindRepository
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (request: BindRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> =
+    // Location data comes from the request alone. Bind reads no provider
+    // marker on disk.
+    openProvisionedState
+        options
+        request.RepositoryRoot
+        request.Location
+        LakeFsStateStore.BindProvisioning
+        context
+
+let private openRepository
+    (options: LakeFsProviderOptions.LakeFsProviderOptions)
+    (request: OpenRequest)
+    (context: OperationContext)
+    : Async<OperationResult<Repository>> =
+    async {
+        match
+            LakeFsStateStore.findByFolder options request.RepositoryRoot
+            |> Result.bind (fun stateId ->
+                LakeFsStateStore.resolve options request.RepositoryRoot stateId)
+        with
         | Error failure -> return Failed failure
         | Ok state ->
             return!
-                openSessionFromStateDirectory
+                openRepositoryFromStateDirectory
                     state
-                    hooks
-                    credentials
-                    binding
+                    options.Hooks
+                    options.Credentials
+                    request.RepositoryRoot
+                    request.ConnectionProfileId
+                    None
                     context
                 |> LakeFsPathSafety.guard
     }
@@ -3464,87 +3741,109 @@ let private cleanupPreconditionFailure message expectedHead observedHead =
                 }
     }
 
-/// Deletes an expired binding's provider-owned workspace branch. Session Close is
+/// Deletes the provider-owned workspace branch of a discarded repository. Close is
 /// intentionally non-destructive; hosts call this lifecycle operation only when a
-/// binding is being discarded. lakeFS has no conditional branch delete, so the
+/// folder is being discarded. lakeFS has no conditional branch delete, so the
 /// implementation checks the head immediately before deletion and verifies absence
 /// afterwards, reporting any observed race instead of claiming clean success.
 let private cleanupOwnedWorkspaceBranchFromStateDirectory
     (stateDirectory: string)
-    (hooks: LakeFsSessionHooks)
+    (hooks: LakeFsProviderOptions.LakeFsSessionHooks)
     (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    (binding: WorkspaceBinding)
+    (repositoryRoot: string)
+    (connectionProfileId: string option)
     (ownershipToken: string)
     (expectedHead: string option)
     (context: OperationContext)
     : Async<OperationResult<unit>> =
     async {
-        match LakeFsLocation.tryParse binding.Location.ProviderLocation with
-        | Error message ->
-            return Failed(OperationFailure.create Validation "invalid_location" message)
-        | Ok location ->
-            match LakeFsIndex.load stateDirectory with
-            | LakeFsIndex.Missing ->
-                return OperationResult.noOp (Some "No lakeFS workspace index remains to clean up.") ()
-            | LakeFsIndex.Corrupt message ->
-                return Failed(OperationFailure.createRedacted ProviderError "workspace_index_corrupt" message)
-            | LakeFsIndex.Loaded index ->
-                let derivedBranch =
-                    if String.IsNullOrWhiteSpace ownershipToken then
-                        ""
-                    else
-                        workspaceBranchName binding.WorkspaceRoot ownershipToken
+        match LakeFsIndex.load stateDirectory with
+        | LakeFsIndex.Missing ->
+            return OperationResult.unchanged (Some "No lakeFS workspace index remains to clean up.") ()
+        | LakeFsIndex.Corrupt message ->
+            return Failed(OperationFailure.createRedacted ProviderError "workspace_index_corrupt" message)
+        | LakeFsIndex.Loaded index ->
+            let derivedBranch =
+                if String.IsNullOrWhiteSpace ownershipToken then
+                    ""
+                else
+                    workspaceBranchName repositoryRoot ownershipToken
 
-                let ownsBranch =
-                    ownershipToken <> ""
-                    && ownershipToken = index.OwnershipToken
-                    && derivedBranch = index.WorkspaceBranch
-                    && location.Repository = index.Repository
-                    && location.TargetRef = index.TargetRef
-                    && location.Prefix = index.Prefix
+            let ownsBranch =
+                ownershipToken <> ""
+                && ownershipToken = index.OwnershipToken
+                && derivedBranch = index.WorkspaceBranch
 
-                if not ownsBranch then
+            if not ownsBranch then
+                return
+                    Failed(
+                        cleanupPreconditionFailure
+                            "The stored state of the folder does not prove ownership of this lakeFS workspace branch."
+                            expectedHead
+                            None
+                    )
+            else
+                match expectedHead with
+                | None ->
                     return
                         Failed(
                             cleanupPreconditionFailure
-                                "The persisted binding does not prove ownership of this lakeFS workspace branch."
-                                expectedHead
+                                "Cleanup requires the caller-observed workspace-branch head."
                                 None
+                                index.WorkspaceRevision
                         )
-                else
-                    match expectedHead with
-                    | None ->
+                | Some expected ->
+                    let! connection = credentials.ResolveConnection connectionProfileId
+
+                    match connection with
+                    | Error message ->
                         return
                             Failed(
-                                cleanupPreconditionFailure
-                                    "Cleanup requires the caller-observed workspace-branch head."
-                                    None
-                                    index.WorkspaceRevision
+                                OperationFailure.createRedacted
+                                    Authentication
+                                    "connection_profile_unresolved"
+                                    message
                             )
-                    | Some expected ->
-                        let! connection = credentials.ResolveConnection binding.ConnectionProfileId
+                    | Ok resolved ->
+                        let! initialHead =
+                            LakeFsApi.getBranch
+                                resolved
+                                index.Repository
+                                index.WorkspaceBranch
+                                context
 
-                        match connection with
-                        | Error message ->
+                        match initialHead with
+                        | Error failure when failure.Category = NotFound ->
+                            return
+                                OperationResult.unchanged
+                                    (Some "The owned lakeFS workspace branch is already absent.")
+                                    ()
+                        | Error failure -> return Failed failure
+                        | Ok branch when branch.CommitId <> expected ->
                             return
                                 Failed(
-                                    OperationFailure.createRedacted
-                                        Authentication
-                                        "connection_profile_unresolved"
-                                        message
+                                    cleanupPreconditionFailure
+                                        "The owned workspace branch moved before cleanup."
+                                        (Some expected)
+                                        (Some branch.CommitId)
                                 )
-                        | Ok resolved ->
-                            let! initialHead =
+                        | Ok _ ->
+                            match hooks.Barrier with
+                            | Some hook ->
+                                do! hook repositoryRoot "cleanup-precheck-done" context
+                            | None -> ()
+
+                            let! finalHead =
                                 LakeFsApi.getBranch
                                     resolved
                                     index.Repository
                                     index.WorkspaceBranch
                                     context
 
-                            match initialHead with
+                            match finalHead with
                             | Error failure when failure.Category = NotFound ->
                                 return
-                                    OperationResult.noOp
+                                    OperationResult.unchanged
                                         (Some "The owned lakeFS workspace branch is already absent.")
                                         ()
                             | Error failure -> return Failed failure
@@ -3552,138 +3851,157 @@ let private cleanupOwnedWorkspaceBranchFromStateDirectory
                                 return
                                     Failed(
                                         cleanupPreconditionFailure
-                                            "The owned workspace branch moved before cleanup."
+                                            "The owned workspace branch advanced during cleanup verification."
                                             (Some expected)
                                             (Some branch.CommitId)
                                     )
                             | Ok _ ->
-                                match hooks.Barrier with
-                                | Some hook ->
-                                    do! hook binding.WorkspaceRoot "cleanup-precheck-done" context
-                                | None -> ()
-
-                                let! finalHead =
-                                    LakeFsApi.getBranch
+                                let! deleted =
+                                    LakeFsApi.deleteBranch
                                         resolved
                                         index.Repository
                                         index.WorkspaceBranch
                                         context
 
-                                match finalHead with
-                                | Error failure when failure.Category = NotFound ->
-                                    return
-                                        OperationResult.noOp
-                                            (Some "The owned lakeFS workspace branch is already absent.")
-                                            ()
+                                match deleted with
                                 | Error failure -> return Failed failure
-                                | Ok branch when branch.CommitId <> expected ->
-                                    return
-                                        Failed(
-                                            cleanupPreconditionFailure
-                                                "The owned workspace branch advanced during cleanup verification."
-                                                (Some expected)
-                                                (Some branch.CommitId)
-                                        )
-                                | Ok _ ->
-                                    let! deleted =
-                                        LakeFsApi.deleteBranch
+                                | Ok() ->
+                                    let! verified =
+                                        LakeFsApi.getBranch
                                             resolved
                                             index.Repository
                                             index.WorkspaceBranch
                                             context
 
-                                    match deleted with
-                                    | Error failure -> return Failed failure
-                                    | Ok() ->
-                                        let! verified =
-                                            LakeFsApi.getBranch
-                                                resolved
-                                                index.Repository
-                                                index.WorkspaceBranch
-                                                context
-
-                                        match verified with
-                                        | Error failure when failure.Category = NotFound ->
-                                            return OperationResult.succeeded ()
-                                        | Error failure ->
-                                            return Failed { failure with StateChanged = true }
-                                        | Ok branch ->
-                                            return
-                                                OperationResult.partiallySucceeded
-                                                    (OperationOutcome.performed ())
-                                                    {
-                                                        cleanupPreconditionFailure
-                                                            "The workspace branch was recreated during cleanup verification."
-                                                            (Some expected)
-                                                            (Some branch.CommitId) with
-                                                            StateChanged = true
-                                                    }
-                                                    {
-                                                        Code = "review_workspace_branch"
-                                                        Instructions =
-                                                            Some
-                                                                "Review the recreated branch before retrying cleanup."
-                                                    }
+                                    match verified with
+                                    | Error failure when failure.Category = NotFound ->
+                                        return OperationResult.succeeded ()
+                                    | Error failure ->
+                                        return Failed { failure with StateChanged = true }
+                                    | Ok branch ->
+                                        return
+                                            OperationResult.partiallySucceeded
+                                                (OperationOutcome.performed ())
+                                                {
+                                                    cleanupPreconditionFailure
+                                                        "The workspace branch was recreated during cleanup verification."
+                                                        (Some expected)
+                                                        (Some branch.CommitId) with
+                                                        StateChanged = true
+                                                }
+                                                {
+                                                    Code = "review_workspace_branch"
+                                                    Instructions =
+                                                        Some
+                                                            "Review the recreated branch before retrying cleanup."
+                                                }
     }
 
-let cleanupOwnedWorkspaceBranch
+/// Deletes the owned workspace branch of the folder. It finds the state entry of the folder,
+/// checks the ownership token against the index and checks the expected head of the branch
+/// before it deletes.
+let internal cleanupOwnedWorkspaceBranch
     (options: LakeFsProviderOptions.LakeFsProviderOptions)
-    (hooks: LakeFsSessionHooks)
-    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    (binding: WorkspaceBinding)
+    (folder: string)
+    (connectionProfileId: string option)
     (ownershipToken: string)
     (expectedHead: string option)
     (context: OperationContext)
     : Async<OperationResult<unit>> =
     async {
-        match LakeFsStateStore.resolve options binding.WorkspaceRoot binding.ProviderStateRef with
+        match
+            LakeFsStateStore.findByFolder options folder
+            |> Result.bind (fun stateId -> LakeFsStateStore.resolve options folder stateId)
+        with
         | Error failure -> return Failed failure
         | Ok state ->
             return!
                 cleanupOwnedWorkspaceBranchFromStateDirectory
                     state.StateDirectory
-                    hooks
-                    credentials
-                    binding
+                    options.Hooks
+                    options.Credentials
+                    folder
+                    connectionProfileId
                     ownershipToken
                     expectedHead
                     context
     }
 
-/// Factory whose Open builds real lakeFS sessions.
-let createFactoryWithHooks
-    (options: LakeFsProviderOptions.LakeFsProviderOptions)
-    (hooks: LakeFsSessionHooks)
-    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    : ProviderFactory =
-    let baseFactory = LakeFsProviderFactory.createFactory options credentials
-
-    {
-        baseFactory with
-            Open = fun binding context -> openSession options hooks credentials binding context
+/// Releases what the repository holds. A lakeFS repository holds nothing that needs releasing.
+let internal close (repository: Repository) : Async<unit> =
+    async {
+        match repository with
+        | :? LakeFsRepository -> ()
+        | _ -> invalidArg "repository" "The repository belongs to another provider."
     }
 
-/// Accepts a provider-neutral revision policy for factory composition. lakeFS has no
-/// large-object representation, so it ignores the strategy and never invokes it.
-let createFactoryWithHooksAndPolicy
-    (options: LakeFsProviderOptions.LakeFsProviderOptions)
-    (hooks: LakeFsSessionHooks)
-    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    (revisionPolicy: RevisionPolicyStrategy)
-    : ProviderFactory =
-    createFactoryWithHooks options hooks credentials
+/// The functions of the lakeFS provider. lakeFS has no text diff, history, web address, local tool
+/// to install or large objects, and says so for each of them.
+let internal functions (options: LakeFsProviderOptions.LakeFsProviderOptions) : ProviderFunctions =
+    let noTextDiff = "lakeFS has no text diff."
+    let noHistory = "lakeFS has no history."
+    let noLargeObjects = "lakeFS stores every file the same way and has no large objects to manage."
 
-let createFactory
-    (options: LakeFsProviderOptions.LakeFsProviderOptions)
-    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    : ProviderFactory =
-    createFactoryWithHooks options LakeFsSessionHooks.none credentials
-
-/// Accepts the strategy and delegates to the existing lakeFS factory. lakeFS never
-/// invokes the strategy because it has no large-object representation.
-let createFactoryWithPolicy
-    (options: LakeFsProviderOptions.LakeFsProviderOptions)
-    (credentials: LakeFsCredentials.LakeFsCredentialStrategy)
-    (revisionPolicy: RevisionPolicyStrategy)
-    : ProviderFactory =
-    createFactory options credentials
+    {
+        VerifyLocation =
+            Implemented(fun request context ->
+                LakeFsProviderFactory.verifyAccess options.Credentials request context)
+        Initialize = Implemented(initializeRepository options)
+        Clone = Implemented(cloneRepository options)
+        Bind = Implemented(bindRepository options)
+        Open = Implemented(openRepository options)
+        CheckDependencies = Implemented checkDependencies
+        InstallDependency = Missing "lakeFS needs no local tool, so there is nothing to install."
+        GetStatus = Implemented runGetStatus
+        ListRefs = Implemented runListRefs
+        CreateRef = Implemented runCreateRef
+        PreflightSwitchRef = Implemented runPreflightSwitchRef
+        SwitchRef = Implemented runSwitchRef
+        CreateRevision = Implemented runCreateRevision
+        RestorePaths = Implemented runRestorePaths
+        GetDiffSummary = Implemented runGetDiffSummary
+        Synchronization = {
+            Refresh = Implemented runRefresh
+            PreviewUpdate = Implemented runPreviewUpdate
+            Update = Implemented runUpdate
+            Publish = Implemented runPublish
+            Synchronize = Implemented runSynchronize
+        }
+        ConflictResolution = {
+            GetActiveSession = Implemented runGetActiveSession
+            Resolve = Implemented runResolve
+            Finalize = Implemented runFinalize
+            Cancel = Implemented runCancel
+        }
+        TextDiff = {
+            Open = Missing noTextDiff
+            ReadPage = Missing noTextDiff
+            ReplayPage = Missing noTextDiff
+            Expand = Missing noTextDiff
+            ReadLine = Missing noTextDiff
+            GetSourceInfo = Missing noTextDiff
+            Close = Missing noTextDiff
+        }
+        History = {
+            ListRevisions = Missing noHistory
+            GetRevisionChanges = Missing noHistory
+        }
+        RepositoryBrowser = {
+            GetRepositoryWebUrl = Missing "lakeFS has no web address for a repository."
+        }
+        ObjectMaterialization = {
+            ListObjects = Missing noLargeObjects
+            Materialize = Missing noLargeObjects
+            Dematerialize = Missing noLargeObjects
+        }
+        StoragePolicy = {
+            SetPathPolicy = Missing noLargeObjects
+            GetSettings = Missing noLargeObjects
+            SetSettings = Missing noLargeObjects
+        }
+        Maintenance = {
+            Prune = Missing noLargeObjects
+            Deduplicate = Missing noLargeObjects
+            CanDeduplicate = Missing noLargeObjects
+        }
+    }

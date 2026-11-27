@@ -2069,7 +2069,7 @@ type TextDiffSession internal (
                 let code, message = failure.Value
                 return EngineResult.Failed(code, message, None)
             else return EngineResult.Ok(Resumable.Scanning(progress, continuation, preview))
-        | EngineResult.Ok(Resumable.Ready page) when page.NextCursor.IsSome ->
+        | EngineResult.Ok(Resumable.Ready(page: DiffPage)) when page.NextCursor.IsSome ->
             let! preview = pendingPagePreview ()
             if invalidDetail.IsSome then return failContent ()
             elif failure.IsSome then

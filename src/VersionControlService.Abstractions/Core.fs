@@ -14,11 +14,11 @@ type FileChange = {
     Kind: FileChangeKind
 }
 
-/// Truthful neutral status. WorkspaceVersion is the opaque optimistic-concurrency
+/// Truthful neutral status. RepositoryVersion is the opaque optimistic-concurrency
 /// token: pure reads over an unchanged workspace return the same token.
-type WorkspaceStatus = {
+type RepositoryStatus = {
     CurrentRef: LogicalRef option
-    WorkspaceVersion: string
+    RepositoryVersion: string
     Changes: FileChange[]
     ActiveConflictSession: ConflictSessionSummary option
     Synchronization: SynchronizationState option
@@ -30,12 +30,12 @@ type CreateRefRequest = {
     BaseRef: ProviderRef option
     /// Explicit create-only or create-and-switch behavior.
     SwitchTo: bool
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 type SwitchRefRequest = {
     TargetRef: ProviderRef
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 /// Destructive-change preflight for switching refs.
@@ -49,13 +49,13 @@ type CreateRevisionRequest = {
     Message: string
     /// Exact literal repository paths; never interpreted as patterns.
     Paths: RepositoryPath[]
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 type RestoreRequest = {
     /// Exact literal repository paths to restore.
     Paths: RepositoryPath[]
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 /// Object-level diff entry; line counts stay optional because object-oriented
@@ -70,19 +70,4 @@ type DiffEntry = {
 
 type DiffSummary = {
     Entries: DiffEntry[]
-}
-
-/// The required core every provider session supplies.
-type CoreVersionControl = {
-    GetStatus: OperationContext -> Async<OperationResult<WorkspaceStatus>>
-    ListRefs: OperationContext -> Async<OperationResult<LogicalRef[]>>
-    CreateRef: CreateRefRequest -> OperationContext -> Async<OperationResult<LogicalRef>>
-    PreflightSwitchRef: SwitchRefRequest -> OperationContext -> Async<OperationResult<SwitchPreflight>>
-    SwitchRef: SwitchRefRequest -> OperationContext -> Async<OperationResult<WorkspaceStatus>>
-    /// Creates a revision from exact selected paths and an expected workspace version.
-    CreateRevision: CreateRevisionRequest -> OperationContext -> Async<OperationResult<RevisionId>>
-    /// Restores the paths to their base revision. A path whose object is available locally stays
-    /// materialized.
-    RestorePaths: RestoreRequest -> OperationContext -> Async<OperationResult<unit>>
-    GetDiffSummary: OperationContext -> Async<OperationResult<DiffSummary>>
 }

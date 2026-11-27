@@ -1,5 +1,5 @@
-/// Git LFS as optional services: object materialization, storage policy, and
-/// local storage maintenance. Core Git never requires these; each operation
+/// Git LFS operations: object materialization, storage policy, and
+/// local storage maintenance. Core Git never requires these. Each operation
 /// reports its own dependency status when git-lfs is unavailable.
 module internal VersionControlService.Git.GitLfsExtensions
 
@@ -340,7 +340,7 @@ let deleteCachedObjectsOfFreedPaths
     }
 
 /// Lists the Git LFS files of the workspace with their materialization state.
-let private listObjects (repoPath: string) (context: OperationContext) : Async<OperationResult<ObjectState[]>> =
+let listObjects (repoPath: string) (context: OperationContext) : Async<OperationResult<ObjectState[]>> =
     async {
         if context.Cancellation.IsCancellationRequested() then
             return OperationResult.canceled "Git LFS listing was canceled."
@@ -427,7 +427,7 @@ let internal batchDematerializeAction = {
     }
 }
 
-let private batchNoOpReason = "Every path is already in the requested state."
+let private batchUnchangedReason = "Every path is already in the requested state."
 
 /// Collapses the outcomes of the paths into one result. The failure of a run with failed paths names
 /// them in AffectedPaths and Details. It takes its message, category and retry flag from the first failure
@@ -455,7 +455,7 @@ let internal toBatchResult (action: BatchAction) (outcomes: GitService.LfsPathOu
 
     if failed.Length = 0 then
         if changed.Length = 0 then
-            OperationResult.noOp (Some batchNoOpReason) ()
+            OperationResult.unchanged (Some batchUnchangedReason) ()
         else
             Succeeded {
                 OperationOutcome.performed () with
@@ -533,7 +533,7 @@ let private runBatch
     (context: OperationContext)
     : Async<OperationResult<unit>> =
     if paths.Length = 0 then
-        async { return OperationResult.noOp (Some batchNoOpReason) () }
+        async { return OperationResult.unchanged (Some batchUnchangedReason) () }
     else
         serialize (fun () ->
             async {
@@ -569,157 +569,169 @@ let private runBatch
                             | Ok outcomes -> return toBatchResult action outcomes
             })
 
-/// The object-materialization service of a Git workspace. Materialize and Dematerialize read the Git LFS
-/// listing once, and the download fetches the objects of many paths together. A path that fails does not
-/// stop the others.
-let createObjectMaterialization
+/// Materializes the paths. It reads the Git LFS listing once, and the download fetches the objects of many
+/// paths together. A path that fails does not stop the others.
+let materialize
+    (repoPath: string)
+    (credentials: GitCredentialStrategy.GitCredentialStrategy)
+    (connectionProfileId: string option)
+    (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
+    (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
+    : RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>> =
+    runBatch
+        preflight
+        serialize
+        "lfs-materialize"
+        batchMaterializeAction
+        (fun requestedPaths context ->
+            GitService.downloadLfsFiles
+                repoPath
+                requestedPaths
+                credentials
+                connectionProfileId
+                context.ReportProgress
+                context)
+
+/// Dematerializes the paths with the same listing and the same per-path outcome as `materialize`.
+let dematerialize
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
     (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
     (serialize: (unit -> Async<OperationResult<unit>>) -> Async<OperationResult<unit>>)
-    : ObjectMaterializationService = {
-    ListObjects = listObjects repoPath
-    Materialize =
-        runBatch
-            preflight
-            serialize
-            "lfs-materialize"
-            batchMaterializeAction
-            (fun requestedPaths context ->
-                GitService.downloadLfsFiles
-                    repoPath
-                    requestedPaths
-                    credentials
-                    connectionProfileId
-                    context.ReportProgress
-                    context)
-    Dematerialize =
-        runBatch
-            preflight
-            serialize
-            "lfs-dematerialize"
-            batchDematerializeAction
-            (fun requestedPaths context ->
-                promise {
-                    let! result =
-                        GitService.freeLfsFiles
-                            repoPath
-                            requestedPaths
-                            credentials
-                            connectionProfileId
-                            context.ReportProgress
-                            context
+    : RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>> =
+    runBatch
+        preflight
+        serialize
+        "lfs-dematerialize"
+        batchDematerializeAction
+        (fun requestedPaths context ->
+            promise {
+                let! result =
+                    GitService.freeLfsFiles
+                        repoPath
+                        requestedPaths
+                        credentials
+                        connectionProfileId
+                        context.ReportProgress
+                        context
 
-                    match result with
-                    | Error failure -> return Error failure
-                    | Ok outcomes ->
-                        // The cleanup also covers a run that stopped on cancellation, because the files
-                        // that were already freed stay freed.
-                        let freedPaths =
-                            outcomes
-                            |> Array.choose (fun outcome ->
-                                match outcome.Result with
-                                | Ok GitService.Changed -> Some outcome.Path
-                                | _ -> None)
+                match result with
+                | Error failure -> return Error failure
+                | Ok outcomes ->
+                    // The cleanup also covers a run that stopped on cancellation, because the files
+                    // that were already freed stay freed.
+                    let freedPaths =
+                        outcomes
+                        |> Array.choose (fun outcome ->
+                            match outcome.Result with
+                            | Ok GitService.Changed -> Some outcome.Path
+                            | _ -> None)
 
-                        if freedPaths.Length > 0 then
-                            do!
-                                deleteCachedObjectsOfFreedPaths repoPath runGit context freedPaths
-                                |> Async.StartAsPromise
+                    if freedPaths.Length > 0 then
+                        do!
+                            deleteCachedObjectsOfFreedPaths repoPath runGit context freedPaths
+                            |> Async.StartAsPromise
 
-                        return Ok outcomes
-                })
-}
+                    return Ok outcomes
+            })
 
-let createStoragePolicy
+/// Marks the path as a large object or records the opt-out.
+let setPathPolicy
     (repoPath: string)
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (preflight: OperationContext -> Async<Result<unit, OperationFailure>>)
-    : StoragePolicyService = {
-    SetPathPolicy =
-        fun path useLargeObjectStorage context -> async {
-            let relativePath = RepositoryPath.value path
+    (path: RepositoryPath)
+    (useLargeObjectStorage: bool)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> = async {
+    let relativePath = RepositoryPath.value path
 
-            if useLargeObjectStorage then
-                let! result = GitLfsService.trackLiteral repoPath relativePath |> Async.AwaitPromise
+    if useLargeObjectStorage then
+        let! result = GitLfsService.trackLiteral repoPath relativePath |> Async.AwaitPromise
 
-                match result with
-                | Ok() -> return completeStoragePolicyChange repoPath relativePath
-                | Error error ->
-                    let kind = GitService.classifyFailureKind error
+        match result with
+        | Ok() -> return completeStoragePolicyChange repoPath relativePath
+        | Error error ->
+            let kind = GitService.classifyFailureKind error
 
-                    return
-                        Failed(
-                            OperationFailure.createRedacted
-                                (categoryOfKind kind)
-                                "lfs_operation_failed"
-                                error
-                        )
-            else
-                let! preparation = prepareUnmark repoPath preflight runGit relativePath context
+            return
+                Failed(
+                    OperationFailure.createRedacted
+                        (categoryOfKind kind)
+                        "lfs_operation_failed"
+                        error
+                )
+    else
+        let! preparation = prepareUnmark repoPath preflight runGit relativePath context
 
-                match preparation with
-                | Error failure -> return Failed failure
-                | Ok wasMaterialized ->
-                    let! result = GitLfsService.untrackLiteral repoPath relativePath |> Async.AwaitPromise
-
-                    match result with
-                    | Ok() -> return completeStoragePolicyChange repoPath relativePath
-                    | Error error ->
-                        let kind = GitService.classifyFailureKind error
-                        let failure =
-                            OperationFailure.createRedacted
-                                (categoryOfKind kind)
-                                "lfs_operation_failed"
-                                error
-
-                        return
-                            Failed {
-                                failure with
-                                    StateChanged = wasMaterialized
-                                    AffectedPaths = if wasMaterialized then [| relativePath |] else [||]
-                            }
-        }
-    GetSettings =
-        fun _ -> async {
-            let! result = Async.AwaitPromise(GitService.getLfsSettings repoPath)
+        match preparation with
+        | Error failure -> return Failed failure
+        | Ok wasMaterialized ->
+            let! result = GitLfsService.untrackLiteral repoPath relativePath |> Async.AwaitPromise
 
             match result with
-            | Ok settings ->
-                return
-                    OperationResult.succeeded {
-                        AutoPolicyThresholdMb = Some settings.AutoTrackThresholdMb
-                        MaterializeLargeObjects = settings.DownloadLargeFiles
-                    }
-            | Error failure -> return Failed(toOperationFailure failure)
-        }
-    SetSettings =
-        fun settings context -> async {
-            if settings.AutoPolicyThresholdMb |> Option.exists (fun value -> value <= 0) then
-                return
-                    Failed(
-                        OperationFailure.create
-                            Validation
-                            "invalid_lfs_threshold"
-                            GitService.InvalidLfsThresholdMessage
-                    )
-            else
-                let! currentResult = Async.AwaitPromise(GitService.getLfsSettings repoPath)
+            | Ok() -> return completeStoragePolicyChange repoPath relativePath
+            | Error error ->
+                let kind = GitService.classifyFailureKind error
+                let failure =
+                    OperationFailure.createRedacted
+                        (categoryOfKind kind)
+                        "lfs_operation_failed"
+                        error
 
-                match currentResult with
-                | Error failure -> return Failed(toOperationFailure failure)
-                | Ok current ->
-                    let next: GitLfsSettingsDto = {
-                        AutoTrackThresholdMb =
-                            settings.AutoPolicyThresholdMb
-                            |> Option.defaultValue current.AutoTrackThresholdMb
-                        DownloadLargeFiles = settings.MaterializeLargeObjects
+                return
+                    Failed {
+                        failure with
+                            StateChanged = wasMaterialized
+                            AffectedPaths = if wasMaterialized then [| relativePath |] else [||]
                     }
+}
 
-                    return! wrapUnit context ignore (fun () -> GitService.setLfsSettings repoPath next)
-        }
+let getStoragePolicySettings
+    (repoPath: string)
+    (_: OperationContext)
+    : Async<OperationResult<StoragePolicySettings>> = async {
+    let! result = Async.AwaitPromise(GitService.getLfsSettings repoPath)
+
+    match result with
+    | Ok settings ->
+        return
+            OperationResult.succeeded {
+                AutoPolicyThresholdMb = Some settings.AutoTrackThresholdMb
+                MaterializeLargeObjects = settings.DownloadLargeFiles
+            }
+    | Error failure -> return Failed(toOperationFailure failure)
+}
+
+let setStoragePolicySettings
+    (repoPath: string)
+    (settings: StoragePolicySettings)
+    (context: OperationContext)
+    : Async<OperationResult<unit>> = async {
+    if settings.AutoPolicyThresholdMb |> Option.exists (fun value -> value <= 0) then
+        return
+            Failed(
+                OperationFailure.create
+                    Validation
+                    "invalid_lfs_threshold"
+                    GitService.InvalidLfsThresholdMessage
+            )
+    else
+        let! currentResult = Async.AwaitPromise(GitService.getLfsSettings repoPath)
+
+        match currentResult with
+        | Error failure -> return Failed(toOperationFailure failure)
+        | Ok current ->
+            let next: GitLfsSettingsDto = {
+                AutoTrackThresholdMb =
+                    settings.AutoPolicyThresholdMb
+                    |> Option.defaultValue current.AutoTrackThresholdMb
+                DownloadLargeFiles = settings.MaterializeLargeObjects
+            }
+
+            return! wrapUnit context ignore (fun () -> GitService.setLfsSettings repoPath next)
 }
 
 let private reportMaintenanceProgress (phaseCode: string) (context: OperationContext) (progress: GitProgressDto) =
@@ -773,7 +785,7 @@ let private runMaintenance
 /// git-lfs prints these when the file system cannot clone files or when LFS extensions rule deduplication out.
 let private dedupUnavailableTokens = [| "does not support de-duplication"; "extensions are configured" |]
 
-let private canDeduplicate
+let canDeduplicate
     (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (context: OperationContext)
     =
@@ -794,24 +806,24 @@ let private canDeduplicate
                 return Failed(OperationFailure.createRedacted (categoryOfKind kind) "lfs_operation_failed" text)
     }
 
-let createMaintenance
+let prune
     (repoPath: string)
-    (runGit: string[] -> OperationContext -> Async<Result<NodeProcess.ProcessOutput, OperationFailure>>)
     (credentials: GitCredentialStrategy.GitCredentialStrategy)
     (connectionProfileId: string option)
-    : StorageMaintenanceService = {
-    Prune =
-        runMaintenance
-            "maintenance-prune"
-            "Git LFS cache pruning was canceled."
-            (GitService.pruneLfsCacheWithProgressAndCancellation
-                repoPath
-                credentials
-                connectionProfileId)
-    Deduplicate =
-        runMaintenance
-            "maintenance-deduplicate"
-            "Git LFS storage deduplication was canceled."
-            (GitService.dedupLfsStorageWithProgressAndCancellation repoPath)
-    CanDeduplicate = canDeduplicate runGit
-}
+    (context: OperationContext)
+    : Async<OperationResult<string>> =
+    runMaintenance
+        "maintenance-prune"
+        "Git LFS cache pruning was canceled."
+        (GitService.pruneLfsCacheWithProgressAndCancellation
+            repoPath
+            credentials
+            connectionProfileId)
+        context
+
+let deduplicate (repoPath: string) (context: OperationContext) : Async<OperationResult<string>> =
+    runMaintenance
+        "maintenance-deduplicate"
+        "Git LFS storage deduplication was canceled."
+        (GitService.dedupLfsStorageWithProgressAndCancellation repoPath)
+        context

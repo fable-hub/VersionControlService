@@ -6,7 +6,7 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
-/// Synchronization profile: refresh/preview/update/publish, up-to-date no-ops,
+/// Synchronization profile: refresh/preview/update/publish, up-to-date unchanged results,
 /// divergence, structural stale-target reporting, recoverable publish failure, retry.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
     let profileName = $"{harness.Name} / synchronization profile"
@@ -31,7 +31,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         }
                     |]
 
-                let! refreshResult = run ((syncService workspace.Session).Refresh(ctx "refresh"))
+                let! refreshResult = run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository (ctx "refresh")))
                 let state = expectValue "refresh" refreshResult
 
                 Vitest.expect(state.Relationship).toEqual (TargetAhead)
@@ -64,7 +64,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 do! workspace.WriteFile "base.txt" "local base change\n"
 
-                let! previewResult = run ((syncService workspace.Session).PreviewUpdate(ctx "preview"))
+                let! previewResult = run (executed (workspace.Provider.Synchronization.PreviewUpdate workspace.Repository (ctx "preview")))
                 let preview = expectValue "preview update" previewResult
 
                 Vitest.expect(pathValues preview.ChangedPaths).toEqual ([| "base.txt"; "remote-new.txt" |])
@@ -77,19 +77,22 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(localBase).toEqual (Some "local base change\n")
             }
 
-            profileTest "an up-to-date update is a NoOp"
+            profileTest "an up-to-date update is Unchanged"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
                 let! status = getStatus workspace
 
                 let! updateResult =
                     run (
-                        (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
-                            (ctx "noop-update")
+                        executed (
+                            workspace.Provider.Synchronization.Update
+                                workspace.Repository
+                                { ExpectedRepositoryVersion = status.RepositoryVersion }
+                                (ctx "unchanged-update")
+                        )
                     )
 
-                expectNoOp "up-to-date update" updateResult |> ignore
+                expectUnchanged "up-to-date update" updateResult |> ignore
             }
 
             profileTest "update incorporates non-conflicting target changes"
@@ -108,9 +111,12 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! updateResult =
                     run (
-                        (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = status.WorkspaceVersion }
-                            (ctx "update")
+                        executed (
+                            workspace.Provider.Synchronization.Update
+                                workspace.Repository
+                                { ExpectedRepositoryVersion = status.RepositoryVersion }
+                                (ctx "update")
+                        )
                     )
 
                 let state = expectValue "update" updateResult
@@ -120,7 +126,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(incoming).toEqual (Some "incoming content\n")
             }
 
-            profileTest "publish makes local revisions visible on the target and repeats as NoOp"
+            profileTest "publish makes local revisions visible on the target and repeats as Unchanged"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
                 do! workspace.WriteFile "published.txt" "published content\n"
@@ -129,13 +135,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "add published file"
-                                Paths = [| mkPath "published.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "publish-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "add published file"
+                                    Paths = [| mkPath "published.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "publish-revision")
+                        )
                     )
 
                 expectPerformed "revision before publish" revisionResult |> ignore
@@ -144,12 +153,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! publishResult =
                     run (
-                        (syncService workspace.Session).Publish
-                            {
-                                ExpectedWorkspaceVersion = afterRevision.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                            }
-                            (ctx "publish")
+                        executed (
+                            workspace.Provider.Synchronization.Publish
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = afterRevision.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "publish")
+                        )
                     )
 
                 let publishOutcome = expectPerformed "publish" publishResult
@@ -161,9 +173,12 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! linkedUpdate =
                     run (
-                        (syncService linked.Session).Update
-                            { ExpectedWorkspaceVersion = linkedStatus.WorkspaceVersion }
-                            (ctx "linked-update")
+                        executed (
+                            linked.Provider.Synchronization.Update
+                                linked.Repository
+                                { ExpectedRepositoryVersion = linkedStatus.RepositoryVersion }
+                                (ctx "linked-update")
+                        )
                     )
 
                 expectOutcome "linked update" linkedUpdate |> ignore
@@ -171,20 +186,23 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! linkedContent = linked.ReadFile "published.txt"
                 Vitest.expect(linkedContent).toEqual (Some "published content\n")
 
-                // Publishing again with nothing new is a NoOp.
+                // Publishing again with nothing new is Unchanged.
                 let! repeatStatus = getStatus workspace
 
                 let! repeatPublish =
                     run (
-                        (syncService workspace.Session).Publish
-                            {
-                                ExpectedWorkspaceVersion = repeatStatus.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                            }
-                            (ctx "repeat-publish")
+                        executed (
+                            workspace.Provider.Synchronization.Publish
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = repeatStatus.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "repeat-publish")
+                        )
                     )
 
-                expectNoOp "repeat publish" repeatPublish |> ignore
+                expectUnchanged "repeat publish" repeatPublish |> ignore
             }
 
             profileTest "a failed publish is recoverable and retry succeeds"
@@ -196,13 +214,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "revision awaiting publish"
-                                Paths = [| mkPath "retry.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "retry-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "revision awaiting publish"
+                                    Paths = [| mkPath "retry.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "retry-revision")
+                        )
                     )
 
                 let revision = expectPerformed "revision before broken publish" revisionResult
@@ -212,12 +233,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! brokenPublish =
                     run (
-                        (syncService workspace.Session).Publish
-                            {
-                                ExpectedWorkspaceVersion = brokenStatus.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                            }
-                            (ctx "broken-publish")
+                        executed (
+                            workspace.Provider.Synchronization.Publish
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = brokenStatus.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "broken-publish")
+                        )
                     )
 
                 let failure = expectFailure "broken publish" brokenPublish
@@ -228,7 +252,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! afterFailure = getStatus workspace
 
                 match afterFailure.Synchronization with
-                | Some sync -> Vitest.expect(sync.WorkspaceRevision = revision.ResultingRevision).toBe (true)
+                | Some sync -> Vitest.expect(sync.LocalRevision = revision.ResultingRevision).toBe (true)
                 | None -> failwith "Expected synchronization state."
 
                 do! harness.RestorePublish workspace
@@ -236,12 +260,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! retryPublish =
                     run (
-                        (syncService workspace.Session).Publish
-                            {
-                                ExpectedWorkspaceVersion = restoredStatus.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                            }
-                            (ctx "retry-publish")
+                        executed (
+                            workspace.Provider.Synchronization.Publish
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = restoredStatus.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "retry-publish")
+                        )
                     )
 
                 let retried = expectPerformed "retried publish" retryPublish
@@ -253,7 +280,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! workspace = harness.CreateWorkspace()
 
                 // Capture the target revision the consumer believes is current.
-                let! refreshResult = run ((syncService workspace.Session).Refresh(ctx "stale-refresh"))
+                let! refreshResult = run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository (ctx "stale-refresh")))
                 let observedState = expectValue "refresh before staleness" refreshResult
 
                 let staleTarget =
@@ -275,13 +302,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "local revision"
-                                Paths = [| mkPath "local.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "stale-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "local revision"
+                                    Paths = [| mkPath "local.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "stale-revision")
+                        )
                     )
 
                 expectPerformed "local revision" revisionResult |> ignore
@@ -289,12 +319,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! publishResult =
                     run (
-                        (syncService workspace.Session).Publish
-                            {
-                                ExpectedWorkspaceVersion = prePublish.WorkspaceVersion
-                                ExpectedTargetRevision = Some staleTarget
-                            }
-                            (ctx "stale-publish")
+                        executed (
+                            workspace.Provider.Synchronization.Publish
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = prePublish.RepositoryVersion
+                                    ExpectedTargetRevision = Some staleTarget
+                                }
+                                (ctx "stale-publish")
+                        )
                     )
 
                 let failure = carriedFailure "stale publish" publishResult
@@ -305,27 +338,30 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(evidenceRoles.Length >= 2).toBe (true)
             }
 
-            profileTest "synchronize with nothing to do is a NoOp and leaves the target alone"
+            profileTest "synchronize with nothing to do is Unchanged and leaves the target alone"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
-                let! beforeResult = run ((syncService workspace.Session).Refresh(ctx "sync-noop-before"))
+                let! beforeResult = run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository (ctx "sync-unchanged-before")))
                 let before = expectValue "initial refresh" beforeResult
                 let! status = getStatus workspace
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = true
-                            }
-                            (ctx "synchronize-noop")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = true
+                                }
+                                (ctx "synchronize-unchanged")
+                        )
                     )
 
-                expectNoOp "synchronize no-op" result |> ignore
-                let! afterResult = run ((syncService workspace.Session).Refresh(ctx "sync-noop-after"))
+                expectUnchanged "synchronize unchanged" result |> ignore
+                let! afterResult = run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository (ctx "sync-unchanged-after")))
                 let after = expectValue "final refresh" afterResult
                 Vitest.expect(after.TargetRevision).toEqual (before.TargetRevision)
             }
@@ -344,13 +380,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "save local content"
-                                Paths = [| mkPath "local.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "synchronize-local-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "save local content"
+                                    Paths = [| mkPath "local.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "synchronize-local-revision")
+                        )
                     )
 
                 expectPerformed "local revision" revisionResult |> ignore
@@ -358,14 +397,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = afterRevision.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = true
-                            }
-                            (ctx "synchronize-update-publish")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = afterRevision.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = true
+                                }
+                                (ctx "synchronize-update-publish")
+                        )
                     )
 
                 let outcome = expectPerformed "synchronize update and publish" result
@@ -397,14 +439,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! firstResult =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-risk")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-risk")
+                        )
                     )
 
                 let firstFailure = expectFailure "synchronize risk" firstResult
@@ -425,14 +470,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! acceptedStatus = getStatus workspace
                 let! acceptedResult =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = acceptedStatus.WorkspaceVersion
-                                ExpectedTargetRevision = observedTarget
-                                AcceptUpdateRisks = true
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-risk-accepted")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = acceptedStatus.RepositoryVersion
+                                    ExpectedTargetRevision = observedTarget
+                                    AcceptUpdateRisks = true
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-risk-accepted")
+                        )
                     )
 
                 let acceptedFailure = expectFailure "accepted synchronize" acceptedResult
@@ -458,13 +506,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "commit local divergence"
-                                Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "synchronize-conflict-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "commit local divergence"
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "synchronize-conflict-revision")
+                        )
                     )
 
                 expectPerformed "local divergent revision" revisionResult |> ignore
@@ -472,14 +523,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! firstResult =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = divergentStatus.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-conflict-preview")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = divergentStatus.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-conflict-preview")
+                        )
                     )
 
                 let firstFailure = expectFailure "synchronize conflict preview" firstResult
@@ -492,14 +546,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! acceptedStatus = getStatus workspace
                 let! acceptedResult =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = acceptedStatus.WorkspaceVersion
-                                ExpectedTargetRevision = Some observedTarget
-                                AcceptUpdateRisks = true
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-conflict-accepted")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = acceptedStatus.RepositoryVersion
+                                    ExpectedTargetRevision = Some observedTarget
+                                    AcceptUpdateRisks = true
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-conflict-accepted")
+                        )
                     )
 
                 let acceptedFailure = carriedFailure "accepted synchronize conflict" acceptedResult
@@ -525,14 +582,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! firstResult =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = true
-                            }
-                            (ctx "synchronize-moved-risk")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = true
+                                }
+                                (ctx "synchronize-moved-risk")
+                        )
                     )
 
                 let firstFailure = expectFailure "synchronize moved risk" firstResult
@@ -545,14 +605,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = movedStatus.WorkspaceVersion
-                                ExpectedTargetRevision = Some oldTarget
-                                AcceptUpdateRisks = true
-                                PublishLocalRevisions = true
-                            }
-                            (ctx "synchronize-moved-retry")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = movedStatus.RepositoryVersion
+                                    ExpectedTargetRevision = Some oldTarget
+                                    AcceptUpdateRisks = true
+                                    PublishLocalRevisions = true
+                                }
+                                (ctx "synchronize-moved-retry")
+                        )
                     )
 
                 let failure = expectFailure "synchronize moved target" result
@@ -569,14 +632,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! status = getStatus workspace
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = true
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-missing-acceptance-target")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = true
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-missing-acceptance-target")
+                        )
                     )
 
                 let failure = expectFailure "missing acceptance target" result
@@ -591,13 +657,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "local-only revision"
-                                Paths = [| mkPath "local-only.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "synchronize-local-only-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "local-only revision"
+                                    Paths = [| mkPath "local-only.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "synchronize-local-only-revision")
+                        )
                     )
 
                 expectPerformed "local-only revision" revisionResult |> ignore
@@ -609,14 +678,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = beforeSync.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-local-only")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = beforeSync.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-local-only")
+                        )
                     )
 
                 let outcome = expectPerformed "synchronize without publish" result
@@ -633,14 +705,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! workspace = harness.CreateWorkspace()
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = "stale"
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = true
-                            }
-                            (ctx "synchronize-stale-workspace")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = "stale"
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = true
+                                }
+                                (ctx "synchronize-stale-workspace")
+                        )
                     )
 
                 let failure = expectFailure "stale workspace synchronize" result
@@ -661,22 +736,28 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "conflicting local revision"
-                                Paths = [| mkPath "base.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "synchronize-conflict-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "conflicting local revision"
+                                    Paths = [| mkPath "base.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "synchronize-conflict-revision")
+                        )
                     )
 
                 expectPerformed "conflicting local revision" revisionResult |> ignore
                 let! updateStatus = getStatus workspace
                 let! updateResult =
                     run (
-                        (syncService workspace.Session).Update
-                            { ExpectedWorkspaceVersion = updateStatus.WorkspaceVersion }
-                            (ctx "synchronize-open-conflict")
+                        executed (
+                            workspace.Provider.Synchronization.Update
+                                workspace.Repository
+                                { ExpectedRepositoryVersion = updateStatus.RepositoryVersion }
+                                (ctx "synchronize-open-conflict")
+                        )
                     )
 
                 let updateFailure = carriedFailure "conflicting update" updateResult
@@ -684,14 +765,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! conflictStatus = getStatus workspace
                 let! synchronizeResult =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = conflictStatus.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            (ctx "synchronize-active-conflict")
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = conflictStatus.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                (ctx "synchronize-active-conflict")
+                        )
                     )
 
                 let failure = expectFailure "active conflict synchronize" synchronizeResult

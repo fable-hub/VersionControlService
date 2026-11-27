@@ -1,4 +1,4 @@
-/// The text diff service of a Git session. Every call goes to the shared worker pool under an owner made of
+/// The text diff of a Git repository. Every call goes to the shared worker pool under an owner made of
 /// the workspace, its LFS media directory and the window that made the call.
 module VersionControlService.Git.TextDiff.GitTextDiffService
 
@@ -9,8 +9,8 @@ open VersionControlService.Git.TextDiff.TextDiffProtocol
 module TextDiffPool = VersionControlService.Git.TextDiff.TextDiffPool
 
 type GitTextDiffOptions = {
-    /// The session calls this on a diff Open until it returns a pool. None fails that Open with
-    /// diff_worker_failed, and the next Open asks again. The session keeps the first pool it gets, so the host
+    /// The opened repository calls this on a diff Open until it returns a pool. None fails that Open with
+    /// diff_worker_failed, and the next Open asks again. The repository keeps the first pool it gets, so the host
     /// must return the same pool on every call. A host with a ready pool passes `fun () -> Promise.lift (Some pool)`.
     Pool: unit -> JS.Promise<TextDiffPool.TextDiffPool option>
     /// The window that started the call. The host maps its operation id to that window.
@@ -28,7 +28,7 @@ let create
     (options: GitTextDiffOptions)
     (workspaceRoot: string)
     (resolveMediaDirectory: OperationContext -> Async<Result<string, OperationFailure>>)
-    : TextDiffService * (unit -> Async<unit>) =
+    : TextDiffPool.TextDiffCalls * (unit -> Async<unit>) =
     let acquired: TextDiffPool.TextDiffPool option ref = ref None
 
     let acquire () = async {
@@ -51,7 +51,7 @@ let create
         (pool: TextDiffPool.TextDiffPool)
         (context: OperationContext)
         (onMediaFailure: OperationFailure -> OperationResult<'T>)
-        (call: TextDiffService -> Async<OperationResult<'T>>)
+        (call: TextDiffPool.TextDiffCalls -> Async<OperationResult<'T>>)
         : Async<OperationResult<'T>> =
         async {
             let! mediaDirectory = resolveMediaDirectory context
@@ -72,13 +72,13 @@ let create
         (context: OperationContext)
         (onMediaFailure: OperationFailure -> OperationResult<'T>)
         (onNoPool: OperationResult<'T>)
-        (call: TextDiffService -> Async<OperationResult<'T>>)
+        (call: TextDiffPool.TextDiffCalls -> Async<OperationResult<'T>>)
         =
         match acquired.Value with
         | Some pool -> withService pool context onMediaFailure call
         | None -> async.Return onNoPool
 
-    let service: TextDiffService = {
+    let service: TextDiffPool.TextDiffCalls = {
         Open =
             fun request context -> async {
                 let! pool = acquire ()
@@ -125,9 +125,9 @@ let create
 
     service, closeWorkspace
 
-/// The service of a session created without a worker pool. The provider has no in-process diff, so Open
+/// The text diff of a provider created without a worker pool. The provider has no in-process diff, so Open
 /// fails with diff_worker_failed. No handle can exist, so handle calls report a closed session.
-let unavailable: TextDiffService = {
+let unavailable: TextDiffPool.TextDiffCalls = {
     Open =
         fun _ _ -> async {
             return
@@ -135,7 +135,7 @@ let unavailable: TextDiffService = {
                     OperationFailure.create
                         ProviderError
                         TextDiffFailureCodes.WorkerFailed
-                        "The Git session was created without a text diff worker pool."
+                        "The Git provider was created without a text diff worker pool."
                 )
         }
     ReadPage = fun _ _ -> async { return sessionClosed () }

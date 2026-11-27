@@ -35,7 +35,7 @@ let private fakeTargetRef: LogicalRef = {
 
 let private fakeSynchronizationState: SynchronizationState = {
     BaseRevision = None
-    WorkspaceRevision = None
+    LocalRevision = None
     TargetRevision = None
     TargetRef = Some fakeTargetRef
     LocalRevisionCount = None
@@ -59,22 +59,24 @@ let private fakeObjectState: ObjectState = {
     ObjectId = None
 }
 
-let private unsupported (operation: string) : OperationResult<'T> =
-    OperationResult.failed (
-        OperationFailure.create Unsupported "operation_not_supported" $"{operation} is not supported by this provider."
-    )
+let private noFunction = "The fake provider does not have this function."
 
-let private createFakeSynchronization () : SynchronizationService = {
-    Refresh = fun _ -> async { return OperationResult.succeeded fakeSynchronizationState }
-    PreviewUpdate = fun _ -> async { return unsupported "Synchronization preview" }
-    Update = fun _ _ -> async { return unsupported "Synchronization update" }
-    Publish = fun _ _ -> async { return unsupported "Synchronization publish" }
-    Synchronize = fun _ _ -> async { return unsupported "Synchronization synchronize" }
+let private previewUpdateReason = "The fake provider cannot preview an update."
+
+type private FakeRepository(descriptor: RepositoryDescriptor) =
+    inherit Repository(descriptor)
+
+let private createFakeSynchronization () : SynchronizationFunctions = {
+    Refresh = Implemented(fun _ _ -> async { return OperationResult.succeeded fakeSynchronizationState })
+    PreviewUpdate = Missing previewUpdateReason
+    Update = Missing noFunction
+    Publish = Missing noFunction
+    Synchronize = Missing noFunction
 }
 
-let private createFakeConflictResolution () : ConflictResolutionService = {
+let private createFakeConflictResolution () : ConflictResolutionFunctions = {
     GetActiveSession =
-        fun _ ->
+        Implemented(fun _ _ ->
             async {
                 return
                     OperationResult.succeeded (
@@ -86,42 +88,56 @@ let private createFakeConflictResolution () : ConflictResolutionService = {
                             Items = [| fakeConflictItem |]
                         }
                     )
-            }
-    Resolve = fun _ _ -> async { return unsupported "Conflict resolution" }
-    Finalize = fun _ _ -> async { return unsupported "Conflict finalization" }
-    Cancel = fun _ _ -> async { return unsupported "Conflict cancellation" }
+            })
+    Resolve = Missing noFunction
+    Finalize = Missing noFunction
+    Cancel = Missing noFunction
 }
 
-let private createFakeObjectMaterialization () : ObjectMaterializationService = {
-    ListObjects = fun _ -> async { return OperationResult.succeeded [| fakeObjectState |] }
-    Materialize = fun _ _ -> async { return unsupported "Object materialization" }
-    Dematerialize = fun _ _ -> async { return unsupported "Object dematerialization" }
+let private createFakeObjectMaterialization () : ObjectMaterializationFunctions = {
+    ListObjects = Implemented(fun _ _ -> async { return OperationResult.succeeded [| fakeObjectState |] })
+    Materialize = Missing noFunction
+    Dematerialize = Missing noFunction
 }
 
-/// Core whose diff summary is a 50-step long operation reporting progress each step
+/// The list of a fake provider whose diff summary is a 50-step long operation reporting progress each step
 /// and observing cancellation between steps.
-let private createFakeCore () : CoreVersionControl =
+let private createFakeFunctions () : ProviderFunctions =
     let status = {
         CurrentRef = None
-        WorkspaceVersion = "fake-revision-1"
+        RepositoryVersion = "fake-revision-1"
         Changes = [||]
         ActiveConflictSession = None
         Synchronization = None
     }
 
-    let notSupported (name: string) =
-        OperationResult.failed (OperationFailure.create Unsupported "fake_not_exercised" $"{name} is not exercised.")
-
     {
-        GetStatus = fun _ -> async { return OperationResult.succeeded status }
-        ListRefs = fun _ -> async { return OperationResult.succeeded [||] }
-        CreateRef = fun _ _ -> async { return notSupported "CreateRef" }
-        PreflightSwitchRef = fun _ _ -> async { return notSupported "PreflightSwitchRef" }
-        SwitchRef = fun _ _ -> async { return notSupported "SwitchRef" }
-        CreateRevision = fun _ _ -> async { return notSupported "CreateRevision" }
-        RestorePaths = fun _ _ -> async { return notSupported "RestorePaths" }
+        VerifyLocation = Missing noFunction
+        Initialize = Missing noFunction
+        Clone = Missing noFunction
+        Bind =
+            Implemented(fun request _ ->
+                async {
+                    let descriptor: RepositoryDescriptor = {
+                        ProviderId = fakeProviderId
+                        RepositoryRoot = request.RepositoryRoot
+                        Location = Some request.Location
+                    }
+
+                    return OperationResult.succeeded (FakeRepository descriptor :> Repository)
+                })
+        Open = Missing noFunction
+        CheckDependencies = Implemented(fun _ -> async { return OperationResult.succeeded [||] })
+        InstallDependency = Missing noFunction
+        GetStatus = Implemented(fun _ _ -> async { return OperationResult.succeeded status })
+        ListRefs = Implemented(fun _ _ -> async { return OperationResult.succeeded [||] })
+        CreateRef = Missing noFunction
+        PreflightSwitchRef = Missing noFunction
+        SwitchRef = Missing noFunction
+        CreateRevision = Missing noFunction
+        RestorePaths = Missing noFunction
         GetDiffSummary =
-            fun context -> async {
+            Implemented(fun _ context -> async {
                 let mutable canceled = false
                 let mutable step = 0
 
@@ -144,75 +160,65 @@ let private createFakeCore () : CoreVersionControl =
                     return OperationResult.canceled $"The fake operation stopped after {step} steps."
                 else
                     return OperationResult.succeeded { Entries = [||] }
+            })
+        Synchronization = createFakeSynchronization ()
+        ConflictResolution = createFakeConflictResolution ()
+        TextDiff = {
+            Open = Missing noFunction
+            ReadPage = Missing noFunction
+            ReplayPage = Missing noFunction
+            Expand = Missing noFunction
+            ReadLine = Missing noFunction
+            GetSourceInfo = Missing noFunction
+            Close = Missing noFunction
+        }
+        History = {
+            ListRevisions = Missing noFunction
+            GetRevisionChanges = Missing noFunction
+        }
+        RepositoryBrowser = { GetRepositoryWebUrl = Missing noFunction }
+        ObjectMaterialization = createFakeObjectMaterialization ()
+        StoragePolicy = {
+            SetPathPolicy = Missing noFunction
+            GetSettings = Missing noFunction
+            SetSettings = Missing noFunction
+        }
+        Maintenance = {
+            Prune = Missing noFunction
+            Deduplicate = Missing noFunction
+            CanDeduplicate = Missing noFunction
+        }
+    }
+
+let private createProvider (functions: ProviderFunctions) : IVersionControl =
+    ListedProvider((fun _ -> async { return NotDetected }), (fun _ -> async.Return()), functions)
+
+let private createFakeProvider () : IVersionControl = createProvider (createFakeFunctions ())
+
+/// A provider whose only synchronization function is Refresh, which records its run in the log.
+let private createLoggingProvider (log: ResizeArray<string>) : IVersionControl =
+    let functions = createFakeFunctions ()
+
+    createProvider {
+        functions with
+            Synchronization = {
+                functions.Synchronization with
+                    Refresh =
+                        Implemented(fun _ _ ->
+                            async {
+                                log.Add "refresh"
+                                return OperationResult.succeeded fakeSynchronizationState
+                            })
             }
     }
 
-let private createFakeFactory () : ProviderFactory =
-    let binding workspaceRoot location = {
-        SchemaVersion = WorkspaceBinding.CurrentSchemaVersion
-        ProviderId = fakeProviderId
-        WorkspaceRoot = workspaceRoot
-        ProviderStateRef = None
-        Location = location
-        ConnectionProfileId = None
-    }
+let private executed (call: Async<CallResult<'T>>) : Async<OperationResult<'T>> =
+    async {
+        let! result = call
 
-    {
-        Id = fakeProviderId
-        Probe = fun _ -> async { return NotDetected }
-        VerifyLocation =
-            fun request _ -> async {
-                return
-                    OperationResult.succeeded {
-                        Location = request.Location
-                        GrantedIntents = request.Intents
-                        DeniedIntents = [||]
-                    }
-            }
-        Initialize =
-            fun request _ -> async {
-                let location = request.Location |> Option.defaultValue fakeLocation
-                return OperationResult.succeeded (binding request.TargetPath location)
-            }
-        Clone = fun request _ -> async { return OperationResult.succeeded (binding request.TargetPath request.Location) }
-        Adopt =
-            fun _ _ ->
-                async {
-                    return
-                        OperationResult.failed (
-                            OperationFailure.create Unsupported "operation_not_supported" "Adoption is not supported by this provider."
-                        )
-                }
-        Bind =
-            fun request _ -> async { return OperationResult.succeeded (binding request.WorkspaceRoot request.Location) }
-        Open =
-            fun workspaceBinding _ -> async {
-                let descriptor = {
-                    ProviderId = workspaceBinding.ProviderId
-                    WorkspaceRoot = workspaceBinding.WorkspaceRoot
-                    Location = Some workspaceBinding.Location
-                }
-
-                return
-                    OperationResult.succeeded {
-                        WorkspaceSession.createCoreOnly descriptor (createFakeCore ()) with
-                            ConflictResolution = Some(createFakeConflictResolution ())
-                            Synchronization = Some(createFakeSynchronization ())
-                            ObjectMaterialization = Some(createFakeObjectMaterialization ())
-                    }
-            }
-        CheckDependencies = fun _ -> async { return OperationResult.succeeded [||] }
-        InstallDependency =
-            fun _ _ ->
-                async {
-                    return
-                        OperationResult.failed (
-                            OperationFailure.create
-                                Unsupported
-                                "operation_not_supported"
-                                "Dependency installation is not supported by this provider."
-                        )
-                }
+        match result with
+        | Executed operationResult -> return operationResult
+        | NoOp reason -> return failwith $"The provider did not run the call: {reason}"
     }
 
 let private expectSucceeded (operationName: string) (result: OperationResult<'T>) : 'T =
@@ -221,19 +227,19 @@ let private expectSucceeded (operationName: string) (result: OperationResult<'T>
     | PartiallySucceeded _ -> failwith $"{operationName} unexpectedly returned partial success."
     | Failed failure -> failwith $"{operationName} failed ({failure.Category}/{failure.Code}): {failure.Message}"
 
-let private openFakeSession (factory: ProviderFactory) (context: OperationContext) =
+let private openFakeRepository (provider: IVersionControl) (context: OperationContext) =
     async {
         let! bindResult =
-            factory.Bind
-                {
-                    WorkspaceRoot = "/fake/workspace"
-                    Location = fakeLocation
-                }
-                context
+            executed (
+                provider.Bind
+                    {
+                        RepositoryRoot = "/fake/workspace"
+                        Location = fakeLocation
+                    }
+                    context
+            )
 
-        let workspaceBinding = expectSucceeded "bind" bindResult
-        let! openResult = factory.Open workspaceBinding context
-        return expectSucceeded "open session" openResult
+        return expectSucceeded "bind" bindResult
     }
 
 Vitest.describe (
@@ -243,23 +249,23 @@ Vitest.describe (
             "a Fable consumer awaits one core operation through the Async carrier",
             fun () -> promise {
                 let workflow = async {
-                    let factory = createFakeFactory ()
+                    let provider = createFakeProvider ()
                     let context = OperationContext.detached "portable-open"
 
-                    let! session = openFakeSession factory context
-                    let! statusResult = session.Core.GetStatus context
+                    let! repository = openFakeRepository provider context
+                    let! statusResult = executed (provider.GetStatus repository context)
                     return expectSucceeded "get status" statusResult
                 }
 
                 let! status = Async.StartAsPromise workflow
-                Vitest.expect(status.WorkspaceVersion).toBe ("fake-revision-1")
+                Vitest.expect(status.RepositoryVersion).toBe ("fake-revision-1")
             }
         )
 
         Vitest.test (
             "cancellation reaches and stops a Promise-backed fake long operation",
             fun () -> promise {
-                let factory = createFakeFactory ()
+                let provider = createFakeProvider ()
                 let source = OperationCancellation.Source()
                 let mutable lastCompleted = 0.0
 
@@ -275,8 +281,8 @@ Vitest.describe (
                         | None -> ())
 
                 let workflow = async {
-                    let! session = openFakeSession factory context
-                    return! session.Core.GetDiffSummary context
+                    let! repository = openFakeRepository provider context
+                    return! executed (provider.GetDiffSummary repository context)
                 }
 
                 let! diffResult = Async.StartAsPromise workflow
@@ -296,7 +302,7 @@ Vitest.describe (
         Vitest.test (
             "progress callbacks flow through the operation context in Fable",
             fun () -> promise {
-                let factory = createFakeFactory ()
+                let provider = createFakeProvider ()
                 let progressPhases = ResizeArray<string>()
 
                 let context =
@@ -304,8 +310,8 @@ Vitest.describe (
                         progressPhases.Add progress.PhaseCode)
 
                 let workflow = async {
-                    let! session = openFakeSession factory context
-                    return! session.Core.GetDiffSummary context
+                    let! repository = openFakeRepository provider context
+                    return! executed (provider.GetDiffSummary repository context)
                 }
 
                 let! diffResult = Async.StartAsPromise workflow
@@ -319,37 +325,22 @@ Vitest.describe (
         Vitest.test (
             "final SPI additions round-trip through the portable consumer",
             fun () -> promise {
-                let factory = createFakeFactory ()
+                let provider = createFakeProvider ()
                 let context = OperationContext.detached "portable-final-spi"
 
                 let workflow = async {
-                    let! session = openFakeSession factory context
+                    let! repository = openFakeRepository provider context
 
-                    let conflicts =
-                        match session.ConflictResolution with
-                        | Some service -> service
-                        | None -> failwith "Expected the fake conflict-resolution service."
-
-                    let! summaryResult = conflicts.GetActiveSession context
+                    let! summaryResult = executed (provider.ConflictResolution.GetActiveSession repository context)
                     let summary = expectSucceeded "get active conflict session" summaryResult
 
                     let conflict =
                         summary |> Option.defaultWith (fun () -> failwith "Expected an active fake conflict session.")
 
-                    let synchronization =
-                        match session.Synchronization with
-                        | Some service -> service
-                        | None -> failwith "Expected the fake synchronization service."
-
-                    let! stateResult = synchronization.Refresh context
+                    let! stateResult = executed (provider.Synchronization.Refresh repository context)
                     let state = expectSucceeded "refresh synchronization" stateResult
 
-                    let objects =
-                        match session.ObjectMaterialization with
-                        | Some service -> service
-                        | None -> failwith "Expected the fake object-materialization service."
-
-                    let! objectsResult = objects.ListObjects context
+                    let! objectsResult = executed (provider.ObjectMaterialization.ListObjects repository context)
                     let objectState = expectSucceeded "list objects" objectsResult |> Array.exactlyOne
 
                     return conflict.Items[0].CombinedPreview, state.TargetRef, objectState.IsLocallyAvailable
@@ -362,163 +353,61 @@ Vitest.describe (
                 Vitest.expect(isLocallyAvailable).toBe (true)
             }
         )
-)
-
-Vitest.describe (
-    "Fallback services (Fable)",
-    fun () ->
-        Vitest.test (
-            "availability reports fake services before fallback and all services after",
-            fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-availability"
-
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    let before = WorkspaceSession.availability session
-                    let after = session |> WorkspaceSession.withFallbackServices |> WorkspaceSession.availability
-                    return before, after
-                }
-
-                let! before, after = Async.StartAsPromise workflow
-                let expectedBefore: ServiceAvailability = {
-                    Synchronization = true
-                    TextDiff = false
-                    ConflictResolution = true
-                    ObjectMaterialization = true
-                    StoragePolicy = false
-                    Maintenance = false
-                    RepositoryBrowser = false
-                }
-                let expectedAfter: ServiceAvailability = {
-                    Synchronization = true
-                    TextDiff = true
-                    ConflictResolution = true
-                    ObjectMaterialization = true
-                    StoragePolicy = true
-                    Maintenance = true
-                    RepositoryBrowser = true
-                }
-
-                Vitest.expect(before).toEqual (expectedBefore)
-                Vitest.expect(after).toEqual (expectedAfter)
-            }
-        )
 
         Vitest.test (
-            "repository browser fallback returns a warned no-op",
+            "a missing function answers NoOp with the reason of its entry and runs nothing",
             fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-browser"
+                let log = ResizeArray<string>()
+                let provider = createLoggingProvider log
+                let context = OperationContext.detached "portable-missing-function"
 
                 let workflow = async {
-                    let! session = openFakeSession factory context
-                    let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
-                    let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let browser =
-                        filled.RepositoryBrowser
-                        |> Option.defaultWith (fun () -> failwith "Expected the fallback repository-browser service.")
-                    return! browser.GetRepositoryWebUrl context
+                    let! repository = openFakeRepository provider context
+                    return! provider.Synchronization.PreviewUpdate repository context
                 }
 
                 let! result = Async.StartAsPromise workflow
 
                 match result with
-                | Succeeded outcome ->
-                    Vitest.expect(outcome.Effect).toEqual (NoOp(Some "The provider has no repository browser service."))
-                    Vitest.expect(outcome.Value).toEqual None
-                    Vitest.expect(outcome.Warnings.Length).toBe (1)
-                    Vitest.expect(outcome.Warnings[0].Code).toBe (FallbackServiceCodes.ServiceUnavailable)
-                | PartiallySucceeded _
-                | Failed _ -> failwith "The repository-browser fallback did not return a successful no-op."
+                | NoOp reason -> Vitest.expect(reason).toBe (previewUpdateReason)
+                | Executed _ -> failwith "Expected NoOp for a missing function."
+
+                Vitest.expect(log.Count).toBe (0)
             }
         )
 
         Vitest.test (
-            "object materialization fallback returns a warned no-op",
+            "subscribing to a missing function fails with the reason of its entry",
             fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-object-materialization"
+                let provider = createLoggingProvider (ResizeArray<string>())
 
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
-                    let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let objects =
-                        filled.ObjectMaterialization
-                        |> Option.defaultWith (fun () ->
-                            failwith "Expected the fallback object materialization service.")
-                    let! materialized = objects.Materialize [| fakePath |] context
-                    let! dematerialized = objects.Dematerialize [| fakePath |] context
-                    return materialized, dematerialized
-                }
-
-                let! materialized, dematerialized = Async.StartAsPromise workflow
-
-                [ materialized; dematerialized ]
-                |> List.iter (fun result ->
-                    match result with
-                    | Succeeded outcome ->
-                        Vitest
-                            .expect(outcome.Effect)
-                            .toEqual (NoOp(Some "The provider has no object materialization service."))
-                        Vitest.expect(outcome.Warnings.Length).toBe (1)
-                        Vitest.expect(outcome.Warnings[0].Code).toBe (FallbackServiceCodes.ServiceUnavailable)
-                    | PartiallySucceeded _
-                    | Failed _ -> failwith "The object materialization fallback did not return a successful no-op.")
+                match Subscribe.single (fun functions -> functions.Synchronization.PreviewUpdate) provider with
+                | Error reason -> Vitest.expect(reason).toBe (previewUpdateReason)
+                | Ok _ -> failwith "Expected an error for a missing function."
             }
         )
 
         Vitest.test (
-            "synchronization fallback reports the service-unavailable failure",
+            "subscribing to a function the provider has gives the function and its direct result",
             fun () -> promise {
-                let factory = createFakeFactory ()
-                let context = OperationContext.detached "portable-fallback-synchronization"
+                let log = ResizeArray<string>()
+                let provider = createLoggingProvider log
+                let context = OperationContext.detached "portable-subscribed-refresh"
 
                 let workflow = async {
-                    let! session = openFakeSession factory context
-                    let coreOnly = WorkspaceSession.createCoreOnly session.Descriptor session.Core
-                    let filled = WorkspaceSession.withFallbackServices coreOnly
-                    let synchronization =
-                        filled.Synchronization
-                        |> Option.defaultWith (fun () -> failwith "Expected the fallback synchronization service.")
-                    return! synchronization.Refresh context
+                    let! repository = openFakeRepository provider context
+
+                    match Subscribe.single (fun functions -> functions.Synchronization.Refresh) provider with
+                    | Error reason -> return failwith reason
+                    | Ok refresh ->
+                        let! result = refresh repository context
+                        return expectSucceeded "refresh" result
                 }
 
-                let! result = Async.StartAsPromise workflow
+                let! state = Async.StartAsPromise workflow
 
-                match result with
-                | Failed failure ->
-                    Vitest.expect(failure.Category).toEqual (Unsupported)
-                    Vitest.expect(failure.Code).toBe (FallbackServiceCodes.ServiceUnavailable)
-                | Succeeded _
-                | PartiallySucceeded _ -> failwith "The synchronization fallback did not fail as unsupported."
-            }
-        )
-
-        Vitest.test (
-            "a wrapped factory opens a session with every service present",
-            fun () -> promise {
-                let factory = createFakeFactory () |> ProviderFactory.withFallbackServices
-                let context = OperationContext.detached "portable-fallback-factory"
-
-                let workflow = async {
-                    let! session = openFakeSession factory context
-                    return WorkspaceSession.availability session
-                }
-
-                let! availability = Async.StartAsPromise workflow
-                let expected: ServiceAvailability = {
-                    Synchronization = true
-                    TextDiff = true
-                    ConflictResolution = true
-                    ObjectMaterialization = true
-                    StoragePolicy = true
-                    Maintenance = true
-                    RepositoryBrowser = true
-                }
-
-                Vitest.expect(availability).toEqual (expected)
+                Vitest.expect(state).toEqual (fakeSynchronizationState)
+                Vitest.expect(log.Count).toBe (1)
             }
         )
 )

@@ -30,16 +30,16 @@ let private automaticDiscovery () : string option = None
 
 let mutable private executableProvider: unit -> string option = automaticDiscovery
 
-/// Installs the function that selects the git executable. The selection is shared by every factory
-/// in this process, and the provider must not throw. simple-git captures its binary and environment when an
+/// Installs the function that selects the git executable. The selection is shared by every Git provider
+/// in this process, and the function must not throw. simple-git captures its binary and environment when an
 /// operation creates its instance, so for simple-git a changed answer applies from the next operation.
-/// Process requests and the Git LFS adapter ask the provider at each start. The text diff supervisor asks
+/// Process requests and the Git LFS adapter ask the function at each start. The text diff supervisor asks
 /// it each time it launches git. For all of them a changed answer applies from the next start. None or a
 /// blank string selects automatic discovery, which resolves the name "git" through PATH. A selected path
 /// has to be absolute, because a relative path would run relative to the working directory of each command.
 let setGitExecutableProvider (provider: unit -> string option) : unit = executableProvider <- provider
 
-/// Restores automatic discovery for every factory in this process and clears the cached probe of
+/// Restores automatic discovery for every Git provider in this process and clears the cached probe of
 /// the Git tool PATH.
 let resetGitExecutableProvider () : unit =
     executableProvider <- automaticDiscovery

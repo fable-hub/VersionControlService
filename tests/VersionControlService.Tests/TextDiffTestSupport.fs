@@ -1,4 +1,4 @@
-/// Helpers shared by the text diff tests that open a diff through a service.
+/// Helpers shared by the text diff tests that open a diff.
 module VersionControlService.Tests.TextDiffTestSupport
 
 open Fable.Core
@@ -9,7 +9,7 @@ let private maxOpenAttempts = 10000
 
 /// Calls Open and passes each Scanning continuation back with the next Open until the answer is ready.
 let openUntilReady
-    (service: TextDiffService)
+    (openDiff: OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>)
     (initial: OpenDiffRequest)
     (context: OperationContext)
     : JS.Promise<OpenDiffResult> =
@@ -24,7 +24,7 @@ let openUntilReady
             if attempts > maxOpenAttempts then
                 failwith $"Open still answered Scanning after {maxOpenAttempts} attempts."
 
-            let! result = service.Open request context |> Async.StartAsPromise
+            let! result = openDiff request context |> Async.StartAsPromise
 
             match result with
             | Succeeded outcome ->

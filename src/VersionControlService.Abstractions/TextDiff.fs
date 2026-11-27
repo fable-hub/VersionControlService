@@ -113,6 +113,7 @@ type DiffPage = {
 /// Text metadata for one source in an opened diff.
 type DiffSourceInfo = {
     Path: RepositoryPath
+    /// The revision the side was read from, also when its content is a large object. A working file or an absent side has none.
     Revision: RevisionId option
     IsAbsent: bool
     ByteLength: int64
@@ -125,7 +126,7 @@ type DiffSourceInfo = {
 /// An encoding candidate with a preview of at most 2 KiB of decoded text.
 type EncodingCandidate = { Encoding: string; Preview: string }
 
-/// Binds the selected path, optional previous path, pinned commit, and source identities.
+/// Binds the selected path, optional previous path, pinned commits, and source identities.
 type PreparationToken = { Id: string }
 
 /// How a diff session keeps its temporary data.
@@ -138,10 +139,20 @@ type DiffStoragePolicy =
     /// below 576 KiB (a page envelope plus 64 KiB) blocks every committed Git blob.
     | MemoryOnly of memoryBudgetBytes: int64
 
-/// Input for opening a pinned diff session with optional encoding choices, continuation, and storage policy.
+/// What a diff compares.
+[<RequireQualifiedAccess>]
+type DiffComparison =
+    /// The working file against its version in the last revision.
+    | WorkingFile
+    /// The version in a revision against the version in its first parent.
+    | Revision of RevisionId
+
+/// Input for opening a pinned diff session. `Comparison` names what the diff compares, and a revision
+/// comparison does not read the working tree.
 type OpenDiffRequest = {
     Path: RepositoryPath
     PreviousPath: RepositoryPath option
+    Comparison: DiffComparison
     Preparation: PreparationToken option
     PreviousEncoding: string option
     CurrentEncoding: string option
@@ -157,7 +168,6 @@ type DiffBlocker =
     | LocalContentUnavailable of DiffSide * objectId: string option
     | EncodingRequired of DiffSide * PreparationToken * EncodingCandidate[]
     | NotRegularFile of DiffSide
-    | ProviderUnsupported
     /// The session keeps its data in memory and the committed Git blob of this side is larger than the session
     /// may read into memory.
     | BlobTooLargeForMemory of DiffSide * blobBytes: int64 * limitBytes: int64
@@ -215,19 +225,57 @@ type ReadLineRequest = {
 /// Request the pinned metadata for both sources in an opened diff.
 type SourceInfoRequest = { Handle: DiffHandle }
 
+/// The text diff functions of a provider, one entry for each.
+type TextDiffFunctions = {
+    Open: Entry<Repository -> OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>>
+    ReadPage: Entry<Repository -> ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>>
+    ReplayPage: Entry<Repository -> ReplayPageRequest -> OperationContext -> Async<OperationResult<DiffPage>>>
+    Expand: Entry<Repository -> ExpandRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPart[]>>>>
+    ReadLine: Entry<Repository -> ReadLineRequest -> OperationContext -> Async<OperationResult<Resumable<DiffLine>>>>
+    GetSourceInfo:
+        Entry<Repository -> SourceInfoRequest -> OperationContext -> Async<OperationResult<DiffSourceInfo * DiffSourceInfo>>>
+    Close: Entry<Repository -> DiffHandle -> OperationContext -> Async<OperationResult<unit>>>
+}
+
 /// Reads and expands paged diffs with resumable work.
 /// A handle belongs to the workspace and to the owner that the hosting provider derives from the calling
 /// operation (for example, the window that made the call). A call with a handle of another owner answers
 /// `TextDiffFailureCodes.SessionClosed` ("diff_session_closed"), and `Close` of another owner's handle changes nothing.
-type TextDiffService = {
-    Open: OpenDiffRequest -> OperationContext -> Async<OperationResult<Resumable<OpenDiffResult>>>
-    ReadPage: ReadPageRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPage>>>
-    ReplayPage: ReplayPageRequest -> OperationContext -> Async<OperationResult<DiffPage>>
-    Expand: ExpandRequest -> OperationContext -> Async<OperationResult<Resumable<DiffPart[]>>>
-    ReadLine: ReadLineRequest -> OperationContext -> Async<OperationResult<Resumable<DiffLine>>>
-    GetSourceInfo: SourceInfoRequest -> OperationContext -> Async<OperationResult<DiffSourceInfo * DiffSourceInfo>>
-    Close: DiffHandle -> OperationContext -> Async<OperationResult<unit>>
-}
+type ITextDiff =
+    abstract Open:
+        repository: Repository ->
+        request: OpenDiffRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<OpenDiffResult>>>
+
+    abstract ReadPage:
+        repository: Repository ->
+        request: ReadPageRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<DiffPage>>>
+
+    abstract ReplayPage:
+        repository: Repository -> request: ReplayPageRequest -> context: OperationContext -> Async<CallResult<DiffPage>>
+
+    abstract Expand:
+        repository: Repository ->
+        request: ExpandRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<DiffPart[]>>>
+
+    abstract ReadLine:
+        repository: Repository ->
+        request: ReadLineRequest ->
+        context: OperationContext ->
+            Async<CallResult<Resumable<DiffLine>>>
+
+    abstract GetSourceInfo:
+        repository: Repository ->
+        request: SourceInfoRequest ->
+        context: OperationContext ->
+            Async<CallResult<DiffSourceInfo * DiffSourceInfo>>
+
+    abstract Close: repository: Repository -> handle: DiffHandle -> context: OperationContext -> Async<CallResult<unit>>
 
 /// Stable failure codes returned by paged text diff operations.
 module TextDiffFailureCodes =
@@ -281,134 +329,3 @@ module TextDiffFailureCodes =
     /// and recorded answers keep working.
     [<Literal>]
     let MemoryBudgetReached = "diff_memory_budget_reached"
-
-/// Materialization state of one lazily-hydrated object.
-type ObjectState = {
-    Path: RepositoryPath
-    IsMaterialized: bool
-    /// Whether the object bytes are available in provider-local storage.
-    IsLocallyAvailable: bool
-    SizeBytes: float option
-    ObjectId: string option
-}
-
-/// Stable codes of the failures and recoveries that object materialization returns. A provider that supplies
-/// `ObjectMaterializationService` uses them, and a consumer decides by the code because the messages can change.
-module ObjectMaterializationCodes =
-
-    /// A path has local changes that the call would overwrite, for example an edited file. A call returns it
-    /// when every failed path was refused for this reason.
-    [<Literal>]
-    let LocalChanges = "local_changes"
-
-    /// Some paths of a Materialize call with several paths failed, and not all of them for local changes.
-    [<Literal>]
-    let BatchMaterializationIncomplete = "batch_materialization_incomplete"
-
-    /// Some paths of a Dematerialize call with several paths failed, and not all of them for local changes.
-    [<Literal>]
-    let BatchDematerializationIncomplete = "batch_dematerialization_incomplete"
-
-    /// Recovery: materialize the affected paths again. An operation that downloads large objects after its
-    /// own transfer, such as an update, also uses it when that download did not finish.
-    [<Literal>]
-    let RetryMaterializationRecovery = "retry_materialization"
-
-    /// Recovery: dematerialize the affected paths again.
-    [<Literal>]
-    let RetryDematerializationRecovery = "retry_dematerialization"
-
-/// Optional object-materialization extension. A provider supplies it when its workspace holds large or
-/// lazily fetched objects as references that a call replaces with the object's content, or the reverse.
-/// ListObjects reports the state of those objects. Materialize and Dematerialize take an array of paths, so
-/// one call serves a single file and a whole folder, and a provider that handles many paths in one operation
-/// is faster than one call per path.
-///
-/// Paths are exact keys and a duplicate counts once. An empty array or paths that are already in the target
-/// state give Succeeded with a NoOp effect. When some paths fail and others changed, the result is
-/// PartiallySucceeded. When none changed, it is Failed. A failure lists the failed paths in AffectedPaths and
-/// one "<path>: <message>" line per failed path in Details. The outcome's AffectedPaths lists the changed
-/// paths. A canceled run reports the paths that finished as changed and fails the others with a Canceled
-/// failure (PartiallySucceeded when some changed, Failed when none).
-///
-/// A call with one path fails with that path's own code and message. With several paths, the failure code
-/// is `ObjectMaterializationCodes.LocalChanges` when every failed path was refused for local changes.
-/// Otherwise it is `ObjectMaterializationCodes.BatchMaterializationIncomplete` for Materialize and
-/// `ObjectMaterializationCodes.BatchDematerializationIncomplete` for Dematerialize. A partial success carries
-/// the recovery `ObjectMaterializationCodes.RetryMaterializationRecovery` or
-/// `ObjectMaterializationCodes.RetryDematerializationRecovery`.
-type ObjectMaterializationService = {
-    ListObjects: OperationContext -> Async<OperationResult<ObjectState[]>>
-    /// Replaces the references of the given paths with their content.
-    Materialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
-    /// Replaces the content of the given paths with their references. For each path that changes, it also
-    /// removes the provider-local copy of the object. A provider does this only after checking that its remote
-    /// has the object, and it keeps the copy when the local storage is shared with other workspaces.
-    Dematerialize: RepositoryPath[] -> OperationContext -> Async<OperationResult<unit>>
-}
-
-type StoragePolicySettings = {
-    /// Threshold in megabytes above which new objects use large-object storage, when supported.
-    AutoPolicyThresholdMb: int option
-    /// Whether large objects are materialized during clone/update by default.
-    MaterializeLargeObjects: bool
-}
-
-/// Optional large-object storage-policy extension over literal repository paths.
-type StoragePolicyService = {
-    /// True marks the path as a large object. False records an explicit opt-out that
-    /// outranks the automatic policy of later revisions until the path is marked again.
-    /// A provider that changes the policy reports the path in AffectedPaths, and the next
-    /// revision that includes the path stores it under the new policy.
-    SetPathPolicy: RepositoryPath -> bool -> OperationContext -> Async<OperationResult<unit>>
-    GetSettings: OperationContext -> Async<OperationResult<StoragePolicySettings>>
-    SetSettings: StoragePolicySettings -> OperationContext -> Async<OperationResult<unit>>
-}
-
-/// How one selected regular file is stored in the revision being created. Only providers
-/// with a large-object representation (Git with Git LFS) act on it. Providers without one
-/// accept the strategy and never call it.
-[<RequireQualifiedAccess>]
-type RevisionPathPolicy =
-    /// The provider decides from its automatic threshold and its own rules.
-    | Automatic
-    /// The plain content, even above the threshold and even when a provider rule says large object.
-    | Inline
-    /// Large-object storage, even below the threshold.
-    | LargeObject
-
-/// What the strategy sees for each selected regular file. SizeInBytes is the size of the
-/// content that would be committed, so for a file that is a recognized large-object
-/// reference it is the declared payload size, not the length of the reference.
-type RevisionPathPolicyRequest = {
-    Path: RepositoryPath
-    SizeInBytes: float
-}
-
-/// Immutable configuration handed to a factory at creation. The function must be fast,
-/// deterministic and free of side effects. It must not touch the file system or the network.
-type RevisionPolicyStrategy = {
-    ResolvePathPolicy: RevisionPathPolicyRequest -> RevisionPathPolicy
-}
-
-module RevisionPolicyStrategy =
-
-    let automatic: RevisionPolicyStrategy = {
-        ResolvePathPolicy = fun _ -> RevisionPathPolicy.Automatic
-    }
-
-/// Optional local storage maintenance extension.
-type StorageMaintenanceService = {
-    Prune: OperationContext -> Async<OperationResult<string>>
-    Deduplicate: OperationContext -> Async<OperationResult<string>>
-    /// Whether Deduplicate can work for this workspace, as the provider's own tooling reports it. True does
-    /// not promise that a later Deduplicate succeeds, because that call checks its own preconditions. False
-    /// means the tooling ruled deduplication out and carries no reason. A failed result means the check
-    /// itself could not run.
-    CanDeduplicate: OperationContext -> Async<OperationResult<bool>>
-}
-
-/// Optional repository browser extension.
-type RepositoryBrowserService = {
-    GetRepositoryWebUrl: OperationContext -> Async<OperationResult<string option>>
-}

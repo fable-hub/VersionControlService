@@ -6,7 +6,7 @@ open VersionControlService.Tests.Contracts.ProviderHarness
 open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 open Vitest
 
-/// Operational profile: progress redaction, cancellation, concurrent sessions,
+/// Operational profile: progress redaction, cancellation, concurrent repositories,
 /// in-process mutation serialization, and interruption recovery.
 let register (harness: ProviderTestHarness) : string * (unit -> int) =
     let profileName = $"{harness.Name} / operational profile"
@@ -39,7 +39,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                     OperationContext.create "operational-progress" OperationCancellation.none progressReports.Add
 
                 let! updateResult =
-                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
+                    run (executed (workspace.Provider.Synchronization.Update workspace.Repository { ExpectedRepositoryVersion = status.RepositoryVersion } context))
 
                 expectOutcome "update with progress" updateResult |> ignore
                 Vitest.expect(progressReports.Count > 0).toBe (true)
@@ -74,7 +74,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let totalBytes = 4.0 * 1024.0 * 1024.0 * 1024.0
 
                 let! updateResult =
-                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
+                    run (executed (workspace.Provider.Synchronization.Update workspace.Repository { ExpectedRepositoryVersion = status.RepositoryVersion } context))
 
                 expectOutcome "update with large-byte progress" updateResult |> ignore
 
@@ -112,7 +112,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                         | _ -> ())
 
                 let! updateResult =
-                    run ((syncService workspace.Session).Update { ExpectedWorkspaceVersion = status.WorkspaceVersion } context)
+                    run (executed (workspace.Provider.Synchronization.Update workspace.Repository { ExpectedRepositoryVersion = status.RepositoryVersion } context))
 
                 let failure = expectFailure "canceled update" updateResult
                 Vitest.expect(failure.Category).toEqual (Canceled)
@@ -120,7 +120,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 // The workspace stayed unchanged.
                 let! afterStatus = getStatus workspace
-                Vitest.expect(afterStatus.WorkspaceVersion).toBe (status.WorkspaceVersion)
+                Vitest.expect(afterStatus.RepositoryVersion).toBe (status.RepositoryVersion)
 
                 let! canceledFile = workspace.ReadFile "canceled.txt"
                 Vitest.expect(canceledFile).toEqual (None)
@@ -141,42 +141,48 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        firstWorkspace.Session.Core.CreateRevision
-                            {
-                                Message = "first workspace revision"
-                                Paths = [| mkPath "first-only.txt" |]
-                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
-                            }
-                            (ctx "independent-revision")
+                        executed (
+                            firstWorkspace.Provider.CreateRevision
+                                firstWorkspace.Repository
+                                {
+                                    Message = "first workspace revision"
+                                    Paths = [| mkPath "first-only.txt" |]
+                                    ExpectedRepositoryVersion = firstStatus.RepositoryVersion
+                                }
+                                (ctx "independent-revision")
+                        )
                     )
 
                 expectPerformed "first workspace revision" revisionResult |> ignore
 
                 let! secondAfter = getStatus secondWorkspace
-                Vitest.expect(secondAfter.WorkspaceVersion).toBe (secondStatus.WorkspaceVersion)
+                Vitest.expect(secondAfter.RepositoryVersion).toBe (secondStatus.RepositoryVersion)
             }
 
             profileTest "two sessions on the same workspace serialize mutations through version tokens"
             <| fun () -> promise {
                 let! workspace = harness.CreateWorkspace()
-                let! secondSession = harness.OpenSecondSession workspace
+                let! secondRepository = harness.OpenSecondRepository workspace
 
                 do! workspace.WriteFile "first.txt" "first content\n"
                 do! workspace.WriteFile "second.txt" "second content\n"
 
                 let! firstStatus = getStatus workspace
-                let! secondStatus = sessionStatus secondSession
-                Vitest.expect(secondStatus.WorkspaceVersion).toBe (firstStatus.WorkspaceVersion)
+                let! secondStatus = repositoryStatus workspace.Provider secondRepository
+                Vitest.expect(secondStatus.RepositoryVersion).toBe (firstStatus.RepositoryVersion)
 
                 let! firstMutation =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "first session revision"
-                                Paths = [| mkPath "first.txt" |]
-                                ExpectedWorkspaceVersion = firstStatus.WorkspaceVersion
-                            }
-                            (ctx "first-session-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "first session revision"
+                                    Paths = [| mkPath "first.txt" |]
+                                    ExpectedRepositoryVersion = firstStatus.RepositoryVersion
+                                }
+                                (ctx "first-session-revision")
+                        )
                     )
 
                 expectPerformed "first session mutation" firstMutation |> ignore
@@ -184,13 +190,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 // The second session's token is now stale; the mutation is rejected.
                 let! staleMutation =
                     run (
-                        secondSession.Core.CreateRevision
-                            {
-                                Message = "second session stale revision"
-                                Paths = [| mkPath "second.txt" |]
-                                ExpectedWorkspaceVersion = secondStatus.WorkspaceVersion
-                            }
-                            (ctx "stale-session-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                secondRepository
+                                {
+                                    Message = "second session stale revision"
+                                    Paths = [| mkPath "second.txt" |]
+                                    ExpectedRepositoryVersion = secondStatus.RepositoryVersion
+                                }
+                                (ctx "stale-session-revision")
+                        )
                     )
 
                 let failure = expectFailure "stale second-session mutation" staleMutation
@@ -198,17 +207,20 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(failure.Code).toBe (ConformanceCodes.PreconditionFailed)
 
                 // Refreshing the token lets the second session proceed.
-                let! refreshedStatus = sessionStatus secondSession
+                let! refreshedStatus = repositoryStatus workspace.Provider secondRepository
 
                 let! retriedMutation =
                     run (
-                        secondSession.Core.CreateRevision
-                            {
-                                Message = "second session retried revision"
-                                Paths = [| mkPath "second.txt" |]
-                                ExpectedWorkspaceVersion = refreshedStatus.WorkspaceVersion
-                            }
-                            (ctx "retried-session-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                secondRepository
+                                {
+                                    Message = "second session retried revision"
+                                    Paths = [| mkPath "second.txt" |]
+                                    ExpectedRepositoryVersion = refreshedStatus.RepositoryVersion
+                                }
+                                (ctx "retried-session-revision")
+                        )
                     )
 
                 expectPerformed "retried second-session mutation" retriedMutation |> ignore
@@ -231,13 +243,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! interruptedResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "interrupted revision"
-                                Paths = [| mkPath "interrupted.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            context
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "interrupted revision"
+                                    Paths = [| mkPath "interrupted.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                context
+                        )
                     )
 
                 let failure = expectFailure "interrupted revision" interruptedResult
@@ -245,19 +260,22 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 Vitest.expect(failure.StateChanged).toBe (false)
 
                 let! afterStatus = getStatus workspace
-                Vitest.expect(afterStatus.WorkspaceVersion).toBe (status.WorkspaceVersion)
+                Vitest.expect(afterStatus.RepositoryVersion).toBe (status.RepositoryVersion)
                 Vitest.expect(changePaths afterStatus).toEqual ([| "interrupted.txt" |])
 
                 // The retry succeeds cleanly.
                 let! retriedResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "retried revision"
-                                Paths = [| mkPath "interrupted.txt" |]
-                                ExpectedWorkspaceVersion = afterStatus.WorkspaceVersion
-                            }
-                            (ctx "retried-after-interrupt")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "retried revision"
+                                    Paths = [| mkPath "interrupted.txt" |]
+                                    ExpectedRepositoryVersion = afterStatus.RepositoryVersion
+                                }
+                                (ctx "retried-after-interrupt")
+                        )
                     )
 
                 expectPerformed "retried revision" retriedResult |> ignore
@@ -273,13 +291,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! revisionResult =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "revision before broken publish"
-                                Paths = [| mkPath "leak-probe.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            (ctx "leak-revision")
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "revision before broken publish"
+                                    Paths = [| mkPath "leak-probe.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                (ctx "leak-revision")
+                        )
                     )
 
                 expectPerformed "revision" revisionResult |> ignore
@@ -287,12 +308,15 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! publishResult =
                     run (
-                        (syncService workspace.Session).Publish
-                            {
-                                ExpectedWorkspaceVersion = prePublish.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                            }
-                            (ctx "leak-publish")
+                        executed (
+                            workspace.Provider.Synchronization.Publish
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = prePublish.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                }
+                                (ctx "leak-publish")
+                        )
                     )
 
                 let failure = expectFailure "broken publish" publishResult
@@ -301,9 +325,9 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 for detail in failure.Details do
                     assertRedacted detail
 
-                // The binding itself is serializable without secrets.
-                assertRedacted workspace.Binding.Location.ProviderLocation
-                assertRedacted (workspace.Binding.ConnectionProfileId |> Option.defaultValue "")
+                // The location itself is serializable without secrets.
+                assertRedacted (locationOf workspace).ProviderLocation
+                assertRedacted ((locationOf workspace).ConnectionProfileId |> Option.defaultValue "")
 
                 do! harness.RestorePublish workspace
             }

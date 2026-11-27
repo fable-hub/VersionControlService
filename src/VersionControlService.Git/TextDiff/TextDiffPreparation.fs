@@ -20,7 +20,8 @@ type SideIdentity =
 type PreparationBinding = {
     Path: string
     PreviousPath: string option
-    CommitId: string option
+    PreviousCommitId: string option
+    CurrentCommitId: string option
     Previous: SideIdentity
     Current: SideIdentity
 }
@@ -38,7 +39,8 @@ let private sideIdentity (side: ResolvedSide) =
 let bindingOf (path: string) (previousPath: string option) (sources: ResolvedSources) : PreparationBinding = {
     Path = path
     PreviousPath = previousPath
-    CommitId = sources.CommitId
+    PreviousCommitId = sources.PreviousCommitId
+    CurrentCommitId = sources.CurrentCommitId
     Previous = sideIdentity sources.Previous
     Current = sideIdentity sources.Current
 }

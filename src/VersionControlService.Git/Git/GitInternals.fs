@@ -17,6 +17,16 @@ module GitExecution = VersionControlService.Git.GitExecution
 
 type GitProgressCallback = GitProgressDto -> unit
 
+let mkRevisionId (value: string) =
+    match RevisionId.tryCreate value with
+    | Ok revisionId -> revisionId
+    | Error message -> failwith message
+
+let mkProviderRef (value: string) =
+    match ProviderRef.tryCreate value with
+    | Ok reference -> reference
+    | Error message -> failwith message
+
 let private indexLockFailurePattern = Regex(@"Unable to create '(.*index\.lock)': File exists", RegexOptions.Singleline)
 
 [<Emit("Date.now()")>]

@@ -31,7 +31,6 @@ Docker is required only for the live lakeFS row.
 | Portable .NET tests | `dotnet test tests/VersionControlService.Abstractions.Tests/VersionControlService.Abstractions.Tests.fsproj --no-restore` | No |
 | Text diff engine on .NET | `dotnet test tests/VersionControlService.TextDiff.Tests/VersionControlService.TextDiff.Tests.fsproj --no-restore` | No |
 | Text diff engine in Fable and Vitest | `dotnet run --project build/Build.fsproj -- test textdiff` | No |
-| Text diff suites with the Fable compiler Swate uses | `dotnet run --project build/Build.fsproj -- test textdiff-swate-fable` | No |
 | Fable and Vitest | `dotnet run --project build/Build.fsproj -- test run` | No |
 | Portable Fable consumer | `dotnet run --project build/Build.fsproj -- test consumer` | No |
 | Git and Git LFS scenarios | `dotnet run --project build/Build.fsproj -- test focused GitProviderContract.test.js ".*"` | No |

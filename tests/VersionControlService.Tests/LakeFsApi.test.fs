@@ -7,11 +7,14 @@ open VersionControlService.Abstractions
 open VersionControlService.LakeFs.LakeFsTypes
 open VersionControlService.Tests.NodePath
 open Vitest
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
 module LakeFsApi = VersionControlService.LakeFs.LakeFsApi
 module LakeFsRequestOutput = VersionControlService.LakeFs.LakeFsRequestOutput
 module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
 module LakeFsProviderFactory = VersionControlService.LakeFs.LakeFsProviderFactory
+module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
+module LakeFsProvider = VersionControlService.LakeFs.LakeFsProvider
 module NodeInterop = VersionControlService.Runtime.Node.Interop
 
 let private httpModule: obj = importAll "http"
@@ -631,13 +634,19 @@ Vitest.describe (
 )
 
 Vitest.describe (
-    "lakeFS factory provisioning contract",
+    "lakeFS provider provisioning contract",
     fun () ->
         Vitest.test (
-            "lakeFS factory treats markers as hints and verifies access intents",
+            "lakeFS provider ignores markers and verifies access intents",
             TestOptions(timeout = 120000),
             fun () -> promise {
-                // Probe: the lakectl marker is a detection hint, never a binding.
+                let stateRoot =
+                    join [|
+                        osDynamic?tmpdir () |> unbox<string>
+                        $"vcs-lakefs-api-state-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+                    |]
+
+                // Probe: the lakectl marker neither detects a folder nor binds it.
                 let! markerRoot =
                     fsPromisesDynamic?mkdtemp (join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-probe-" |])
                     |> unbox<JS.Promise<string>>
@@ -648,15 +657,21 @@ Vitest.describe (
                         |> unbox<JS.Promise<obj>>
                         |> Promise.map ignore
 
-                    let! probeResult = Async.StartAsPromise(LakeFsProviderFactory.probe markerRoot)
+                    let probeProvider =
+                        LakeFsProvider.create {
+                            StateRoot = stateRoot
+                            PathCaseSensitivity = CaseInsensitive
+                            Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                            Credentials = LakeFsCredentials.unconfigured
+                        }
+
+                    let! probeResult = Async.StartAsPromise(probeProvider.Probe markerRoot)
 
                     match probeResult with
-                    | Detected(root, _, bindingHint) ->
-                        Vitest.expect(root).toBe (markerRoot)
-                        Vitest.expect(bindingHint.IsSome).toBe (true)
-                    | _ -> failwith "Expected the marker directory to be detected."
+                    | NotDetected -> ()
+                    | _ -> failwith "Expected the marker directory not to be detected."
 
-                    let! emptyProbe = Async.StartAsPromise(LakeFsProviderFactory.probe (join [| markerRoot; "sub" |]))
+                    let! emptyProbe = Async.StartAsPromise(probeProvider.Probe(join [| markerRoot; "sub" |]))
 
                     match emptyProbe with
                     | NotDetected -> ()
@@ -666,12 +681,6 @@ Vitest.describe (
                     |> ignore
 
                 // Access intents: reads granted, writes denied by the server.
-                let stateRoot =
-                    join [|
-                        osDynamic?tmpdir () |> unbox<string>
-                        $"vcs-lakefs-api-state-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
-                    |]
-
                 let! server =
                     startFakeServer [
                         "GET", "/api/v1/repositories/repo", 200, """{"id":"repo","default_branch":"main"}"""
@@ -692,11 +701,13 @@ Vitest.describe (
                                 }
                     }
 
-                    let factory =
-                        LakeFsProviderFactory.createFactory {
+                    let provider =
+                        LakeFsProvider.create {
                             StateRoot = stateRoot
                             PathCaseSensitivity = CaseInsensitive
-                        } strategy
+                            Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                            Credentials = strategy
+                        }
 
                     let location: RepositoryLocation = {
                         ProviderId = LakeFsProviderFactory.lakeFsProviderId
@@ -707,17 +718,19 @@ Vitest.describe (
 
                     let! verifyResult =
                         Async.StartAsPromise(
-                            factory.VerifyLocation
-                                {
-                                    Location = location
-                                    Intents = [|
-                                        ReadIntent
-                                        WriteObjectIntent
-                                        CreateRevisionIntent
-                                        PublishIntent
-                                    |]
-                                }
-                                (ctx "verify-intents")
+                            executed (
+                                provider.VerifyLocation
+                                    {
+                                        Location = location
+                                        Intents = [|
+                                            ReadIntent
+                                            WriteObjectIntent
+                                            CreateRevisionIntent
+                                            PublishIntent
+                                        |]
+                                    }
+                                    (ctx "verify-intents")
+                            )
                         )
 
                     match verifyResult with
@@ -730,25 +743,64 @@ Vitest.describe (
                     // The strategy saw the location's connection profile.
                     Vitest.expect(observedProfiles |> List.contains (Some "lake-profile")).toBe (true)
 
-                    // Bindings come from the request alone and never carry secrets.
-                    let! bindResult =
-                        Async.StartAsPromise(
-                            factory.Bind
-                                {
-                                    WorkspaceRoot = "/lake-workspace"
-                                    Location = location
-                                }
-                                (ctx "bind")
-                        )
+                    // The repository of a bind comes from the request alone and never carries secrets.
+                    // The bind runs the first open: it reads the target branch, creates the workspace branch
+                    // and lists the objects of the target. The server answers all three with an empty target.
+                    let! bindServer =
+                        startFakeServer [
+                            "GET", "/api/v1/repositories/repo/branches/main", 200, """{"id":"main","commit_id":"c1"}"""
+                            "POST", "/api/v1/repositories/repo/branches", 201, """{"id":"workspace","commit_id":"c1"}"""
+                            "GET",
+                            "/api/v1/repositories/repo/refs/",
+                            200,
+                            """{"results":[],"pagination":{"has_more":false,"next_offset":""}}"""
+                        ]
 
-                    match bindResult with
-                    | Succeeded outcome ->
-                        let serialized: string = emitJsExpr outcome.Value "JSON.stringify($0)"
-                        Vitest.expect(serialized.Contains "supersecret").toBe (false)
-                        Vitest.expect(serialized.Contains "AKIA-test").toBe (false)
-                        Vitest.expect(outcome.Value.Location.ProviderLocation).toBe ("lakefs://repo/main/data/vault-a")
-                    | PartiallySucceeded _
-                    | Failed _ -> failwith "Expected the bind to succeed."
+                    let! bindRoot =
+                        fsPromisesDynamic?mkdtemp (join [| osDynamic?tmpdir () |> unbox<string>; "vcs-lakefs-bind-" |])
+                        |> unbox<JS.Promise<string>>
+
+                    try
+                        let bindStrategy: LakeFsCredentials.LakeFsCredentialStrategy = {
+                            ResolveConnection = fun _ -> async { return Ok(connectionFor bindServer) }
+                        }
+
+                        let bindProvider =
+                            LakeFsProvider.create {
+                                StateRoot = stateRoot
+                                PathCaseSensitivity = CaseInsensitive
+                                Hooks = LakeFsProviderOptions.LakeFsSessionHooks.none
+                                Credentials = bindStrategy
+                            }
+
+                        let! bindResult =
+                            Async.StartAsPromise(
+                                executed (
+                                    bindProvider.Bind
+                                        {
+                                            RepositoryRoot = bindRoot
+                                            Location = location
+                                        }
+                                        (ctx "bind")
+                                )
+                            )
+
+                        match bindResult with
+                        | Succeeded outcome ->
+                            let serialized: string = emitJsExpr outcome.Value.Descriptor "JSON.stringify($0)"
+                            Vitest.expect(serialized.Contains "supersecret").toBe (false)
+                            Vitest.expect(serialized.Contains "AKIA-test").toBe (false)
+
+                            Vitest.expect(outcome.Value.Descriptor.Location.Value.ProviderLocation)
+                                .toBe ("lakefs://repo/main/data/vault-a")
+
+                            do! Async.StartAsPromise(bindProvider.Close outcome.Value)
+                        | PartiallySucceeded _
+                        | Failed _ -> failwith "Expected the bind to succeed."
+                    finally
+                        bindServer.Close()
+                        fsPromisesDynamic?rm (bindRoot, createObj [ "recursive" ==> true; "force" ==> true ])
+                        |> ignore
                 finally
                     server.Close()
                     fsPromisesDynamic?rm (stateRoot, createObj [ "recursive" ==> true; "force" ==> true ])

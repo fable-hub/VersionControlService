@@ -4,14 +4,12 @@ open System
 open Fable.Core
 open Fable.Core.JsInterop
 open VersionControlService.Abstractions
+open VersionControlService.Git
 open VersionControlService.Tests.NodePath
 open Vitest
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
-module GitCredentialStrategy = VersionControlService.Git.GitCredentialStrategy
 module GitWorkspaceSession = VersionControlService.Git.GitWorkspaceSession
-module LakeFsCredentials = VersionControlService.LakeFs.LakeFsCredentials
-module LakeFsProviderOptions = VersionControlService.LakeFs.LakeFsProviderOptions
-module LakeFsWorkspaceSession = VersionControlService.LakeFs.LakeFsWorkspaceSession
 module NodeFileSystem = VersionControlService.Runtime.Node.FileSystem
 module NodeProcess = VersionControlService.Runtime.Node.Process
 
@@ -104,8 +102,8 @@ let private expectSucceededOutcome label result =
 type private GitRevisionPolicyFixture = {
     Root: string
     WorkPath: string
-    Session: WorkspaceSession
-    Binding: WorkspaceBinding
+    Provider: IVersionControl
+    Repository: Repository
 }
 
 let private createGitFixtureWithHooks
@@ -135,28 +133,45 @@ let private createGitFixtureWithHooks
                 workPath
                 [| "config"; "--local"; "versioncontrolservice.lfs.autotrackthresholdmb"; "1" |]
 
-        let factory =
-            GitWorkspaceSession.createFactoryWithCredentialsIdentityAndPolicy
-                hooks
-                GitCredentialStrategy.anonymous
-                GitCredentialStrategy.anonymousIdentity
-                strategy
+        let provider =
+            GitProvider.create {
+                GitProviderOptions.defaults with
+                    Hooks = hooks
+                    RevisionPolicy = strategy
+            }
 
-        let adoptRequest: AdoptRequest = {
-            WorkspaceRoot = workPath
-            ConnectionProfileId = None
-        }
+        let! openedResult =
+            provider.Open { RepositoryRoot = workPath; ConnectionProfileId = None } (context "revision-policy-open")
+            |> executed
+            |> Async.StartAsPromise
 
-        let! adoptedResult = factory.Adopt adoptRequest (context "revision-policy-adopt") |> Async.StartAsPromise
-        let binding = expectSucceeded "revision policy adoption" adoptedResult
-        let! openedResult = factory.Open binding (context "revision-policy-open") |> Async.StartAsPromise
-        let session = expectSucceeded "revision policy open" openedResult
+        let repository = expectSucceeded "revision policy open" openedResult
 
         return {
             Root = root
             WorkPath = workPath
-            Session = session
-            Binding = binding
+            Provider = provider
+            Repository = repository
+        }
+    }
+
+/// A second, independent open of the folder of the fixture, with other hooks.
+let private reopenWithHooks
+    (fixture: GitRevisionPolicyFixture)
+    (hooks: GitWorkspaceSession.GitSessionHooks)
+    : JS.Promise<GitRevisionPolicyFixture> =
+    promise {
+        let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
+
+        let! openedResult =
+            provider.Open { RepositoryRoot = fixture.WorkPath; ConnectionProfileId = None } (context "revision-policy-reopen")
+            |> executed
+            |> Async.StartAsPromise
+
+        return {
+            fixture with
+                Provider = provider
+                Repository = expectSucceeded "revision policy reopen" openedResult
         }
     }
 
@@ -189,18 +204,18 @@ let private createRevision
     (paths: string[])
     : JS.Promise<OperationResult<RevisionId>> =
     promise {
-        let! statusResult = fixture.Session.Core.GetStatus(context "revision-policy-status") |> Async.StartAsPromise
+        let! statusResult = fixture.Provider.GetStatus fixture.Repository (context "revision-policy-status") |> executed |> Async.StartAsPromise
         let status = expectSucceeded "revision policy status" statusResult
 
         let request: CreateRevisionRequest = {
             Message = message
             Paths = paths |> Array.map repositoryPath
-            ExpectedWorkspaceVersion = status.WorkspaceVersion
+            ExpectedRepositoryVersion = status.RepositoryVersion
         }
 
         return!
-            fixture.Session.Core.CreateRevision request (context "revision-policy-create")
-            |> Async.StartAsPromise
+            fixture.Provider.CreateRevision fixture.Repository request (context "revision-policy-create")
+            |> executed |> Async.StartAsPromise
     }
 
 let private lfsPointer payloadSize =
@@ -243,13 +258,10 @@ let private unmarkWithIndexError (createLock: bool) (name: string) : JS.Promise<
         let! initial = createRevision fixture "test: commit path before the index error" [| path |]
         expectSucceeded "initial plain revision" initial |> ignore
 
-        let storagePolicy =
-            fixture.Session.StoragePolicy
-            |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
         let! markResult =
-            storagePolicy.SetPathPolicy (repositoryPath path) true (context $"mark-{name}")
-            |> Async.StartAsPromise
+            fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) true (context $"mark-{name}")
+            |> executed |> Async.StartAsPromise
 
         expectSucceeded "mark before the index error" markResult |> ignore
 
@@ -283,13 +295,11 @@ let private unmarkWithIndexError (createLock: bool) (name: string) : JS.Promise<
                         })
         }
 
-        let hookedStoragePolicy =
-            (GitWorkspaceSession.createSession hooks fixture.Binding).StoragePolicy
-            |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+        let! hooked = reopenWithHooks fixture hooks
 
         let! unmarkResult =
-            hookedStoragePolicy.SetPathPolicy (repositoryPath path) false (context name)
-            |> Async.StartAsPromise
+            hooked.Provider.StoragePolicy.SetPathPolicy hooked.Repository (repositoryPath path) false (context name)
+            |> executed |> Async.StartAsPromise
 
         return unmarkResult, NodeFileSystem.existsSync lockPath
     })
@@ -522,20 +532,20 @@ Vitest.describe (
 
                         paths.Add path
 
-                    let! statusResult = fixture.Session.Core.GetStatus(context "process-count-status") |> Async.StartAsPromise
+                    let! statusResult = fixture.Provider.GetStatus fixture.Repository (context "process-count-status") |> executed |> Async.StartAsPromise
                     let status = expectSucceeded "process count status" statusResult
 
                     let request: CreateRevisionRequest = {
                         Message = "test: count selected revision processes"
                         Paths = paths.ToArray() |> Array.map repositoryPath
-                        ExpectedWorkspaceVersion = status.WorkspaceVersion
+                        ExpectedRepositoryVersion = status.RepositoryVersion
                     }
 
                     countGitProcesses <- true
 
                     let! revision =
-                        fixture.Session.Core.CreateRevision request (context "process-count-create")
-                        |> Async.StartAsPromise
+                        fixture.Provider.CreateRevision fixture.Repository request (context "process-count-create")
+                        |> executed |> Async.StartAsPromise
 
                     countGitProcesses <- false
                     expectSucceeded "process count revision" revision |> ignore
@@ -813,13 +823,10 @@ Vitest.describe (
                     let! initial = createRevision fixture "test: commit plain path before marking" [| path |]
                     expectSucceeded "initial plain revision" initial |> ignore
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! markResult =
-                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-plain-path")
-                        |> Async.StartAsPromise
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) true (context "mark-plain-path")
+                        |> executed |> Async.StartAsPromise
 
                     let marked = expectSucceededOutcome "mark plain path" markResult
                     Vitest.expect(marked.AffectedPaths |> Array.contains path).toBe true
@@ -851,13 +858,10 @@ Vitest.describe (
                     let! initial = createRevision fixture "test: commit path before LFS marking" [| path |]
                     expectSucceeded "initial plain revision" initial |> ignore
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! markResult =
-                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-for-unmark-test")
-                        |> Async.StartAsPromise
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) true (context "mark-for-unmark-test")
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "mark before local unmark" markResult |> ignore
 
@@ -871,8 +875,8 @@ Vitest.describe (
                     do! writeUtf8FileAsync absolutePath pointer
 
                     let! unmarkResult =
-                        storagePolicy.SetPathPolicy (repositoryPath path) false (context "unmark-local-pointer")
-                        |> Async.StartAsPromise
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) false (context "unmark-local-pointer")
+                        |> executed |> Async.StartAsPromise
 
                     let unmarked = expectSucceededOutcome "unmark local pointer" unmarkResult
                     Vitest.expect(unmarked.AffectedPaths |> Array.contains path).toBe true
@@ -905,13 +909,10 @@ Vitest.describe (
                     let! initial = createRevision fixture "test: commit path before checkout simulation" [| path |]
                     expectSucceeded "initial plain revision" initial |> ignore
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! markResult =
-                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-checkout-simulation")
-                        |> Async.StartAsPromise
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) true (context "mark-checkout-simulation")
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "mark before checkout simulation" markResult |> ignore
 
@@ -942,19 +943,16 @@ Vitest.describe (
                                     })
                     }
 
-                    let hookedSession = GitWorkspaceSession.createSession hooks fixture.Binding
-                    let hookedStoragePolicy =
-                        hookedSession.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
+                    let! hooked = reopenWithHooks fixture hooks
                     let attributesPath = join [| fixture.WorkPath; ".gitattributes" |]
                     let! attributesBefore = readUtf8FileAsync attributesPath
 
                     let! unmarkResult =
-                        hookedStoragePolicy.SetPathPolicy
+                        hooked.Provider.StoragePolicy.SetPathPolicy hooked.Repository
                             (repositoryPath path)
                             false
                             (context "unmark-checkout-simulation")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     match unmarkResult with
                     | Failed failure ->
@@ -1026,17 +1024,14 @@ Vitest.describe (
                     do! writeUtf8FileAsync rootAbsolutePath rootContent
                     do! writeUtf8FileAsync nestedAbsolutePath nestedContent
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     for path in [| rootPath; nestedPath |] do
                         let! markResult =
-                            storagePolicy.SetPathPolicy
+                            fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository
                                 (repositoryPath path)
                                 true
                                 (context $"mark-{path}")
-                            |> Async.StartAsPromise
+                            |> executed |> Async.StartAsPromise
 
                         expectSucceeded $"mark {path}" markResult |> ignore
 
@@ -1050,11 +1045,11 @@ Vitest.describe (
                     do! writeUtf8FileAsync nestedAbsolutePath nestedPointer
 
                     let! unmarkResult =
-                        storagePolicy.SetPathPolicy
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository
                             (repositoryPath rootPath)
                             false
                             (context "unmark-root-same-name")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "unmark root same-named file" unmarkResult |> ignore
                     let! materializedRoot = readUtf8FileAsync rootAbsolutePath
@@ -1076,13 +1071,10 @@ Vitest.describe (
                     let! initial = createRevision fixture "test: commit path before LFS marking" [| path |]
                     expectSucceeded "initial plain revision" initial |> ignore
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! markResult =
-                        storagePolicy.SetPathPolicy (repositoryPath path) true (context "mark-for-missing-object-test")
-                        |> Async.StartAsPromise
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) true (context "mark-for-missing-object-test")
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "mark before missing-object unmark" markResult |> ignore
 
@@ -1123,8 +1115,8 @@ Vitest.describe (
                     let! attributesBefore = readUtf8FileAsync (join [| fixture.WorkPath; ".gitattributes" |])
 
                     let! unmarkResult =
-                        storagePolicy.SetPathPolicy (repositoryPath path) false (context "unmark-missing-pointer")
-                        |> Async.StartAsPromise
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository (repositoryPath path) false (context "unmark-missing-pointer")
+                        |> executed |> Async.StartAsPromise
 
                     match unmarkResult with
                     | Failed failure ->
@@ -1153,16 +1145,13 @@ Vitest.describe (
                     let! first = createRevision fixture "test: track before automatic opt-out" [| path |]
                     expectSucceeded "automatic tracking revision" first |> ignore
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! unsetResult =
-                        storagePolicy.SetPathPolicy
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository
                             (repositoryPath path)
                             false
                             (context "automatic-opt-out")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "automatic opt-out" unsetResult |> ignore
 
@@ -1193,16 +1182,13 @@ Vitest.describe (
                     let! first = createRevision fixture "test: commit plain path" [| path |]
                     expectSucceeded "plain path revision" first |> ignore
 
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! unsetResult =
-                        storagePolicy.SetPathPolicy
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository
                             (repositoryPath path)
                             false
                             (context "plain-path-opt-out")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "plain path opt-out" unsetResult |> ignore
 
@@ -1232,16 +1218,13 @@ Vitest.describe (
 
                 withGitFixture strategy (Some "\n") (fun fixture -> promise {
                     let absolutePath = join [| fixture.WorkPath; path |]
-                    let storagePolicy =
-                        fixture.Session.StoragePolicy
-                        |> Option.defaultWith (fun () -> failwith "Expected Git storage policy.")
 
                     let! unsetResult =
-                        storagePolicy.SetPathPolicy
+                        fixture.Provider.StoragePolicy.SetPathPolicy fixture.Repository
                             (repositoryPath path)
                             false
                             (context "large-object-opt-out")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "large object opt-out" unsetResult |> ignore
                     do! writeUtf8FileAsync absolutePath (String.replicate 100 "f")
@@ -1374,19 +1357,19 @@ Vitest.describe (
                     let! _ = runGitOk fixture.WorkPath [| "add"; "data.bin" |]
 
                     let! statusResult =
-                        fixture.Session.Core.GetStatus(context "m6-prune-status")
-                        |> Async.StartAsPromise
+                        fixture.Provider.GetStatus fixture.Repository (context "m6-prune-status")
+                        |> executed |> Async.StartAsPromise
 
                     let status = expectSucceeded "M6 prune status" statusResult
 
                     let! restoreResult =
-                        fixture.Session.Core.RestorePaths
+                        fixture.Provider.RestorePaths fixture.Repository
                             {
                                 Paths = [| repositoryPath "data.bin" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
+                                ExpectedRepositoryVersion = status.RepositoryVersion
                             }
                             (context "m6-prune-restore")
-                        |> Async.StartAsPromise
+                        |> executed |> Async.StartAsPromise
 
                     expectSucceeded "M6 prune restore" restoreResult |> ignore
                     let! restored = readUtf8FileAsync dataPath
@@ -1395,38 +1378,8 @@ Vitest.describe (
                     let! porcelain = runGitOk fixture.WorkPath [| "status"; "--porcelain" |]
                     Vitest.expect(porcelain.Trim()).toBe ""
 
-                    let maintenance =
-                        fixture.Session.Maintenance
-                        |> Option.defaultWith (fun () -> failwith "Expected Git maintenance.")
-
-                    let! pruneResult = maintenance.Prune(context "m6-prune") |> Async.StartAsPromise
+                    let! pruneResult = fixture.Provider.Maintenance.Prune fixture.Repository (context "m6-prune") |> executed |> Async.StartAsPromise
                     expectSucceeded "M6 prune after a restored LFS edit" pruneResult |> ignore
                 })
-        )
-
-        Vitest.test (
-            "the lakeFS factory accepts a strategy and never calls it",
-            fun () ->
-                let mutable called = false
-
-                let strategy: RevisionPolicyStrategy = {
-                    ResolvePathPolicy = fun _ ->
-                        called <- true
-                        raise (Exception "lakeFS must not resolve revision paths")
-                }
-
-                let options: LakeFsProviderOptions.LakeFsProviderOptions = {
-                    StateRoot = "unused-lakefs-state"
-                    PathCaseSensitivity = CaseInsensitive
-                }
-
-                let factory =
-                    LakeFsWorkspaceSession.createFactoryWithPolicy
-                        options
-                        LakeFsCredentials.unconfigured
-                        strategy
-
-                Vitest.expect(ProviderId.value factory.Id).toBe "lakefs"
-                Vitest.expect(called).toBe false
         )
 )

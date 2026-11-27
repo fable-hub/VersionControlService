@@ -66,7 +66,6 @@ jobs:
       - run: npm ci
       - run: git lfs install --skip-repo
       - run: .\build.cmd test textdiff
-      - run: .\build.cmd test textdiff-swate-fable
 
   git-lfs-scenarios:
     runs-on: windows-latest

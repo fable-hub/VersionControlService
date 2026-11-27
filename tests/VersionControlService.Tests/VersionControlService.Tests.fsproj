@@ -11,7 +11,7 @@
     <Compile Include="Contracts\ConflictProviderSuite.fs" />
     <Compile Include="Contracts\ProvisioningProviderSuite.fs" />
     <Compile Include="Contracts\OperationalProviderSuite.fs" />
-    <Compile Include="Contracts\ExtensionProviderSuites.fs" />
+    <Compile Include="Contracts\OptionalServiceProviderSuites.fs" />
     <Compile Include="Contracts\ConsumerWorkflowSuite.fs" />
     <Compile Include="Contracts\StepEventsProviderSuite.fs" />
     <Compile Include="Contracts\OutputProviderSuite.fs" />
@@ -22,12 +22,12 @@
     <Compile Include="GitCredentials.test.fs" />
     <Compile Include="GitPartialSuccess.test.fs" />
     <Compile Include="GitRevisionPolicy.test.fs" />
+    <Compile Include="GitHistory.test.fs" />
     <Compile Include="LakeFsApi.test.fs" />
     <Compile Include="LakeFsWorkspaceIndex.test.fs" />
     <Compile Include="LakeFsMaterialization.test.fs" />
     <Compile Include="LakeFsProviderContract.test.fs" />
     <Compile Include="LakeFsIntegration.test.fs" />
-    <Compile Include="ProviderResolver.test.fs" />
     <Compile Include="NodeRuntime.test.fs" />
     <Compile Include="TextDiffSupervisor.test.fs" />
     <Compile Include="TextDiffProtocol.test.fs" />

@@ -56,6 +56,7 @@ let private page: DiffPage = {
 let private openRequest: OpenDiffRequest = {
     Path = path "a.txt"
     PreviousPath = None
+    Comparison = DiffComparison.WorkingFile
     Preparation = None
     PreviousEncoding = None
     CurrentEncoding = None
@@ -119,7 +120,8 @@ type private PreparationHandler(issueFirstOpen: bool) =
     let binding (request: OpenDiffRequest) : PreparationBinding = {
         Path = RepositoryPath.value request.Path
         PreviousPath = request.PreviousPath |> Option.map RepositoryPath.value
-        CommitId = None
+        PreviousCommitId = None
+        CurrentCommitId = None
         Previous = SideIdentity.NoSource
         Current = SideIdentity.NoSource
     }
@@ -336,7 +338,7 @@ let private failureCode (result: OperationResult<'T>) =
     | Failed failure -> failure.Code
     | other -> failwith $"Expected a failure, got %A{other}"
 
-let private readPage (service: TextDiffService) (handle: DiffHandle) cursor operationContext =
+let private readPage (service: TextDiffPool.TextDiffCalls) (handle: DiffHandle) cursor operationContext =
     service.ReadPage { Handle = handle; Cursor = cursor; Background = false } operationContext |> run
 
 let private waitUntil (condition: unit -> bool) = promise {

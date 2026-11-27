@@ -69,7 +69,7 @@ let register (harness: ProviderTestHarness) (secrets: string[]) : string * (unit
                 let! workspace = harness.CreateWorkspace()
                 let batches, context = capture "output-refresh"
 
-                let! result = run ((syncService workspace.Session).Refresh context)
+                let! result = run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository context))
 
                 expectOutcome "refresh with output" result |> ignore
                 expectWellFormedOutput (entriesOf batches)
@@ -84,13 +84,16 @@ let register (harness: ProviderTestHarness) (secrets: string[]) : string * (unit
 
                 let! result =
                     run (
-                        workspace.Session.Core.CreateRevision
-                            {
-                                Message = "revision with output"
-                                Paths = [| mkPath "output.txt" |]
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                            }
-                            context
+                        executed (
+                            workspace.Provider.CreateRevision
+                                workspace.Repository
+                                {
+                                    Message = "revision with output"
+                                    Paths = [| mkPath "output.txt" |]
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                }
+                                context
+                        )
                     )
 
                 expectPerformed "revision with output" result |> ignore

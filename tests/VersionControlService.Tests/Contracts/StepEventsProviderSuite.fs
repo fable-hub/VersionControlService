@@ -60,7 +60,7 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 let! workspace = harness.CreateWorkspace()
                 let reports, context = capture "step-events-refresh"
 
-                let! result = run ((syncService workspace.Session).Refresh context)
+                let! result = run (executed (workspace.Provider.Synchronization.Refresh workspace.Repository context))
 
                 expectOutcome "refresh with step events" result |> ignore
                 expectStepStarts [| ProgressPhaseCodes.Refresh |] reports
@@ -83,14 +83,17 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            context
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                context
+                        )
                     )
 
                 expectPerformed "synchronize with step events" result |> ignore
@@ -105,17 +108,20 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
 
                 let! result =
                     run (
-                        (syncService workspace.Session).Synchronize
-                            {
-                                ExpectedWorkspaceVersion = status.WorkspaceVersion
-                                ExpectedTargetRevision = None
-                                AcceptUpdateRisks = false
-                                PublishLocalRevisions = false
-                            }
-                            context
+                        executed (
+                            workspace.Provider.Synchronization.Synchronize
+                                workspace.Repository
+                                {
+                                    ExpectedRepositoryVersion = status.RepositoryVersion
+                                    ExpectedTargetRevision = None
+                                    AcceptUpdateRisks = false
+                                    PublishLocalRevisions = false
+                                }
+                                context
+                        )
                     )
 
-                expectNoOp "synchronize of an up-to-date workspace" result |> ignore
+                expectUnchanged "synchronize of an up-to-date workspace" result |> ignore
                 expectStepStarts [| ProgressPhaseCodes.Refresh |] reports
             }
 
@@ -129,14 +135,16 @@ let register (harness: ProviderTestHarness) : string * (unit -> int) =
                 // of its own to the common ones.
                 let! result =
                     run (
-                        harness.Factory.Clone
-                            {
-                                Location = anchor.Binding.Location
-                                TargetPath = clonePath
-                                TargetRef = None
-                                MaterializeAllObjects = false
-                            }
-                            context
+                        executed (
+                            harness.Provider.Clone
+                                {
+                                    Location = locationOf anchor
+                                    TargetPath = clonePath
+                                    TargetRef = None
+                                    MaterializeAllObjects = false
+                                }
+                                context
+                        )
                     )
 
                 expectValue "clone with step events" result |> ignore

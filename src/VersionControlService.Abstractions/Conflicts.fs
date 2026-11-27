@@ -1,7 +1,7 @@
 namespace VersionControlService.Abstractions
 
 /// Provider-issued opaque conflict-session handle. Its Version rotates after every
-/// successful nonterminal resolution and is distinct from WorkspaceVersion; the two
+/// successful nonterminal resolution and is distinct from RepositoryVersion; the two
 /// tokens have different lifetimes and are never collapsed into one field.
 type ConflictSessionHandle = {
     SessionId: string
@@ -52,7 +52,7 @@ type ConflictResolution =
 type ResolveConflictRequest = {
     Handle: ConflictSessionHandle
     /// Independently observed workspace version; separate lifetime from the handle.
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     Path: RepositoryPath
     Resolution: ConflictResolution
 }
@@ -66,13 +66,13 @@ type ConflictResolutionOutcome = {
 
 type FinalizeConflictRequest = {
     Handle: ConflictSessionHandle
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     Message: string option
 }
 
 type CancelConflictRequest = {
     Handle: ConflictSessionHandle
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 /// Stable recovery action code for stale/foreign/closed conflict-session handles.
@@ -81,14 +81,34 @@ module ConflictRecovery =
     [<Literal>]
     let RefreshConflictSession = "refresh_conflict_session"
 
+/// The conflict resolution functions of a provider, one entry for each.
+type ConflictResolutionFunctions = {
+    GetActiveSession: Entry<Repository -> OperationContext -> Async<OperationResult<ConflictSessionSummary option>>>
+    Resolve: Entry<Repository -> ResolveConflictRequest -> OperationContext -> Async<OperationResult<ConflictResolutionOutcome>>>
+    Finalize: Entry<Repository -> FinalizeConflictRequest -> OperationContext -> Async<OperationResult<RevisionId option>>>
+    Cancel: Entry<Repository -> CancelConflictRequest -> OperationContext -> Async<OperationResult<unit>>>
+}
+
 /// Provider-managed conflict sessions. Stale, foreign, or closed handles are rejected
 /// before provider state changes with category Concurrency, code "precondition_failed",
 /// and recovery "refresh_conflict_session". Finalize/cancel closes the handle.
-type ConflictResolutionService = {
-    GetActiveSession: OperationContext -> Async<OperationResult<ConflictSessionSummary option>>
-    Resolve: ResolveConflictRequest -> OperationContext -> Async<OperationResult<ConflictResolutionOutcome>>
+type IConflictResolution =
+    abstract GetActiveSession:
+        repository: Repository -> context: OperationContext -> Async<CallResult<ConflictSessionSummary option>>
+
+    abstract Resolve:
+        repository: Repository ->
+        request: ResolveConflictRequest ->
+        context: OperationContext ->
+            Async<CallResult<ConflictResolutionOutcome>>
+
     /// Finalizes only when all conflicts are resolved; verifies the provider
     /// destination after its own pre-check and closes the handle.
-    Finalize: FinalizeConflictRequest -> OperationContext -> Async<OperationResult<RevisionId option>>
-    Cancel: CancelConflictRequest -> OperationContext -> Async<OperationResult<unit>>
-}
+    abstract Finalize:
+        repository: Repository ->
+        request: FinalizeConflictRequest ->
+        context: OperationContext ->
+            Async<CallResult<RevisionId option>>
+
+    abstract Cancel:
+        repository: Repository -> request: CancelConflictRequest -> context: OperationContext -> Async<CallResult<unit>>

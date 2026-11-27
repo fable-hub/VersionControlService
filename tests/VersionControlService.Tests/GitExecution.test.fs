@@ -2,7 +2,9 @@ module VersionControlService.Tests.GitExecutionTests
 
 open Fable.Core
 open VersionControlService.Abstractions
+open VersionControlService.Git
 open Vitest
+open VersionControlService.Tests.Contracts.ProviderHarness.SuiteHelpers
 
 module GitAuthAdapter = VersionControlService.Git.GitAuthAdapter
 module GitCommandResolver = VersionControlService.Git.GitCommandResolver
@@ -147,10 +149,10 @@ let private notGitHooks (output: NodeProcess.ProcessOutput) : GitWorkspaceSessio
 }
 
 let private checkDependencies (hooks: GitWorkspaceSession.GitSessionHooks) : JS.Promise<DependencyStatus[]> = promise {
-    let factory = GitWorkspaceSession.createFactory hooks
+    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
     let! result =
-        factory.CheckDependencies(OperationContext.detached "git-executable-probe")
+        executed (provider.CheckDependencies(OperationContext.detached "git-executable-probe"))
         |> Async.StartAsPromise
 
     match result with
@@ -305,10 +307,10 @@ Vitest.describe (
                         Barrier = None
                     }
 
-                    let factory = GitWorkspaceSession.createFactory hooks
+                    let provider = GitProvider.create { GitProviderOptions.defaults with Hooks = hooks }
 
                     let checkDependencies () =
-                        factory.CheckDependencies(OperationContext.detached "git-executable-session")
+                        executed (provider.CheckDependencies(OperationContext.detached "git-executable-session"))
                         |> Async.StartAsPromise
 
                     GitExecution.setGitExecutableProvider (fun () -> Some first)

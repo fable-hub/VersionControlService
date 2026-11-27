@@ -146,13 +146,13 @@ let private blockers = [|
     DiffBlocker.LocalContentUnavailable(DiffSide.Previous, None)
     DiffBlocker.EncodingRequired(DiffSide.Current, token, [| { Encoding = "windows-1252"; Preview = "caf\u00e9" }; { Encoding = "latin1"; Preview = "" } |])
     DiffBlocker.NotRegularFile DiffSide.Current
-    DiffBlocker.ProviderUnsupported
     DiffBlocker.BlobTooLargeForMemory(DiffSide.Previous, large, Int64.MaxValue)
 |]
 
 let private openRequest: OpenDiffRequest = {
     Path = path "a.txt"
     PreviousPath = Some(path "old/a.txt")
+    Comparison = DiffComparison.WorkingFile
     Preparation = Some token
     PreviousEncoding = Some "utf-8"
     CurrentEncoding = Some "utf-16le"
@@ -225,6 +225,7 @@ Vitest.describe (
                             {
                                 openRequest with
                                     PreviousPath = None
+                                    Comparison = DiffComparison.Revision(revision (String.replicate 40 "a"))
                                     Preparation = None
                                     PreviousEncoding = None
                                     CurrentEncoding = None

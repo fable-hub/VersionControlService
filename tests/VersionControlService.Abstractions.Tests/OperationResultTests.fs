@@ -71,12 +71,12 @@ let operationResultTests =
             | Some report -> report [| entry |]
             | None -> failtest "Expected an output callback."
 
-        testCase "noOp keeps its reason"
+        testCase "unchanged keeps its reason"
         <| fun () ->
-            match OperationResult.noOp (Some "already up to date") "value" with
-            | Succeeded outcome -> Expect.equal outcome.Effect (NoOp(Some "already up to date")) "NoOp reason kept."
+            match OperationResult.unchanged (Some "already up to date") "value" with
+            | Succeeded outcome -> Expect.equal outcome.Effect (Unchanged(Some "already up to date")) "Unchanged reason kept."
             | PartiallySucceeded _
-            | Failed _ -> failtest "Expected Succeeded NoOp."
+            | Failed _ -> failtest "Expected Succeeded Unchanged."
 
         testCase "failure carries stable category, extensible code, retry guidance, state, and recovery"
         <| fun () ->
@@ -158,13 +158,13 @@ let operationResultTests =
                     |]
                     AffectedPaths = [| "x.txt"; "y.txt" |]
                     ResultingRevision = Some(expectRevisionId "def456")
-                    ResultingWorkspaceVersion = Some "workspace-token-1"
+                    ResultingRepositoryVersion = Some "workspace-token-1"
                     Publication = LocalOnly
             }
 
             Expect.equal outcome.Warnings.Length 1 "Structured warning kept."
             Expect.equal outcome.AffectedPaths.Length 2 "Affected paths kept."
-            Expect.equal outcome.ResultingWorkspaceVersion (Some "workspace-token-1") "Workspace version kept."
+            Expect.equal outcome.ResultingRepositoryVersion (Some "workspace-token-1") "Workspace version kept."
             Expect.equal outcome.Publication LocalOnly "Publication state kept."
 
         testCase "redaction strips credential material from failure details"

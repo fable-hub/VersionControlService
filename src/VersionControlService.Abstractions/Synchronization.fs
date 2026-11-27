@@ -13,7 +13,7 @@ type RevisionRelationship =
 /// Counts are optional because object-oriented providers cannot always compute them.
 type SynchronizationState = {
     BaseRevision: RevisionId option
-    WorkspaceRevision: RevisionId option
+    LocalRevision: RevisionId option
     TargetRevision: RevisionId option
     /// Configured publication/update target, when the workspace has one.
     TargetRef: LogicalRef option
@@ -39,11 +39,11 @@ type UpdatePreview = {
 }
 
 type UpdateRequest = {
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
 }
 
 type PublishRequest = {
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     /// Consumer-observed target revision for the provider's client-side
     /// check-then-act-then-verify sequence. Never a server-side precondition.
     ExpectedTargetRevision: RevisionId option
@@ -56,7 +56,7 @@ type PublishRequest = {
 /// would touch, retries a preview that could not be computed, and binds a
 /// publication target the provider reports as missing.
 type SynchronizeRequest = {
-    ExpectedWorkspaceVersion: string
+    ExpectedRepositoryVersion: string
     /// The target revision the consumer observed when it made its decision. A target
     /// that has moved since fails with precondition_failed before any mutation.
     /// Required when AcceptUpdateRisks is set, so an acceptance never applies to a
@@ -69,21 +69,39 @@ type SynchronizeRequest = {
     PublishLocalRevisions: bool
 }
 
+/// The synchronization functions of a provider, one entry for each.
+type SynchronizationFunctions = {
+    Refresh: Entry<Repository -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+    PreviewUpdate: Entry<Repository -> OperationContext -> Async<OperationResult<UpdatePreview>>>
+    Update: Entry<Repository -> UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+    Publish: Entry<Repository -> PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+    Synchronize: Entry<Repository -> SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>>
+}
+
 /// Synchronization expressed as intent; providers own the mechanics.
-type SynchronizationService = {
+type ISynchronization =
     /// Observe target state without changing workspace content.
-    Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>
+    abstract Refresh: repository: Repository -> context: OperationContext -> Async<CallResult<SynchronizationState>>
+
     /// Return changed/overlapping paths, data-loss risk, and whether a conflict session would be created.
-    PreviewUpdate: OperationContext -> Async<OperationResult<UpdatePreview>>
+    abstract PreviewUpdate: repository: Repository -> context: OperationContext -> Async<CallResult<UpdatePreview>>
+
     /// Incorporate the target into the provider workspace.
-    Update: UpdateRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
+    abstract Update:
+        repository: Repository -> request: UpdateRequest -> context: OperationContext -> Async<CallResult<SynchronizationState>>
+
     /// Make workspace revisions visible on the configured target.
-    Publish: PublishRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
+    abstract Publish:
+        repository: Repository -> request: PublishRequest -> context: OperationContext -> Async<CallResult<SynchronizationState>>
+
     /// The refresh, the update the workspace needs and the publish of its revisions
     /// run as one operation under the provider's mutation lock. See
     /// Synchronization.compose for the contract.
-    Synchronize: SynchronizeRequest -> OperationContext -> Async<OperationResult<SynchronizationState>>
-}
+    abstract Synchronize:
+        repository: Repository ->
+        request: SynchronizeRequest ->
+        context: OperationContext ->
+            Async<CallResult<SynchronizationState>>
 
 /// Codes the composition produces. Providers keep their own codes for their steps.
 module SynchronizationCodes =
@@ -133,7 +151,7 @@ type SynchronizationSteps = {
     Refresh: OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Previews an update to the pinned target without reading the target again.
     PreviewUpdate: SynchronizationState -> OperationContext -> Async<OperationResult<UpdatePreview>>
-    /// Applies exactly the pinned target revision. NoOp when there is nothing to apply.
+    /// Applies exactly the pinned target revision. Unchanged when there is nothing to apply.
     Update: SynchronizationState -> OperationContext -> Async<OperationResult<SynchronizationState>>
     /// Publishes the workspace. The provider derives the expected publication target
     /// from the pinned state when its publication target is the synchronization
@@ -328,7 +346,7 @@ module Synchronization =
                                             | _ ->
                                                 return
                                                     Succeeded {
-                                                        OperationOutcome.noOp
+                                                        OperationOutcome.unchanged
                                                             (Some "The workspace already has every target revision.")
                                                             state1 with
                                                                 Warnings = refreshWarnings
@@ -376,7 +394,7 @@ module Synchronization =
                                                                 if updated || publishOutcome.Effect = Performed then
                                                                     Performed
                                                                 else
-                                                                    NoOp(Some "The workspace and the target are already synchronized.")
+                                                                    Unchanged(Some "The workspace and the target are already synchronized.")
                                                             Warnings =
                                                                 Array.append
                                                                     refreshWarnings

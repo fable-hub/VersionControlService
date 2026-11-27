@@ -1,7 +1,7 @@
-/// Injected per-factory/per-connection-profile credential resolution for the
+/// Injected per-provider/per-connection-profile credential resolution for the
 /// Git provider. Anonymous HTTPS, SSH-agent, and local/file remotes need no
 /// strategy at all; token flows scope their credential to one host and never
-/// place secrets in bindings, requests, or output.
+/// place secrets in repository locations, requests, or output.
 module VersionControlService.Git.GitCredentialStrategy
 
 open System
@@ -25,11 +25,11 @@ type RevisionIdentity = {
 /// identity. TargetHost is the DNS host of the remote the revision will be published
 /// to: the configured publish remote of the current branch when there is one,
 /// otherwise the bound location. It is None when no host can be read from that
-/// value, which includes local paths. ConnectionProfileId is
-/// the session profile, the same value credential resolution receives, so an
+/// value, which includes local paths. ConnectionProfileId is the connection profile of the
+/// opened repository, the same value credential resolution receives, so an
 /// application that keeps several accounts per host can pick the matching one.
 type RevisionIdentityRequest = {
-    WorkspaceRoot: string
+    RepositoryRoot: string
     TargetHost: string option
     ConnectionProfileId: string option
 }
@@ -150,7 +150,7 @@ let private buildLfsEndpoint (remoteUrl: string) : string =
 /// Builds one command-scoped authentication value that can be reused for core
 /// Git and explicit Git LFS processes. The credential-bearing LFS endpoint is
 /// supplied only through `-c` arguments and is never persisted in repository
-/// configuration or a workspace binding.
+/// configuration or a repository location.
 let internal buildScopedCommandAuthentication
     (remoteName: string)
     (remoteUrl: string)
