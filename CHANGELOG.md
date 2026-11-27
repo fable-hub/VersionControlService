@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.6.0 - 2026-11-27
+
 ### Added
 
 -   `DiffComparison.Revision` compares the version in a revision with the version in its first parent. The comparison does not read the working tree. The Git provider accepts only a full object id as the revision.
